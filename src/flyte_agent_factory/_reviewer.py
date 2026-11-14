@@ -25,6 +25,7 @@ async def _call_reviewer(
     round_: int = 0,
     timeline: _timeline._Timeline | None = None,
     on_engine: Callable[[str, str], object] | None = None,
+    on_setting: Callable[[str, str, str], object] | None = None,
     **kwargs: Any,
 ) -> tuple[str, Dir]:
     """Return a sub-agent call, metered under `purpose` (judge name, planner, arbiter, contract).
@@ -32,6 +33,9 @@ async def _call_reviewer(
     Codex is the second engine: a role can be put on it outright (`_engine_for`), and a call
     the Claude account refuses with its usage limit is retried there before anyone waits --
     a separate meter keeps review moving through a Claude limit.
+
+    `on_engine(engine, label)` and `on_setting(engine, model, effort)` are told what each call is about to
+    run on, the second as separate values; a call that moves to the other engine reports again.
     """
     engine = kwargs.pop("engine", None)
     # A pre-routed Codex delegation passes Codex settings, which cannot run on Claude.
@@ -60,9 +64,11 @@ async def _call_reviewer(
         return kwargs.get("model", ""), kwargs.get("effort", "")
 
     def announce() -> None:
+        model = kwargs.get("model", _policy.DEFAULTS["author"].model if engine == "claude" else "")
         if on_engine:
-            model = kwargs.get("model", _policy.DEFAULTS["author"].model if engine == "claude" else "")
             on_engine(engine, f"{engine} {model or 'default'}/{kwargs.get('effort') or 'default'}")
+        if on_setting:
+            on_setting(engine, model or "", kwargs.get("effort") or "")
         if timeline:
             timeline.row(
                 "🔧",
