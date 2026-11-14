@@ -6,9 +6,9 @@ import asyncio
 import re
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TypedDict
 
 import flyte
 import flyte.errors
@@ -21,6 +21,7 @@ from flyte_agent_factory import (
     _gates,
     _inbox,
     _issues,
+    _judge_inputs,
     _policy,
     _reviewer,
     _roles,
@@ -92,6 +93,18 @@ class _JudgeOutcome:
     probe_at: float | None = None
     limit_text: str = ""
     carried: bool = False
+    #: What the call that produced this outcome ran on and was asked; see `_judge_inputs`.
+    model: str = ""
+    effort: str = ""
+    prompt_sha256: str = ""
+
+
+class _Seen(TypedDict, total=False):
+    """The `_JudgeOutcome` fields a judge's latest call reports, gathered as the call runs."""
+
+    model: str
+    effort: str
+    prompt_sha256: str
 
 
 @dataclass
@@ -105,6 +118,12 @@ class _Carried:
     nonblocking: list[str] = field(default_factory=list)
     unverified: list[str] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
+    #: Where the judge really ran. Empty in a metrics file from before they were kept.
+    engine: str = ""
+    model: str = ""
+    effort: str = ""
+    prompt_sha256: str = ""
+    attempts: int = 1
 
 
 #: A carried judge's report and item lists are bounded: they live in the metrics file.
@@ -818,6 +837,8 @@ async def _one_judge(
     setting = _policy.resolve("judge", round_)
     advisory_craft = judge == "craft" and not _is_craft_blocking()
     used: list[str] = []  # the engine of each call, from `_call_reviewer`'s own report
+    # The model, effort and prompt of the latest call: the one whose text the verdict comes from.
+    seen: _Seen = {}
     engine: str | None = None
     for tries in range(1, _NO_VERDICT_ATTEMPTS + 1):
         text: str | None = None
@@ -825,31 +846,34 @@ async def _one_judge(
         limit_text, retry_at, probe_at = "", None, None
         for attempt in (1, 2):
             try:
+                prompt = _qa_prompt(
+                    judge,
+                    instruction,
+                    brief,
+                    acceptance,
+                    round_,
+                    facts,
+                    notes,
+                    _prior_findings.get(judge, ""),
+                    _reviewer._earlier_requirements(judge, round_),
+                    "\n".join(f"- {r}" for r in _session_config._rulings),
+                    _contract._contract,
+                    "\n".join(f"- {d}" for d in _inbox._directions),
+                )
+                seen["prompt_sha256"] = _judge_inputs.hash_prompt(prompt)
                 text, _ = await _reviewer._call_reviewer(
                     timeline=timeline,
                     purpose=judge,
                     round_=round_,
                     answer_only=True,
-                    brief=_qa_prompt(
-                        judge,
-                        instruction,
-                        brief,
-                        acceptance,
-                        round_,
-                        facts,
-                        notes,
-                        _prior_findings.get(judge, ""),
-                        _reviewer._earlier_requirements(judge, round_),
-                        "\n".join(f"- {r}" for r in _session_config._rulings),
-                        _contract._contract,
-                        "\n".join(f"- {d}" for d in _inbox._directions),
-                    ),
+                    brief=prompt,
                     workdir=snapshot,
                     role="verify",
                     model=setting.model,
                     effort=setting.effort,
                     max_turns=120,
                     on_engine=lambda name, _label: used.append(name),
+                    on_setting=lambda _engine, model, effort: seen.update({"model": model, "effort": effort}),
                     **({"engine": engine} if engine else {}),
                 )
                 break
@@ -866,6 +890,8 @@ async def _one_judge(
                     retry_at, probe_at = getattr(e, "retry_at", None), getattr(e, "probe_at", None)
                     break  # a second try minutes later meets the same limit
         ran_on = used[-1] if used else ""
+        # Provisional, so a judge that raises past here still records where its call ran (`_evaluate`).
+        outcomes[judge] = _JudgeOutcome(NOT_RUN, "", ran_on, tries, **seen)
         if text is None:
             if limit_text:
                 outcomes[judge] = _JudgeOutcome(
@@ -876,13 +902,14 @@ async def _one_judge(
                     retry_at=retry_at,
                     probe_at=probe_at,
                     limit_text=limit_text,
+                    **seen,
                 )
                 timeline.row("⏸️", f"{display}: DEFERRED ({_dashboard._short(limit_text, 160)})")
             else:
                 # A timeout is the one failure worth naming without its text: the text says nothing more.
                 timed_out = isinstance(error, (asyncio.TimeoutError, flyte.errors.TaskTimeoutError))
                 reason = "timeout" if timed_out else f"{type(error).__name__}: {error}"[:160]
-                outcomes[judge] = _JudgeOutcome(NOT_RUN, reason, ran_on, tries)
+                outcomes[judge] = _JudgeOutcome(NOT_RUN, reason, ran_on, tries, **seen)
                 timeline.row("⚠️", f"{display}: NOT RUN ({reason})")
             return judge, False, ""
         reason = _find_usable_result_gap(text, advisory_craft)
@@ -900,11 +927,11 @@ async def _one_judge(
     else:
         # No verdict is not a pass: a reviewer that wandered off checked nothing. Nor is it a FAIL, which
         # would cost the author a whole round of fixing what nobody found; `_evaluate` asks again.
-        outcomes[judge] = _JudgeOutcome(NO_VERDICT, reason, ran_on, _NO_VERDICT_ATTEMPTS)
+        outcomes[judge] = _JudgeOutcome(NO_VERDICT, reason, ran_on, _NO_VERDICT_ATTEMPTS, **seen)
         return judge, False, _review_report(text or "(returned nothing)")
 
     def record_outcome(outcome: str) -> None:
-        outcomes[judge] = _JudgeOutcome(outcome, "", ran_on, tries)
+        outcomes[judge] = _JudgeOutcome(outcome, "", ran_on, tries, **seen)
 
     if advisory_craft:
         timeline.row("ℹ️", f"judge-craft advisory: {_review_report(text)}")
@@ -1024,6 +1051,11 @@ def _keep_carried(
                 nonblocking=nonblocking[:_CARRIED_ITEMS],
                 unverified=unverified[:_CARRIED_ITEMS],
                 conflicts=conflicts[:_CARRIED_ITEMS],
+                engine=o.engine,
+                model=o.model,
+                effort=o.effort,
+                prompt_sha256=o.prompt_sha256,
+                attempts=o.attempts,
             )
             timeline.carried[name] = asdict(kept)
     if timeline.carried and not timeline._save_metrics():
@@ -1120,6 +1152,8 @@ async def _evaluate(
         )
         if code == 0:
             round_files = sorted(p for p in diff.split("\0") if p)
+    # What every judge of the round is shown, recorded in its row (docs/judge-inputs.md).
+    round_inputs = await _judge_inputs.capture_round_inputs(workspace, base, reviewed_head, round_base)
     unverified: list[str] = []
     nonblocking: list[str] = []
     conflicts: list[str] = []
@@ -1170,11 +1204,21 @@ async def _evaluate(
     for (name, _), result in zip(to_run, results, strict=True):
         if isinstance(result, BaseException):
             timeline.row("⚠️", f"{_roles.display_role(name)}: NOT RUN (raised {type(result).__name__})")
-            outcomes[name] = _JudgeOutcome(NOT_RUN, f"raised {type(result).__name__}")
+            # Keep what the judge's call ran on, if it got that far.
+            ran = outcomes.get(name) or _JudgeOutcome(NOT_RUN)
+            outcomes[name] = replace(ran, outcome=NOT_RUN, reason=f"raised {type(result).__name__}")
         else:
             reports[name] = result[2]
     for name, kept in carried.items():
-        outcomes[name] = _JudgeOutcome(kept.outcome, carried=True)
+        outcomes[name] = _JudgeOutcome(
+            kept.outcome,
+            engine=kept.engine,
+            carried=True,
+            model=kept.model,
+            effort=kept.effort,
+            prompt_sha256=kept.prompt_sha256,
+            attempts=kept.attempts,
+        )
         reports[name] = kept.report
         own[name] = (list(kept.unverified), list(kept.nonblocking), list(kept.conflicts))
         # Not rerun, so say so here: this is the row a reader of the timeline finds for the judge.
@@ -1306,6 +1350,19 @@ async def _evaluate(
     if timeline.carried:
         timeline.carried.clear()  # decided: the next round judges afresh, after a restart too
         timeline._save_metrics()
+    judges = {
+        name: _judge_inputs.build_judge_entry(
+            round_inputs,
+            engine=o.engine,
+            model=o.model,
+            effort=o.effort,
+            prompt_sha256=o.prompt_sha256,
+            outcome=o.outcome,
+            attempts=o.attempts,
+            carried=o.carried,
+        )
+        for name, o in outcomes.items()
+    }
     timeline.verdicts.append(
         {
             "round": round_,
@@ -1314,6 +1371,7 @@ async def _evaluate(
             "at": time.time(),
             "changed_files": round_files[: _timeline._METRICS_CHANGED_FILES],
             "changed_files_count": len(round_files),
+            "judges": judges,
         }
     )
     if timeline.issues:

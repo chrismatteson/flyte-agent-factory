@@ -36,6 +36,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [chat-operator.md](chat-operator.md#what-to-ask-it) | What to ask the chat operator day to day |
 | [operating.md](operating.md) | Launching, the queue, steering, questions, delegation |
 | [judgement.md](judgement.md) | Who decides a question: the owner or the factory, the no-waiver rule, overruling a decision |
+| [judge-inputs.md](judge-inputs.md) | What each review judge was shown, as recorded in the round row, and recreating the diff from it |
 | [deploy-webhook.md](deploy-webhook.md) | Push wake-ups, issue intake and the deploy safety net |
 | [triggers.md](triggers.md) | Every timer, its cadence and what it costs |
 | [personal-browser.md](personal-browser.md) | The single-seat logged-in browser |
