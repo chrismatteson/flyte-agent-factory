@@ -288,7 +288,9 @@ async def _freeze_contract(snapshot: Dir, brief: str, acceptance: str, timeline:
                 # first): wait for the reset like a review, rather than give up on the contract
                 # for the rest of the project (qa).
                 raise _reviewer.ReviewLimited(
-                    str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip(), retry_at=getattr(e, "retry_at", None)
+                    str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip(),
+                    retry_at=getattr(e, "retry_at", None),
+                    probe_at=getattr(e, "probe_at", None),
                 ) from e
             timeline.row("⚠️", f"contract on {setting.model} failed: {type(e).__name__}: {str(e)[:160]}")
             setting = nxt

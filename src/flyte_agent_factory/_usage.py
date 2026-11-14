@@ -16,6 +16,7 @@ from typing import Any, cast
 
 from flyte_agent_factory import (
     _limit_reset,
+    _limit_share,
     _meter,
     _names,
     _pins,
@@ -37,6 +38,102 @@ _METER_EVERY_S = _meter.MIN_INTERVAL_S  # the router counts two of these as stal
 #: for a reset time too large to display) and a token gone from the environment between the check
 #: and the read (KeyError). Meters must not fail the work; anything else is a bug.
 _METER_ERRORS = (_meter.MeterError, OSError, ValueError, TypeError, OverflowError, KeyError)
+
+
+def open_meters(root: Path) -> _meter.MeterStore:
+    """Open the supervisor's meter record, sharing limits with the other pods when a state uri is set."""
+    uri = _session_config._PROFILE.state.uri if _session_config._PROFILE else ""
+    return _meter.MeterStore(root, share=_limit_share.LimitShare(uri) if uri else None)
+
+
+def read_wall_clock() -> float:
+    """Return the wall time, read here so a test's fake clock moves a call's start with the meters."""
+    return time.time()
+
+
+def wake_count() -> int:
+    """Return how many remembered limits were cleared in this pod: waiting calls resume when it grows."""
+    return _meters.wake_count() if _meters else 0
+
+
+def poll_limit_share() -> None:
+    """Apply limit clears published by other pods or a person; cheap enough to call on every tick."""
+    if _meters:
+        try:
+            _meters.poll_shared()
+        except _METER_ERRORS as exc:  # meters must not fail the work
+            _timeline._log_line(f"[meter] {type(exc).__name__}", err=True)
+
+
+def read_limit_times(engine: str) -> tuple[float | None, float | None]:
+    """Return (reset, re-check) while `engine` is limited: when the router lets a call through, else Nones.
+
+    The reset is the remembered one, as noted; the re-check is `LIMIT_PROBE_S` after it was noted and is
+    None when it is not before the reset (a reset nobody could read keeps it).
+    """
+    candidate = _router._candidate(engine, _child_meter(engine), True, time.time())
+    if candidate.state != "exhausted":
+        return None, None
+    return candidate.usable_at, _router.pick_recheck(candidate.probe_at, candidate.usable_at)
+
+
+def note_session_refusal(proc: Any, timeline: _timeline._Timeline) -> tuple[float | None, float | None]:
+    """Record the refusal `proc` shows as a limit of the session's engine; return its `read_limit_times`."""
+    text = getattr(proc, "limit_text", "")
+    fresh = _refusal_until(text, getattr(proc, "limit_seen_wall", None))
+    _note_session_limit(fresh, timeline, getattr(proc, "meter", None), text)
+    return read_limit_times(_author_engine)
+
+
+#: engine -> the `limit_noted_at` its probe claim wrote: the call that was routed as that probe.
+_probe_grants: dict[str, float] = {}
+
+
+def claim_probe(engine: str) -> None:
+    """Take the probe of `engine`'s remembered limit if it is due, so the pod's other calls skip it."""
+    meter = _child_meter(engine)
+    if _meters and meter and _router._candidate(engine, meter, True, time.time()).state == "probe":
+        _meters.claim_probe(meter.account)
+        if meter.limit_noted_at is not None:
+            _probe_grants[engine] = meter.limit_noted_at
+
+
+def holds_probe_grant(engine: str) -> bool:
+    """Return whether `engine`'s limit is held by the probe claim of a call routed on it, still unanswered.
+
+    The claim re-dates the limit, so the engine reads exhausted again to the call that holds it (a
+    delegation chosen by `_delegation_engine` and run later); a refusal or a clear changes the date again
+    and ends the grant.
+    """
+    meter = _child_meter(engine)
+    return bool(
+        meter and meter.limit_noted_at is not None and _probe_grants.get(engine) == meter.limit_noted_at
+    )
+
+
+def note_success(engine: str, started: float | None = None) -> None:
+    """Record that a call on `engine`, begun at `started`, was answered: a remembered limit on it is over."""
+    if _meters and engine:
+        try:
+            _meters.succeeded(engine, _limit_account(engine), started)
+        except _METER_ERRORS as exc:  # meters must not fail the work
+            _timeline._log_line(f"[meter] {type(exc).__name__}", err=True)
+
+
+def clear_limit_direction(engine: str) -> str:
+    """Act on `/clear-limit <engine>`: forget the limit here, tell the other pods, return the row to show."""
+    told = True
+    if _meters:
+        if not _meters.clear_limit(engine):
+            _meters.wake(engine)  # a pause on a notice the meter never recorded is woken too
+        if _meters.share:
+            told = _meters.share.clear_engine(engine)
+    if not told:  # `_limit_share` logged the failure; the other pods still remember the limit
+        return (
+            f"limit direction: {engine} limit cleared here; the state store could not be written, "
+            "so other pods were not told"
+        )
+    return f"limit direction: {engine} limit cleared; calls on {engine} are tried again now"
 
 
 def _show_meter(store: _meter.MeterStore, meter: _meter.Meter, timeline: _timeline._Timeline | None) -> None:
@@ -453,6 +550,9 @@ def _route(
         builders=(_author_engine,) if purpose in _QA_ROLES and _qa_differs() else (),
         exclude=exclude,
     )
+    if decision.probe:
+        assert decision.engine is not None  # a probe is a chosen engine
+        claim_probe(decision.engine)
     if setting and not decision.deferred:
         assert decision.engine is not None  # not deferred
         model, effort = setting(decision.engine)
@@ -463,7 +563,9 @@ def _route(
 
 def _deferred(decision: _router.Decision) -> _router.RouterDeferred:
     # The limit mark is what `_one_judge` and the review loop already wait on.
-    return _router.RouterDeferred(f"{USAGE_LIMIT_MARK} {decision.row()}", retry_at=decision.retry_at)
+    return _router.RouterDeferred(
+        f"{USAGE_LIMIT_MARK} {decision.row()}", retry_at=decision.retry_at, probe_at=decision.probe_at
+    )
 
 
 def _delegation_engine(timeline: _timeline._Timeline) -> Callable[[], Awaitable[str]]:
@@ -524,8 +626,16 @@ def _unknown_reset_note(engine: str, text: str) -> str:
 
 
 def _limit_account(engine: str) -> str:
-    """Return the account a child's refusal on `engine` belongs to; empty keeps the engine-wide record."""
-    return _session_config._claude_account() if engine == "claude" else ""
+    """Return the account a child's refusal on `engine` belongs to; empty keeps the engine-wide record.
+
+    Codex's is the login this pod runs on, as its usage reading names it (`_session_config._codex_account`),
+    reading or not: every slot has its own login, so a limit must meet only a clear on the same one.
+    """
+    if engine == "claude":
+        return _session_config._claude_account()
+    return (
+        _session_config._codex_account() if engine == "codex" and _session_config.CODEX_TOKEN_SECRET else ""
+    )
 
 
 def _same_limit_notice(text: str, earlier: str) -> bool:
@@ -600,13 +710,31 @@ def _ingest_subagent_usage(
     engine: str = "",
     effort: str = "",
     call_id: str = "",
+    started: float | None = None,
+    action_started_at: float | None = None,
 ) -> str:
+    """Record what a sub-agent's result carries.
+
+    `started` is when its call began; `action_started_at`, for a result read later (a child's report, a
+    reattached delegate), is when it ran: that tells a stale refusal from a new one.
+    """
     clean, rec = _split_usage(text)
     route = rec.pop("route", None)
     for decision in rec.pop("routes", None) or [route]:
         _ingest_route(decision, timeline)
-    for refused, until in rec.pop("refusals", {}).items():
-        if _meters:
+    refusals = rec.pop("refusals", {})
+    # Only a call whose start is known proves a limit over: a report re-read later (a failed child, one from
+    # before a restart) would clear a limit noted after it began.
+    if started is not None and (answered := engine or rec.get("engine", "")) not in refusals:
+        note_success(answered, started)
+    for refused, until in refusals.items():
+        # A report re-read after a clear is old news when its call ran before the clear: noting it now would
+        # date it after the clear and bring the cleared limit back. A live refusal reaches the meters by
+        # `_note_engine_limit`. A report that says nothing about when it ran counts as old after any clear.
+        if _meters and (
+            started is not None
+            or not _meters.cleared_since(refused, _limit_account(refused), action_started_at)
+        ):
             _meters.note_limit(refused, until, _limit_account(refused))
     # After the refusals: a dead login's record replaces the plain limit noted for the same engine.
     if "codex" in rec.pop("unusable", []):
@@ -627,6 +755,12 @@ def _ingest_subagent_usage(
         rec["call_id"] = call_id
     _record_usage(purpose or "subagent", round_, rec)
     return clean
+
+
+def read_action_start(action: Any) -> float | None:
+    """Return when a remote action began (Unix time), None if it does not say."""
+    started: Any = getattr(action, "start_time", None)
+    return started.timestamp() if hasattr(started, "timestamp") else None
 
 
 #: A sub-agent turned away by the usage limit says so in its result (HTTP 429). Marked so the

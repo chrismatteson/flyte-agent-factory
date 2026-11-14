@@ -16,7 +16,7 @@ import traceback
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import flyte
 import flyte.errors
@@ -42,6 +42,7 @@ from flyte_agent_factory import (
     _timeline,
     _usage,
 )
+from flyte_agent_factory._bridge import _write_atomic
 
 # Imported here, not where used: the deploy bundles only modules loaded at import time, and
 # a lazy import left `_delegation` out of the bundle (every project died at startup).
@@ -117,6 +118,8 @@ _PREFLIGHT_MAX_BOUNCES = 5
 _CHECKS_TIMEOUT_S = 15 * 60
 # How long a finished checks run may keep flushing output before its pipe is closed (a seam for tests).
 _READER_CLOSE_WAIT_S = 5
+# After this long, output a handed-over session has produced since the question counts as its answer.
+_HANDOVER_ANSWER_GRACE_S = 60.0
 _board_worker: _board.Supervisor | None = None
 
 
@@ -483,6 +486,32 @@ _DONE_LINE = re.compile(r"^\s*DONE\b", re.IGNORECASE | re.MULTILINE)
 _DONE_MARKER = re.compile(r"\bDONE:")
 
 
+def _wall_time_of(monotonic_at: float) -> float:
+    """Return the wall time of a `time.monotonic()` reading taken earlier in this process."""
+    return time.time() - (time.monotonic() - monotonic_at)
+
+
+def _interrupted_message(
+    proc: Any, submission: tuple[str, float, int] | None, noted: object, resumed: object
+) -> str:
+    """Return the direction a limit cut off, to deliver again on resume; empty if there is none.
+
+    A submission counts when nothing but the refusal's echo came after it, it was not noted as answered, and
+    it is not one of the supervisor's own (the resume, a nudge, the "Reply with just: ok" probe).
+    """
+    if (
+        submission
+        and submission != noted
+        and submission != resumed
+        and getattr(proc, "output_count", 0) - submission[2] < _session_config.LIMIT_RESUMED_CHARS
+        and not submission[0].startswith("Your usage limit")
+        and "Reply with just: ok" not in submission[0]
+        and _NUDGE not in submission[0]
+    ):
+        return submission[0]
+    return ""
+
+
 def _declares_done(note: str) -> bool:
     """Whether a note is the session saying it has finished.
 
@@ -689,6 +718,44 @@ async def _post_verdict(
         _dashboard.criterion_results(timeline.notes),
     )
     await asyncio.to_thread(_session_setup._pr.passed, sha, rounds, comment)
+
+
+async def _restore_review(timeline: _timeline._Timeline, workspace: Path | None) -> dict[str, Any] | None:
+    """Return the saved review record after a pod restart, with the board and the round grants put back.
+
+    A pass the pod died before posting is posted now, best effort. None when nothing was saved.
+    """
+    restored = _session_config._load_pass_record()
+    if not restored:
+        return restored
+    timeline.review_passed = restored["passed"]
+    if restored["passed"]:
+        timeline.phase("done")  # what the dashboard showed before the restart, not "building"
+    # A pass in a granted round means those grants were used: without them the restored round sits at
+    # the ceiling and every /review-again is spent raising it back to where it already was.
+    _session_config._granted_rounds = max(
+        _session_config._granted_rounds,
+        min(_session_config._MAX_GRANTED_ROUNDS, restored["round"] - _session_config._QA_MAX_ROUNDS),
+    )
+    timeline.pr_url = timeline.pr_url or restored["pr_url"]
+    timeline.verdicts = restored["verdicts"]
+    timeline.pr_at = restored["pr_at"]
+    timeline.review_round = restored["review_round"]
+    timeline.review_started_at = restored["review_started_at"]
+    if restored["in_review"]:
+        timeline.phase("review", round_=timeline.review_round)
+        timeline._phase["since"] = timeline.review_started_at
+    if restored["passed"] and not restored["verdict_posted"] and _session_setup._pr is not None:
+        # The pod died between saving the pass and posting it: the PR is still a draft with no status.
+        try:
+            # The one caller of `_pump` always passes WORKSPACE.
+            await _post_verdict(cast(Path, workspace), timeline, restored["sha"], restored["round"])
+        except REMOTE_ERRORS as e:  # best effort at startup; a crash here would recur on every restart
+            timeline.row("⚠️", f"could not post the saved verdict: {type(e).__name__}: {e}"[:300])
+        _inbox._save_pass(
+            restored["round"], restored["sha"], timeline.pr_url, verdict_posted=True, timeline=timeline
+        )
+    return restored
 
 
 async def _escalate_preflight(
@@ -903,8 +970,8 @@ async def _refresh_child_usage(timeline: _timeline._Timeline) -> None:
         return  # type: ignore[unreachable]  # outside a task `.action` is None; the stub types it as always set
     seen = timeline._child_usage_seen
 
-    def collect() -> list[tuple[str, list[str]]]:
-        found: list[tuple[str, list[str]]] = []
+    def collect() -> list[tuple[str, float | None, list[str]]]:
+        found: list[tuple[str, float | None, list[str]]] = []
         for action in remote.Action.listall(for_run_name=ctx.action.run_name):
             if (
                 action.name in seen
@@ -918,10 +985,10 @@ async def _refresh_child_usage(timeline: _timeline._Timeline) -> None:
                 _timeline._log_line(f"[usage] child report: {type(exc).__name__}", err=True)
                 continue
             records = re.findall(r"\n<!--factory-usage (\{.*?\})-->", report or "", re.DOTALL)
-            found.append((action.name, records))
+            found.append((action.name, _usage.read_action_start(action), records))
         return found
 
-    for name, records in await asyncio.to_thread(collect):
+    for name, started, records in await asyncio.to_thread(collect):
         for raw in records[-1:]:
             rec = json.loads(raw)
             route = rec.get("route")
@@ -935,6 +1002,7 @@ async def _refresh_child_usage(timeline: _timeline._Timeline) -> None:
                     engine=route.get("engine", ""),
                     effort=route.get("effort", ""),
                     call_id=f"{ctx.action.run_name}/{name}",
+                    action_started_at=started,
                 )
         seen.add(name)
 
@@ -1163,3 +1231,51 @@ def _cgroup_memory_fraction() -> float | None:
             return None
         return used / cap
     return None
+
+
+class HandoverProbe:
+    """The author handed over to an engine as that engine's probe: its first real work proves the limit over.
+
+    The pump ends a pause on evidence the session runs again, but a session started by a handover was never
+    in a pause, so nothing else would drop the limit the router let this one call through. The handover
+    leaves `probe_since` in `author-conversation.json` (the next pod reads it here). As the pause's own end
+    requires, only output that grew after a submission counts, and only a minute on with no notice showing:
+    a startup screen, a resumed transcript's replay or redraws before the refusal arrives are not an answer.
+    Then success is noted for the engine with the handover time as the start, so a refusal noted since
+    still stands.
+    """
+
+    def __init__(self) -> None:
+        self.owner_file = _session_config.STATE_ROOT / "author-conversation.json"
+        self.since = self._read().get("probe_since")
+        self.asked: tuple[str, float, int] | None = None  # the first submission to the new session
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            owner = json.loads(self.owner_file.read_text())
+        except (OSError, ValueError):
+            return {}
+        return owner if isinstance(owner, dict) else {}
+
+    def check(self, proc: Any) -> None:
+        """Note the handed-over engine's success once `proc` shows it runs; call on every tick."""
+        if self.since is None or getattr(proc, "limit_hit_at", None) is not None:
+            return
+        if self.asked is None:
+            self.asked = getattr(proc, "last_submission", None)
+            if self.asked is None:
+                return
+        _, asked_at, output_then = self.asked
+        grown = getattr(proc, "output_count", 0) - output_then
+        if (
+            grown < _session_config.LIMIT_RESUMED_CHARS
+            or time.monotonic() - asked_at <= _HANDOVER_ANSWER_GRACE_S
+        ):
+            return
+        since, self.since = self.since, None
+        owner = self._read()
+        if owner.get("probe_since") == since:
+            owner.pop("probe_since")
+            _write_atomic(self.owner_file, owner)
+            if owner.get("engine") == _usage._author_engine:
+                _usage.note_success(_usage._author_engine, since)

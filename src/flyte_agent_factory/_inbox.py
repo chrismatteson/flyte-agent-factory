@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from flyte_agent_factory import _session_config, _session_log, _timeline
+from flyte_agent_factory import _session_config, _session_log, _timeline, _usage
 from flyte_agent_factory._conditions import open_condition
 from flyte_agent_factory._process import ClaudeProcess
 
@@ -54,6 +54,16 @@ ENGINE_DIRECTION = re.compile(
 )
 
 
+#: A person's word that a remembered usage limit is over: `/clear-limit [engine]`, Claude by default.
+CLEAR_LIMIT_DIRECTION = re.compile(r"^\s*/clear-limit(?:\s+(claude|codex))?\s*[.!]?\s*$", re.I)
+
+
+def parse_clear_limit(text: str) -> str | None:
+    """Return the engine `text` says is out of its limit, lower case, or None when it is not that command."""
+    match = CLEAR_LIMIT_DIRECTION.match(text)
+    return (match[1] or "claude").lower() if match else None
+
+
 def engine_direction(text: str) -> str | None:
     """Return the engine `text` directs the author to, lower case, or None when it is not that command."""
     match = ENGINE_DIRECTION.match(text)
@@ -80,6 +90,7 @@ async def _inbox_loop(
     *,
     on_engine: Callable[[str], str] | None = None,
     on_late_answer: Callable[[str, str], Awaitable[None]] | None = None,
+    on_clear_limit: Callable[[str], str] = _usage.clear_limit_direction,
 ) -> None:
     """Deliver direction that arrives over Flyte conditions into the session.
 
@@ -87,7 +98,9 @@ async def _inbox_loop(
     still lives in `agent`, which this module cannot import. `credentials` takes the owner's sealed
     credentials and `/revoke-credential` before anything else sees them (`Credentials.handle`).
     `on_engine` takes an engine direction (`engine_direction`) and returns the timeline row saying what
-    was done. Without it, such a message is ordinary direction for the session.
+    was done. Without it, such a message is ordinary direction for the session. `on_clear_limit` does the
+    same for `/clear-limit` (`parse_clear_limit`); by default it forgets the limit in this pod and
+    tells the others (`_usage.clear_limit_direction`).
     `on_late_answer` takes `/late-answer <condition> <text>`, the owner's answer to an ask that had already
     closed, which the factory's MCP server reroutes here (`Bridge.late_answer`); it puts it in the inbox
     itself. Without it, such a message is ordinary direction.
@@ -158,6 +171,11 @@ async def _inbox_loop(
                     _record_direction(message, "Union", timeline)
                     if row := on_engine(engine):
                         timeline.row("🔁", row)
+                    continue
+                if limited := parse_clear_limit(message):
+                    # Acted on here too: the session is likely the one paused on the limit being cleared.
+                    _record_direction(message, "Union", timeline)
+                    timeline.row("🔁", on_clear_limit(limited))
                     continue
 
                 # Written to a file for the same reason as the brief: the TUI submits on

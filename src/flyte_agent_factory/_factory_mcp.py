@@ -79,6 +79,7 @@ CHAT_TASKS = (
     "status",
     "set_reserve",
     "get_reserve",
+    "clear_limit",
     "rotate_token",
     "browser_link",
     "credential_link",
@@ -139,6 +140,11 @@ Each account (claude, codex) can hold back k percent of every usage window per h
 window resets, so a launch waits when its account has less than k x hours-to-reset left and reopens by
 itself as the reset nears. run_task(name="factory.set_reserve", inputs={{"account": "claude", "k": 0.5}})
 sets it (0 removes it) and the next admission uses it; run_task(name="factory.get_reserve") reads every k.
+A usage limit the owner has reset by hand (a weekly reset, say) is forgotten by every project's pod with
+run_task(name="factory.clear_limit", inputs={{"engine": "claude"}}) (claude is the default); each pod
+drops what it remembered within a minute (it fails without [state] uri in the deployment profile). Send
+"/clear-limit [engine]" to one project's direct- condition to clear it for that pod at once, and, with
+[state] uri set, for the others too.
 A project whose run has ended is resumed by launching the same name again with
 the new work as the brief: it continues from the last published workspace.
 Use factory.status for progress and review state (rounds, blocking findings, each judge's latest

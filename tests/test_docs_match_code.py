@@ -199,6 +199,13 @@ def test_the_roles_tables_exist():
     assert {"AUTHOR_MODEL", "CORRECTNESS_ENGINE"} <= set(_first_column_names(arch, "Policy key"))
 
 
+def test_the_remembered_limits_section_and_the_clear_limit_row_exist():
+    """The manual clear is how an operator tells the pods a limit was reset; losing its docs must fail."""
+    lines = (ROOT / "docs" / "operating.md").read_text().splitlines()
+    assert "### Remembered usage limits" in lines
+    assert any(line.startswith("| `/clear-limit`") for line in lines)
+
+
 # ---- (c) links resolve ----
 
 

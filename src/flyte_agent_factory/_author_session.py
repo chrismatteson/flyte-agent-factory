@@ -23,6 +23,8 @@ class AuthorSession:
     # Set by the supervisor, not here: declared so the assignments type-check, without defining them
     # (an attribute defined here would hide the engine process's own `retry_at` from `__getattr__`).
     retry_at: float | None
+    #: Set with `retry_at`: when the router lets one call through to a limited engine, if before `retry_at`.
+    probe_at: float | None
     _checkpointed_limit: tuple[str | None, float | None]
     #: Whether the session had declared DONE; the pump keeps it current for the handoff's briefing.
     declared_done: bool

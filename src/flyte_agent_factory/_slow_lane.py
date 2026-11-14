@@ -287,10 +287,27 @@ def run_in_tree(root: Path, pytest_args: Sequence[str], python: str = sys.execut
     return proc.returncode, _tail(proc.stdout), junit.read_text() if junit.exists() else ""
 
 
+def _run_context_dir(start: Path) -> Path | None:
+    """Return the directory holding the run context `attach` reads, None when there is none.
+
+    The supervisor writes it at the workspace root, while a project's checks run from its own directory below
+    that (`projects/<name>/`): looking only in the working directory sent the lane to run here every time.
+    """
+    from flyte_agent_factory.child import context_path
+
+    for base in (start, *start.parents):
+        if context_path(base).is_file():
+            return base
+    workspace = os.environ.get("AGENT_FACTORY_WORKSPACE")
+    if workspace and context_path(workspace).is_file():
+        return Path(workspace)
+    return None
+
+
 def _attach() -> None:
     from flyte_agent_factory.child import attach
 
-    attach()
+    attach(_run_context_dir(Path.cwd()))
 
 
 class UploadFailed(flyte.errors.RuntimeSystemError):

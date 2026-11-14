@@ -88,6 +88,8 @@ class _JudgeOutcome:
     attempts: int = 1
     #: DEFERRED only: the router's time to ask again, and the untruncated limit text.
     retry_at: float | None = None
+    #: DEFERRED only: when the router lets one call through to a remembered limit, if before `retry_at`.
+    probe_at: float | None = None
     limit_text: str = ""
     carried: bool = False
 
@@ -820,7 +822,7 @@ async def _one_judge(
     for tries in range(1, _NO_VERDICT_ATTEMPTS + 1):
         text: str | None = None
         error: Exception | None = None
-        limit_text, retry_at = "", None
+        limit_text, retry_at, probe_at = "", None, None
         for attempt in (1, 2):
             try:
                 text, _ = await _reviewer._call_reviewer(
@@ -861,7 +863,7 @@ async def _one_judge(
                 if _usage.USAGE_LIMIT_MARK in str(e):
                     # The whole text: the router's `; retry at HH:MM UTC` is at its end.
                     limit_text = str(e).split(_usage.USAGE_LIMIT_MARK, 1)[1].strip()
-                    retry_at = getattr(e, "retry_at", None)
+                    retry_at, probe_at = getattr(e, "retry_at", None), getattr(e, "probe_at", None)
                     break  # a second try minutes later meets the same limit
         ran_on = used[-1] if used else ""
         if text is None:
@@ -872,6 +874,7 @@ async def _one_judge(
                     engine=ran_on,
                     attempts=tries,
                     retry_at=retry_at,
+                    probe_at=probe_at,
                     limit_text=limit_text,
                 )
                 timeline.row("⏸️", f"{display}: DEFERRED ({_dashboard._short(limit_text, 160)})")
@@ -1053,8 +1056,12 @@ def _raise_undecided(
         dated = sorted((o.retry_at, n) for n, o in deferred.items() if o.retry_at is not None)
         # The text of the judge that frees first: with no retry_at the supervisor parses the reset from it.
         first = deferred[dated[0][1]] if dated else next(iter(deferred.values()))
+        probes = [o.probe_at for o in deferred.values() if o.probe_at is not None]
         raise _reviewer.ReviewLimited(
-            first.limit_text, retry_at=dated[0][0] if dated else None, missing=reasons
+            first.limit_text,
+            retry_at=dated[0][0] if dated else None,
+            probe_at=min(probes, default=None),
+            missing=reasons,
         )
     if nobody_ran:
         # Nobody looked. Passing here would let a cluster blip approve every DONE.
@@ -1355,6 +1362,7 @@ async def _review_round(
     workspace: Path, brief: str, acceptance: str, round_: int, timeline: _timeline._Timeline
 ) -> tuple[bool, str, bool | None, str]:
     """Review, then on a failure plan the next round. (passed, message, converging, why)."""
+    timeline.review_clears = _usage.wake_count()
     timeline.phase("review", round_=round_)
     passed, findings = await _evaluate(workspace, brief, acceptance, round_, timeline)
     if passed:

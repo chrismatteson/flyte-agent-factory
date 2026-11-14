@@ -335,6 +335,17 @@ def test_an_unknown_other_engine_keeps_qa_different_from_the_builder():
     assert decision.reason == "codex meter unknown; QA differs from builder claude"
 
 
+def test_a_qa_cross_check_takes_the_other_engines_probe_and_says_so():
+    """The cross-check engine is the router's own preference for QA, so its due re-check is taken."""
+    due = _meter.Meter(
+        "codex", "limit-text", NOW, limited_until=NOW + 12 * 3600, limit_noted_at=NOW - _meter.LIMIT_PROBE_S
+    )
+    decision = route("qa", {"claude": claude(20), "codex": due}, builders=("claude",))
+    assert (decision.engine, decision.probe) == ("codex", True)
+    assert "meter unknown" not in decision.reason
+    assert "codex remembered limit re-checked" in decision.reason
+
+
 def test_an_exhausted_other_engine_is_not_chosen_for_qa_diversity():
     decision = route(
         "correctness", {"claude": claude(10), "codex": codex(limited=NOW + 900)}, builders=("claude",)

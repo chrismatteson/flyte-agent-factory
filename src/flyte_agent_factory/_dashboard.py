@@ -22,7 +22,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from typing import Any, TypeVar, cast
 
-from flyte_agent_factory import _roles
+from flyte_agent_factory import _roles, _router
 
 #: The status snapshot `_Timeline` builds (agent.py), which is also the JSON embedded in the page. Its
 #: sections are optional and a page written by an older version lacks some, so values stay `Any`.
@@ -208,6 +208,9 @@ def phase_label(phase: Snapshot, now: float | None = None) -> str:
         until = phase.get("limited_until")
         now = time.time() if now is None else now
         label = f"limited until {clock_or_date(until, now)}" if until else "limited (reset time not shown)"
+        probe = _router.pick_recheck(phase.get("probe_at"), until or None)
+        if probe:
+            label += f"; re-check at {clock_or_date(probe, now)}"
         awaited = (phase.get("paused") or {}).get("engine")
         return f"{label}, waiting for {awaited}" if awaited else label
     return PHASE_LABELS.get(kind, kind)

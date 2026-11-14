@@ -440,6 +440,7 @@ def test_the_allowlist_is_exactly_the_factory_chat_tasks_and_benchmark():
         "status",
         "set_reserve",
         "get_reserve",
+        "clear_limit",
         "rotate_token",
         "browser_link",
         "credential_link",

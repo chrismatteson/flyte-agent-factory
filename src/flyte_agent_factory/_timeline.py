@@ -162,6 +162,9 @@ class _Timeline:
         # The commit `_evaluate` snapshotted for the review in flight. A field rather than part of the
         # return value so that `_evaluate`/`_review_round` keep their shape for their many callers.
         self.reviewed_sha = ""
+        #: `_usage.wake_count()` as the review round in flight began: a limit cleared while its judges ran
+        #: must end the wait the round's deferral starts (`ReviewWait.wait_for_limit`). None before any round.
+        self.review_clears: int | None = None
         self.attempt = 0
         self.repo = ""
         self.branch = ""
@@ -228,10 +231,13 @@ class _Timeline:
         *,
         round_: int = 0,
         limited_until: float | None = None,
+        probe_at: float | None = None,
         paused: dict[str, Any] | None = None,
     ) -> None:
         """Where the project is, for the dashboard's status line; the clock restarts when it changes.
 
+        `limited_until` is the remembered reset; `probe_at` is the earlier time the router tries one call
+        anyway (`LIMIT_PROBE_S`), which is when a waiting call really wakes.
         `paused` is `_router.Paused.as_dict()` while the author waits on a limit: who, until when, and why
         not the other engines. `factory.status` returns it as is.
         """
@@ -244,6 +250,7 @@ class _Timeline:
             self.review_round = round_
             self.review_started_at = self._phase["since"]
         self._phase["limited_until"] = limited_until
+        self._phase["probe_at"] = probe_at
         self._phase["paused"] = paused
         self._dirty = True
 

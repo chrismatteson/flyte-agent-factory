@@ -14,16 +14,16 @@ import time
 import traceback
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Any, Protocol, TypedDict, cast
 
 import flyte
 
-from . import _pins, _policy, _secret_env, _session_config, child
+from . import _pins, _policy, _secret_env, _session_config, _usage, child
 from ._bridge import ANSWERS, REQUESTS, _write_atomic, redact_tokens
 from ._bridge import PARTIAL_PATCH as PARTIAL_PATCH  # re-exported: workers and agent read it here
 from ._bridge import PLAN as PLAN
 from ._errors import REMOTE_ERRORS
-from ._router import RouterDeferred, _reset_text
+from ._router import RouterDeferred, _reset_text, format_recheck, pick_wake_time
 
 Emit = Callable[[str, str], None]
 
@@ -223,6 +223,21 @@ def _append_line(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 
+#: How often a delegation waiting for a limit checks whether it was cleared: a cheap in-memory count, plus
+#: the shared store's own poll (`_limit_share.LIMIT_SHARE_POLL_S`).
+CLEAR_CHECK_S = 5.0
+
+
+async def _watch_clears() -> None:
+    """Return once a remembered limit was cleared in this pod since the call (`_usage.wake_count`)."""
+    clears = _usage.wake_count()
+    while True:
+        await asyncio.sleep(CLEAR_CHECK_S)
+        _usage.poll_limit_share()
+        if _usage.wake_count() > clears:
+            return
+
+
 class Delegations:
     def __init__(
         self,
@@ -414,13 +429,34 @@ class Delegations:
     async def wait_deferred(self, job_id: str, exc: RouterDeferred) -> None:
         """Record that `job_id` waits for an engine's reset, and sleep until it may be routed again."""
         until = exc.retry_at if exc.retry_at is not None else self.clock() + _session_config.LIMIT_RETRY_S
+        # The router lets one call through to a remembered limit once it is due a re-check, before its reset.
+        wake = pick_wake_time(until, exc.probe_at) or until
         # The deferral does not name its engine; a pinned delegate can only be waiting for its pin.
         awaited = _pins.delegate_pin().engine or "any engine"
-        _write_atomic(
-            self.root / ANSWERS / f"{job_id}.json", {"state": "waiting", "engine": awaited, "until": until}
+        waiting: dict[str, Any] = {"state": "waiting", "engine": awaited, "until": until}
+        if wake < until:
+            waiting["probe_at"] = wake
+        _write_atomic(self.root / ANSWERS / f"{job_id}.json", waiting)
+        self.emit(
+            "⏸️",
+            f"delegate {job_id} waits for {awaited} until {_reset_text(until)}"
+            + format_recheck(exc.probe_at, until),
         )
-        self.emit("⏸️", f"delegate {job_id} waits for {awaited} until {_reset_text(until)}")
-        await self.sleep(max(0.0, until - self.clock()))
+        await self._sleep_unless_cleared(max(0.0, wake - self.clock()))
+
+    async def _sleep_unless_cleared(self, seconds: float) -> None:
+        """Sleep `seconds`, or less if a remembered limit is cleared meanwhile (success, a pod, a person)."""
+        sleeping = asyncio.ensure_future(self.sleep(seconds))
+        watching = asyncio.ensure_future(_watch_clears())
+        try:
+            await asyncio.wait({sleeping, watching}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sleeping.cancel()
+            watching.cancel()
+        if sleeping.done() and not sleeping.cancelled():
+            sleeping.result()  # the sleep's own failure is the caller's
+        elif sleeping.cancelled() and not watching.done():
+            raise asyncio.CancelledError  # the sleep was cut off, not ended by a clear
 
     async def attempt(self, job_id: str, request: DelegateRequest, answer_only: bool) -> None:
         """Route and run one job in a slot the caller holds. Raises `RouterDeferred` to wait for a reset."""

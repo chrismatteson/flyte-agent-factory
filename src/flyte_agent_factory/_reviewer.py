@@ -70,8 +70,10 @@ async def _call_reviewer(
                 f"{kwargs.get('model') or 'default'}/{kwargs.get('effort') or 'default'}",
             )
 
-    if engine and not _usage._engine_exhausted(engine):
-        # A delegation may have waited on its snapshot/upload since choosing this engine.
+    if engine and (not _usage._engine_exhausted(engine) or _usage.holds_probe_grant(engine)):
+        # A delegation may have waited on its snapshot/upload since choosing this engine. One routed as
+        # the engine's probe holds its claim, which makes the engine read exhausted: it makes that call.
+        _usage.claim_probe(engine)
         if engine == "codex":
             settle("codex")
     else:
@@ -80,6 +82,7 @@ async def _call_reviewer(
             raise _usage._deferred(decision)
     suffix = ""
     announce()
+    started = _usage.read_wall_clock()
     try:
         text, out = await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
     except REMOTE_ERRORS as e:  # what a failed sub-agent action raises
@@ -114,8 +117,10 @@ async def _call_reviewer(
             else:
                 _timeline._log_line(f"[router] {message}")
             settle(builder)
+            _usage.claim_probe(builder)  # the builder's engine may be due a re-check: this call is it
             suffix = f"+{builder}"
         announce()
+        started = _usage.read_wall_clock()
         try:
             text, out = await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
         except Exception as retry_error:
@@ -131,6 +136,7 @@ async def _call_reviewer(
         timeline,
         engine=engine,
         effort=kwargs.get("effort", ""),
+        started=started,
     )
     return clean, out
 
@@ -213,15 +219,21 @@ class ReviewLimited(ReviewUnavailable):
     """A required judge could not run because of a usage limit; the review re-runs after the reset.
 
     `retry_at` is the router's own time to ask again (unix seconds) when it deferred the call; otherwise
-    None, and the supervisor reads the reset from `reset_text`. `missing` names the deferred judges; the
-    verdicts the others returned are kept for the re-run, as for `ReviewIncomplete`.
+    None, and the supervisor reads the reset from `reset_text`. `probe_at` is the earlier time a remembered
+    limit is due a re-check, if one is; the review waits until the earlier of the two. `missing` names the
+    deferred judges; the verdicts the others returned are kept for the re-run, as for `ReviewIncomplete`.
     """
 
     def __init__(
-        self, reset_text: str, retry_at: float | None = None, missing: dict[str, str] | None = None
+        self,
+        reset_text: str,
+        retry_at: float | None = None,
+        missing: dict[str, str] | None = None,
+        probe_at: float | None = None,
     ) -> None:
         """Keep `reset_text`, when the usage limit lifts, as the account reports it (may be empty)."""
         super().__init__(f"the reviewers are on the usage limit ({reset_text or 'reset time not shown'})")
         self.reset_text = reset_text
         self.retry_at = retry_at
+        self.probe_at = probe_at
         self.missing = dict(missing or {})

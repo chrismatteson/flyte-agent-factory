@@ -472,7 +472,7 @@ async def project(
     # nothing to unpack: after this they are simply on disk.
     state = await _state.restore(root=_session_config.STATE_ROOT, workspace_in=workspace_in)
     await _checkpoint._note_checkpoint_location(timeline, run_name)
-    _usage._meters = _meter.MeterStore(_session_config.STATE_ROOT / "meters")
+    _usage._meters = _usage.open_meters(_session_config.STATE_ROOT / "meters")
     os.environ["AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE"] = "claude"
     _session_setup._export_runtime_env()
     if _checkpoint._ended_path().is_file():

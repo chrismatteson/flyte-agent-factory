@@ -17,6 +17,7 @@ EXPECTED = {
     "agent-factory-subagent": ["agent-factory-subagent.subagent"],
     "factory": [
         "factory.browser_link",
+        "factory.clear_limit",
         "factory.credential_link",
         "factory.credentials",
         "factory.garden_weekly",

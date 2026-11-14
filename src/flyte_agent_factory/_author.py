@@ -208,6 +208,12 @@ def _restore_refusal(session: AuthorSession, owner: dict[str, Any]) -> None:
         current.limit_restored = (current.limit_hit_at, owner["limited_until"])
 
 
+def _limit_cleared(engine: str) -> bool:
+    """Whether `engine`'s author account has no remembered limit ahead (it was cleared, or never noted)."""
+    meter = _author_meter(engine)
+    return meter is None or meter.limited_until is None or meter.limited_until <= time.time()
+
+
 def _author_refusal_route(
     pin: _pins.Pin, timeline: _timeline._Timeline, refused: str, reset_at: float | None
 ) -> _router.Decision:
@@ -396,6 +402,8 @@ def _author_handoff(
     refused_until = 0.0
     refused_known = False
     refused_hit = None
+    # The clear count when the refusal was taken in: a clear after it may end the refused engine's limit.
+    refused_clears = 0
     last_decision: tuple[str | None, float | None] | None = None
     deferred_until = 0.0
     # What this pause already said, so a tick that changes nothing writes nothing. Reset by a new refusal.
@@ -410,11 +418,15 @@ def _author_handoff(
         nonlocal last_paused
         p = _router.paused(decision, now=time.time(), pin_why=_pin_why(pin), pin_fix=_pin_fix(pin))
         # The phase carries the pause on every deferral: the pump re-sets the phase after each one.
-        timeline.phase("limited", limited_until=session.retry_at, paused=p.as_dict())
+        timeline.phase(
+            "limited", limited_until=session.retry_at, probe_at=session.probe_at, paused=p.as_dict()
+        )
         if p.engine and p.engine == refused_engine and not refused_known and p.until == refused_until:
-            until = f"its reset (time unknown; checking again at {_when(session.retry_at or refused_until)})"
+            wake = _router.pick_wake_time(session.retry_at or refused_until, session.probe_at)
+            until = f"its reset (time unknown; checking again at {_when(wake or refused_until)})"
         else:
             until = _when(p.until) if p.until else "its reset (time unknown)"
+            until += _router.format_recheck(p.probe_at, p.until)
         if (p.engine, p.until) != last_paused:
             last_paused = (p.engine, p.until)
             why = "; ".join(f"{e}: {text}" for e, text in p.others.items())
@@ -436,7 +448,8 @@ def _author_handoff(
     session.known_resets = known_resets
 
     async def handoff(reset_at: float | None, interrupted: bool, reason: str = "usage limit") -> bool:
-        nonlocal refused_engine, refused_until, refused_known, refused_hit, last_decision, deferred_until
+        nonlocal refused_engine, refused_until, refused_known, refused_hit, refused_clears, last_decision
+        nonlocal deferred_until
         nonlocal last_paused, allowance_noted
         # Also on a re-evaluation at a deferred retry: the other engine may have reset since.
         await _usage._read_meters(timeline)
@@ -445,6 +458,7 @@ def _author_handoff(
         if refused_engine != _usage._author_engine or refused_hit != session.limit_hit_at:
             refused_engine = _usage._author_engine
             refused_hit = session.limit_hit_at
+            refused_clears = _usage.wake_count()
             own_meter = _author_meter(refused_engine)
             # A refusal restored after a restart carries its saved reset only here: the pump passes no
             # reset for it, and a missing or replaced meters file must not turn a weekly wait into 30 minutes.
@@ -494,6 +508,11 @@ def _author_handoff(
             owner["limited_until"] = refused_until
             owner["account"] = _author_account(refused_engine)
             _write_atomic(owner_file, owner)
+        elif _usage.wake_count() > refused_clears and _limit_cleared(refused_engine):
+            # A success, another pod or a person cleared the refused engine's limit since: its reset is
+            # now, not the notice's time, which would otherwise put the cleared limit back.
+            refused_clears = _usage.wake_count()
+            refused_known, refused_until, deferred_until = True, time.time(), 0.0
         decision = _author_refusal_route(pin, timeline, refused_engine, refused_until)
         ctx = flyte.ctx()
         run_name = ctx.action.run_name if ctx and ctx.action else "local"
@@ -541,8 +560,13 @@ def _author_handoff(
             # Every attempt is shown, so a reader can tell the router was asked again; the repeat is short
             # because the candidates and the reason are the row above.
             retry = f"; retry at {_clock(decision.retry_at)}" if decision.retry_at is not None else ""
+            retry += _router.format_recheck(decision.probe_at, decision.retry_at)
             timeline.row("🔀", f"router: author -> {decision.engine or 'deferred'} (unchanged{retry})")
-        session.retry_at = decision.retry_at or refused_until
+        # A probe is due: the pause ends now although the reset is ahead, and this call is the probe.
+        session.retry_at = decision.retry_at or (time.time() if decision.probe else refused_until)
+        session.probe_at = decision.probe_at if decision.deferred else None
+        if decision.probe and decision.engine:
+            _usage.claim_probe(decision.engine)
         if decision.deferred:
             note_pause(decision, pin)
         if decision.deferred or decision.engine == _usage._author_engine:
@@ -628,6 +652,9 @@ def _author_handoff(
                         conversation = {"engine": "claude", "thread": earlier, "pin": pin.engine}
                     else:
                         conversation["thread"] = str(uuid.uuid4())
+                if decision.probe:
+                    # Its first real work proves the limit over (`_supervise_support.HandoverProbe`).
+                    conversation["probe_since"] = record["at"]
                 _write_atomic(owner, conversation)
                 timeline.row(
                     "🔀",

@@ -12,7 +12,7 @@ the app ingress and Flyte runs each call as the caller, so Union RBAC applies.
 The server exposes every stock tool (32, listed in [architecture.md](architecture.md#the-controls-on-the-mcp)).
 Chat starts projects with `run_task` on `factory.launch` and follows them through the queue; the instructions
 steer it to `factory.launch`, `factory.status`, `factory.queue_list`, `factory.queue_cancel`,
-`factory.set_reserve`, `factory.get_reserve`, `factory.rotate_token`, `factory.browser_link`, `factory.credential_link`,
+`factory.set_reserve`, `factory.get_reserve`, `factory.clear_limit`, `factory.rotate_token`, `factory.browser_link`, `factory.credential_link`,
 `factory.credentials` and `factory-bench.benchmark`. Other tasks, such as `factory-deployer.deploy_if_changed`, can be run too. Running a slot
 task directly is unsupported (it skips validation and the queue) but not blocked.
 
