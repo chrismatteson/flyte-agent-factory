@@ -10,6 +10,7 @@ from there, so the same accessors work on an operator's machine and inside a tas
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import math
@@ -24,7 +25,9 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, TypedDict, cast
 
-from . import _git, _github, _names, _standards
+from . import _git, _github, _names, _profile_policy, _profile_union, _standards
+from ._profile_policy import Gardening as Gardening
+from ._profile_policy import JudgementPolicy as JudgementPolicy
 
 PROFILE_ENV = "AGENT_FACTORY_PROFILE"
 #: The profile's text, set on deployed environments. Not a `AGENT_FACTORY_<ROLE>_*` policy key.
@@ -181,6 +184,8 @@ class Github:
     webhook_secret: str = ""  # Mounted only in factory-webhook, never in project slots
     maintainers: tuple[str, ...] = ()  # lowercased logins allowed to submit issues and direction
     intake_label: str = "factory"
+    push: str = "deploy_key"  # "app": the App pushes; "deploy_key": the repo's deploy key does
+    workflows: bool = False  # whether pushes may touch .github/workflows
 
     @property
     def configured(self) -> bool:
@@ -283,24 +288,6 @@ class Loop:
 
 
 @dataclass(frozen=True)
-class Gardening:
-    """How hard the weekly gardening project (`_gardening`) is guaranteed a slot."""
-
-    min_runs_per_week: int = 1
-    max_days_between: int = 7
-    escalate_on_regression: bool = True
-    max_open_issues: int = 10
-
-
-@dataclass(frozen=True)
-class JudgementPolicy:
-    """Extras to the judge's built-in rules (`_judgement`); a profile adds to them and cannot remove any."""
-
-    owner_reserved: tuple[str, ...] = ()
-    standing_direction: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class Profile:
     name: str
     text: str  # the source, so a deploy can hand it to the pod
@@ -321,6 +308,7 @@ class Profile:
     planner: Planner = Planner()
     state: State = State()
     github: Github = Github()
+    union: _profile_union.Union = _profile_union.Union()
     board: Board | None = None
     direction: Direction | None = None
     bench: Bench | None = None
@@ -767,6 +755,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             "planner",
             "state",
             "github",
+            "union",
             "board",
             "direction",
             "bench",
@@ -815,6 +804,11 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     )
     if backend["kind"] not in BACKENDS:
         raise ProfileError(f"{where}: [backend] kind must be one of {BACKENDS}, not {backend['kind']!r}")
+
+    try:
+        union = _profile_union.parse(data.get("union"), required=backend["kind"] == "union")
+    except _profile_union.UnionError as exc:
+        raise ProfileError(f"{where}: {exc}") from exc
 
     repo_table = dict(_table(data, "repo", where))
     # Retired: its value is not an URL, so it goes before `_fields` reads the rest. The live profile and
@@ -977,9 +971,17 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         raise ProfileError(
             f"{where}: [github] intake_label must be a non-empty label of at most 50 characters"
         )
+    push = github_table.pop("push", "deploy_key")
+    if push not in ("app", "deploy_key"):
+        raise ProfileError(f'{where}: [github] push must be "app" or "deploy_key", not {push!r}')
+    workflows = github_table.pop("workflows", False)
+    if not isinstance(workflows, bool):
+        raise ProfileError(f"{where}: [github] workflows must be true or false")
     github = Github(
         maintainers=tuple(login.lower() for login in maintainers),
         intake_label=intake_label,
+        push=push,
+        workflows=workflows,
         **_fields(
             github_table,
             "github",
@@ -1047,7 +1049,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         direction = Direction(fields["repo"], str(path), fields.get("ref", ""))
 
     bench = (
-        _bench(data, where, repo, secrets, repo_keys, repo_aliases, github, board, gcp)
+        _bench(data, where, repo, secrets, repo_keys, repo_aliases, github, board, gcp, union=union)
         if "bench" in data
         else None
     )
@@ -1111,8 +1113,11 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             f"{where}: [bench] requires [repo] factory (or a [loop] repo), the engine it deploys at a SHA"
         )
 
-    gardening = _gardening_table(_table(data, "gardening", where, required=False), where)
-    judgement = _judgement_table(_table(data, "judgement", where, required=False), where)
+    try:
+        gardening = _profile_policy.parse_gardening(_table(data, "gardening", where, required=False))
+        judgement = _profile_policy.parse_judgement(_table(data, "judgement", where, required=False))
+    except _profile_policy.PolicyError as exc:
+        raise ProfileError(f"{where}: {exc}") from exc
 
     planner_fields = _fields(
         _table(data, "planner", where, required=False), "planner", where, (), ("admission",)
@@ -1144,6 +1149,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         planner=Planner(admission=admission),
         state=state,
         github=github,
+        union=union,
         board=board,
         direction=direction,
         bench=bench,
@@ -1157,32 +1163,6 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     )
 
 
-def _gardening_table(table: Mapping[str, Any], where: str) -> Gardening:
-    unknown = sorted(set(table) - set(Gardening.__dataclass_fields__))
-    if unknown:
-        raise ProfileError(f"{where}: unknown key(s) in [gardening]: {', '.join(unknown)}")
-    values = dict(table)
-    for key, minimum in (("min_runs_per_week", 0), ("max_days_between", 1), ("max_open_issues", 0)):
-        value = values.get(key, getattr(Gardening, key))
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ProfileError(f"{where}: [gardening] {key} must be an integer of at least {minimum}")
-    if not isinstance(values.get("escalate_on_regression", True), bool):
-        raise ProfileError(f"{where}: [gardening] escalate_on_regression must be a boolean")
-    return Gardening(**values)
-
-
-def _judgement_table(table: Mapping[str, Any], where: str) -> JudgementPolicy:
-    unknown = sorted(set(table) - set(JudgementPolicy.__dataclass_fields__))
-    if unknown:
-        raise ProfileError(f"{where}: unknown key(s) in [judgement]: {', '.join(unknown)}")
-    lists: dict[str, tuple[str, ...]] = {}
-    for key, value in table.items():
-        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
-            raise ProfileError(f"{where}: [judgement] {key} must be a list of non-empty strings")
-        lists[key] = tuple(v.strip() for v in value)
-    return JudgementPolicy(**lists)
-
-
 def _bench(
     data: Mapping[str, Any],
     where: str,
@@ -1193,6 +1173,8 @@ def _bench(
     github: Github,
     board: Board | None,
     gcp: Gcp | None = None,
+    *,
+    union: _profile_union.Union,
 ) -> Bench:
     table = dict(_table(data, "bench", where))
     if table.pop("logins", None) is not None:
@@ -1220,6 +1202,7 @@ def _bench(
         board.pat_secret if board else "",
         gcp.secret_name if gcp else "",  # gcp_bootstrap creates or replaces it
         *repo_keys.values(),
+        *union.secrets,
     } - {""}
     if repo_key in production_secrets:
         raise ProfileError(f"{where}: [bench] repo_key must not be a secret the production profile uses")
@@ -1411,20 +1394,68 @@ def child_env(profile: Profile, env: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# The deployer's `[{tier, secret, client_id}]` (JSON), for `factory.status` to show; never a key.
+IDENTITIES_ENV = "AGENT_FACTORY_UNION_IDENTITIES"
+
+
+#: What only the deployer puts into a deployed environment: the push mode its isolation canary allowed
+#: (`_github_mode`), the canary's reasons, and the identities it deployed with.
+DEPLOYER_ONLY_ENV = ("AGENT_FACTORY_GITHUB_PUSH", "AGENT_FACTORY_GITHUB_ISOLATION", IDENTITIES_ENV)
+_deployer_env: dict[str, str] = {}
+
+
+def set_deployer_env(values: Mapping[str, str]) -> None:
+    """Set the `DEPLOYER_ONLY_ENV` values `pod_env` adds: what the deployer passed its deploy child."""
+    unknown = set(values) - set(DEPLOYER_ONLY_ENV)
+    if unknown:
+        raise ValueError(f"not deployer-only settings: {sorted(unknown)}")
+    _deployer_env.clear()
+    _deployer_env.update({name: value for name, value in values.items() if value})
+
+
 def pod_env() -> dict[str, str]:
     """For a deployed environment's `env_vars`: the profile, as the pod will read it."""
     profile = current()
-    return {TOML_ENV: profile.deployment_text()} if profile else {}
+    env = {TOML_ENV: profile.deployment_text()} if profile else {}
+    # Never from this process's environment: a hand deploy from a shell that happens to carry
+    # AGENT_FACTORY_GITHUB_PUSH=app would bake App pushes into the slots without the isolation canary (#179).
+    # Only the deployer's deploy children set these, explicitly (`_deploy._run_child`'s `deployer_env`).
+    env.update(_deployer_env)
+    return env
+
+
+#: What `select_from_argv` selects for `--help` when nothing else selects a profile: the engine's shipped,
+#: neutral example. The ops scripts read the profile at import, before argparse runs, and usage is what
+#: someone runs to find out that they need one (#223); argparse exits after printing it, so nothing acts on
+#: this profile.
+HELP_PROFILE = Path(__file__).resolve().parents[2] / "profiles" / "example.toml"
 
 
 def select_from_argv(argv: list[str] | None = None) -> None:
-    """Honour `--profile NAME` before modules that read the profile at import are imported."""
+    """Honour `--profile NAME` before modules that read the profile at import are imported.
+
+    With `-h` or `--help` and no profile selected any other way, or one this engine refuses (a profile from
+    before `[union]`), select `HELP_PROFILE` so usage prints; the refusal is shown on stderr after it.
+    """
     args = sys.argv[1:] if argv is None else argv
     for i, arg in enumerate(args):
         if arg == "--profile" and i + 1 < len(args):
             os.environ[PROFILE_ENV] = args[i + 1]
         elif arg.startswith("--profile="):
             os.environ[PROFILE_ENV] = arg.split("=", 1)[1]
+    if not {"-h", "--help"} & set(args):
+        return
+    selected = _names.getenv(PROFILE_ENV).strip() or _names.getenv(TOML_ENV).strip()
+    if selected or (PROFILES_DIR / DEFAULT_FILE).is_file():
+        try:
+            require()
+            return
+        except ProfileError as exc:
+            # Usage is how someone finds out what to fix; the refusal still reaches them, after it.
+            note = f"note: the selected profile is not usable: {exc}"
+            atexit.register(lambda: print(note, file=sys.stderr))  # sys.stderr as it is at exit
+        os.environ.pop(TOML_ENV, None)
+    os.environ[PROFILE_ENV] = str(HELP_PROFILE)
 
 
 def _get(profile: Profile, key: str) -> str:

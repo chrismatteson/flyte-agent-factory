@@ -16,8 +16,12 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .data import FIELDS, cost_breakdown, read_jsonl, save_json, scrub
-from .experiment import BACKEND_ERRORS, TOKEN_FIELDS, grade, reference, replay, settings, summarize
+from flyte_agent_factory import _profile
+
+_profile.select_from_argv()  # before .experiment imports agent, which reads the profile at import
+
+from .data import FIELDS, cost_breakdown, read_jsonl, save_json, scrub  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from .experiment import BACKEND_ERRORS, TOKEN_FIELDS, grade, reference, replay, settings, summarize  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
 
 def config_at(path: str | None) -> dict[str, Any]:

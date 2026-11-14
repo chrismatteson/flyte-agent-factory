@@ -80,6 +80,8 @@ wait "$fast" || status=1
 
 uv run --with ruff ruff check src tests ops .github
 uv run --with ruff ruff format --check src tests ops .github
+# The strict mypy baseline (pyproject [tool.mypy]); ruff check above includes the docstring rule (D, pep257).
+uv run mypy .
 # The chat skills ship as committed zips; a stale one (exit 1) or one with no version line (exit 2) fails here.
 uv run python ops/package_skill.py --check skills/dist/agent-factory.zip
 uv run python ops/package_skill.py --check skills/dist/since.zip

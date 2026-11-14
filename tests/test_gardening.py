@@ -349,7 +349,7 @@ def test_the_decision_reads_the_target_list_from_the_workspace_repo(flyte_world,
     )
     monkeypatch.setattr(_factory_base, "PROFILE", profile)
     monkeypatch.setenv(_deploy.GITHUB_KEY_ENV, "offline-app-key")
-    monkeypatch.setattr(_github, "GithubApp", lambda *_: App())
+    monkeypatch.setattr(_github, "GithubApp", lambda *_, **__: App())
     assert _factory._gardening_targets() == []
 
 
@@ -357,7 +357,7 @@ def _github_profile(monkeypatch, files, **repos):
     """A profile whose workspace repo serves `files` (path -> text) through a fake GitHub app."""
 
     class App:
-        def __init__(self, *_):
+        def __init__(self, *_, **__):
             pass
 
         def read_file(self, repo, path):
@@ -418,7 +418,7 @@ def test_the_decision_counts_issues_on_the_workspace_repo(flyte_world, monkeypat
     asked = []
 
     class App:
-        def __init__(self, *_):
+        def __init__(self, *_, **__):
             pass
 
         def open_issues(self, repo, label):

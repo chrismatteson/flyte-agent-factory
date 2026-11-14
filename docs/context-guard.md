@@ -45,7 +45,7 @@ Because the bench was confounded, the default is checked in production and switc
   project) are left out unless the launch is a demo (the factory knows its demo kind) or the brief asks for one: the words demo, video, recording, walkthrough or
   screencast, as whole words in any case. When a demo is asked for, the console-auth block appears once, not twice.
   A short "Context hygiene" paragraph is added.
-- **Denies unbounded reads of large files.** A PreToolUse hook (`python -m flyte_agent_factory._context_guard`,
+- **Denies unbounded reads of large files.** A PreToolUse hook (module `flyte_agent_factory._context_guard`,
   matcher `Read|Bash`) refuses `Read` with no `offset` and no `limit`, and a plain `cat F`, `less F` or `more F`, on a
   text file over 24 KB. The reply gives the size, says the context is re-sent every turn, and shows how to read
   a range: `sed -n '1,200p' F`, `grep -n PATTERN F`, or `Read` with `offset` and `limit`. Ranged reads, anything

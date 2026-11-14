@@ -10,7 +10,6 @@ from pathlib import Path
 from . import _bootstrap_profile as profile_file
 from . import _profile, _workspace
 from ._bootstrap_base import (
-    API_KEY_REQUIREMENT,
     APP_LOST,
     BLOCKED,
     DONE,
@@ -385,15 +384,6 @@ class DeployStep:
     def do(self, ctx: Context) -> Outcome:
         if ctx.settings.backend == "oss":
             return Outcome(BLOCKED, _GAP)
-        if not ctx.deployer.api_key_available():
-            return Outcome(
-                BLOCKED,
-                "the deploy needs a Union API key and this machine cannot make one: "
-                f"{API_KEY_REQUIREMENT}. Run this on a Linux x86_64 machine, where it makes the key and "
-                f"shows it once on that terminal: {build_command(ctx.settings, '--deploy-key')} . Store the "
-                "key in a password manager and export _UNION_EAGER_API_KEY with it "
-                "(docs/quickstart.md, `Local Union deployment bootstrap`), then run this again",
-            )
         url = ctx.deployer.deploy(ctx.profile_path)
         if url:
             ctx.facts["mcp_url"] = url

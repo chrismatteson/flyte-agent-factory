@@ -310,13 +310,13 @@ def test_installation_token_is_for_direction_repo(monkeypatch):
     requested = []
 
     class App:
-        def installation_token(self, repo):
-            requested.append(repo)
+        def installation_token(self, repo, permissions):
+            requested.append((repo, dict(permissions)))
             return "test-token"
 
     monkeypatch.setattr(_bench_store, "Store", lambda url: url)
     url: object = _bench_flow._store(cast(GithubApp, App()))  # `Store` is stubbed to return the url
-    assert requested == ["example-org/direction"]
+    assert requested == [("example-org/direction", {"contents": "write"})]  # the store pushes results
     assert url == "https://x-access-token:test-token@github.com/example-org/direction.git"
 
 
@@ -343,7 +343,7 @@ def test_token_failure_is_a_store_error(monkeypatch):
     monkeypatch.setattr(_bench_flow, "PROFILE", profile())
 
     class App:
-        def installation_token(self, repo):
+        def installation_token(self, repo, permissions):
             raise _github.GithubError("access refused")
 
     with pytest.raises(_bench_store.StoreError, match="installation token"):

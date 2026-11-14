@@ -44,10 +44,6 @@ DENIED_TOOLS = [
 ]
 
 
-#: Where the pod's Union API key is, in the order the SDK reads them (`flyte._initialize`).
-API_KEY_ENV_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY")
-
-
 #: Claude Code reads the setup-token from this inherited file descriptor when it is set (Claude Code
 #: 2.1.x; `strings` on the binary lists it beside `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`). It keeps the
 #: token out of the session's environment, and so out of `/proc/<pid>/environ` and every `env`
@@ -113,19 +109,16 @@ def set_non_dumpable() -> bool:
 
 
 def own_client_id() -> str:
-    """Return the client id of this pod's API key, or "" if there is none or it is unreadable.
+    """Return the client id of this pod's Union key, or "" if it has none or it is unreadable.
 
     The server names an API key by this id when it aborted something. Only the id is returned: the
-    key also holds the secret, which never leaves `decode_api_key`.
+    key also holds the secret, which `_union_identity` never lets leave.
     """
-    from flyte.remote._client.auth._auth_utils import decode_api_key  # the SDK's own parser of the format
+    from . import _union_identity
 
-    key = next((v for v in (os.environ.get(n, "") for n in API_KEY_ENV_VARS) if v), "")
-    if not key:
-        return ""
     try:
-        return decode_api_key(key)[1]
-    except ValueError:  # binascii.Error and UnicodeDecodeError are ValueErrors
+        return _union_identity.current().client_id
+    except _union_identity.IdentityMissing:
         return ""
 
 

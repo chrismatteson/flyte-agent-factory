@@ -28,7 +28,7 @@ from ._bootstrap_base import BLOCKED, DEFAULT_DOMAIN, DONE, TODO, Check, Context
 from ._bootstrap_finish import ConnectStep, DeployStep, GithubAppStep, McpUrlStep, ProfileStep
 from ._bootstrap_flyte import DeployScripts, FlyteSdk
 from ._bootstrap_github import GhCli
-from ._bootstrap_keys import GRANTABLE, grant_key, make_chat_key, make_deploy_key
+from ._bootstrap_keys import GRANTABLE, UnionKeysStep, grant_key, make_chat_key
 from ._bootstrap_steps import (
     BoardStep,
     DeployKeyStep,
@@ -43,7 +43,7 @@ from ._bootstrap_steps import (
 from ._profile import _STATE_SCHEMES
 
 EXIT_OK, EXIT_TODO = 0, 3
-KEY_MODES = {"chat-key": "the chat key", "deploy-key": "the deployment key", "grant": "granting a key"}
+KEY_MODES = {"chat-key": "the chat key", "grant": "granting a key"}
 _WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 _T = TypeVar("_T")
 # Every later step runs `gh`, `git` or `uv`; without them their checks end in a raw FileNotFoundError.
@@ -62,6 +62,9 @@ def build_steps() -> list[Step]:
         # workspace's steps: both store their private key as a Flyte secret, which needs them.
         SignInStep(),
         ProjectStep(),
+        # The factory's own Union keys, stored as secrets over the CLI login: the pods and the deployer act as
+        # them. After the profile, which names the secrets.
+        UnionKeysStep(),
         DeployKeyStep(),
         GithubAppStep(),
         # After the pushes of the template, the profile and the App's profile keys; the factory-URL push
@@ -102,17 +105,7 @@ def _guard(label: str, call: Callable[[], _T]) -> _T | base.Outcome:
 
 
 def run(ctx: Context, table: Sequence[Step]) -> int:
-    """Run the table; return the exit code. `settings.status_only` runs the checks alone, `dry_run` plans.
-
-    The deployer is released at the end whatever happened: it holds the ephemeral deployment API key.
-    """
-    try:
-        return _run(ctx, table)
-    finally:
-        ctx.deployer.close()
-
-
-def _run(ctx: Context, table: Sequence[Step]) -> int:
+    """Run the table; return the exit code. `settings.status_only` runs the checks alone, `dry_run` plans."""
     status_only = ctx.settings.status_only
     read_only = ctx.settings.read_only
     pending: list[str] = []
@@ -170,29 +163,34 @@ def _run(ctx: Context, table: Sequence[Step]) -> int:
     return EXIT_OK
 
 
-def run_key_mode(ctx: Context, mode: str, make: Callable[[], base.Outcome] | None = None) -> int:
-    """Run `--chat-key`, `--deploy-key` or `--grant` (`make`); print its one line and return the exit code.
-
-    The sign-in step runs first, as in the table: the keys are made in the org the Flyte config names, which
-    must be `--endpoint`'s, and these commands are often run on a machine that has no config yet.
-    """
-    if make is None:
-        make = functools.partial(make_chat_key if mode == "chat-key" else make_deploy_key, ctx)
-    # Needs no Union call, so it comes before the sign-in opens a browser for nothing.
-    if not ctx.flyte.can_manage_keys():
-        what = KEY_MODES[mode]
-        needs = (
-            f"{what} needs flyteplugins-union: {base.API_KEY_REQUIREMENT}. Run this on a Linux x86_64 machine"
-        )
-        ctx.say(_format_line(BLOCKED, mode, needs))
-        return EXIT_TODO
+def _signed_in(ctx: Context, mode: str) -> bool:
+    """Sign in if the config does not work yet; say why on the `mode` line and return False if that fails."""
     signin = SignInStep()
     checked = _guard("check", functools.partial(signin.check, ctx))
     if isinstance(checked, base.Outcome) or not checked.ok:
         outcome = _guard("step", functools.partial(signin.do, ctx))
         if outcome.status != DONE:
             ctx.say(_format_line(outcome.status, mode, outcome.detail))
-            return EXIT_TODO
+            return False
+    return True
+
+
+def run_key_mode(ctx: Context, mode: str, make: Callable[[], base.Outcome] | None = None) -> int:
+    """Run `--chat-key` or `--grant` (`make`); print its one line and return the exit code.
+
+    The sign-in step runs first, as in the table: the keys are made in the org the Flyte config names, which
+    must be `--endpoint`'s, and these commands are often run on a machine that has no config yet.
+    """
+    if make is None:
+        make = functools.partial(make_chat_key, ctx)
+    # Needs no Union call, so it comes before the sign-in opens a browser for nothing.
+    if not ctx.flyte.can_manage_keys():
+        what = KEY_MODES[mode]
+        needs = f"{what}: {base.KEY_PLUGIN_REQUIREMENT}. Run this on a Linux x86_64 machine"
+        ctx.say(_format_line(BLOCKED, mode, needs))
+        return EXIT_TODO
+    if not _signed_in(ctx, mode):
+        return EXIT_TODO
     outcome = _guard("step", make)
     ctx.say(_format_line(outcome.status, mode, outcome.detail))
     return EXIT_OK if outcome.status == DONE else EXIT_TODO
@@ -234,17 +232,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "Code with it, or show it once on this terminal (Linux x86_64)",
     )
     keys.add_argument(
-        "--deploy-key",
+        "--union-keys",
         action="store_true",
-        help="instead of the steps: make the factory-deploy Union API key and its grant, and show the key "
-        "once on this terminal, never on stdout (Linux x86_64)",
+        help="instead of the steps: sign in, then make the factory's project and deployer Union API keys and "
+        "store each as a Flyte secret, printing only client ids (Linux x86_64 makes them; elsewhere you "
+        "paste keys made in the console at a hidden prompt)",
     )
     keys.add_argument(
         "--grant",
         nargs=2,
         metavar=("POLICY", "CLIENT_ID"),
         help=f"instead of the steps, for a Union admin: give policy {' or '.join(GRANTABLE)} (made if "
-        "missing) to the key with this client ID, which --chat-key or --deploy-key printed when its maker "
+        "missing) to the key with this client ID, which --chat-key or --union-keys printed when its maker "
         "could not (Linux x86_64)",
     )
     return ap
@@ -256,14 +255,11 @@ def main(
     """Run the bootstrap. `make_context` lets tests supply fake adapters; the command line never does."""
     ap = _build_parser()
     args = ap.parse_args(argv)
-    if (args.chat_key or args.deploy_key or args.grant) and (args.dry_run or args.status):
+    if (args.chat_key or args.grant) and (args.dry_run or args.status):
+        ap.error("--chat-key and --grant change Union; they cannot be combined with --dry-run or --status")
+    if (args.chat_key or args.union_keys or args.grant) and args.backend == "oss":
         ap.error(
-            "--chat-key, --deploy-key and --grant change Union; they cannot be combined with --dry-run or "
-            "--status"
-        )
-    if (args.chat_key or args.deploy_key or args.grant) and args.backend == "oss":
-        ap.error(
-            "--chat-key, --deploy-key and --grant make Union API keys and policies; OSS Flyte has neither "
+            "--chat-key, --union-keys and --grant make Union API keys and policies; OSS Flyte has neither "
             "(see docs/oss-flyte-compat.md for MCP authentication there)"
         )
     if args.grant and args.grant[0] not in GRANTABLE:
@@ -304,8 +300,12 @@ def main(
         context = make_context(settings)
     if args.grant:
         return run_key_mode(context, "grant", functools.partial(grant_key, context, *args.grant))
-    if args.chat_key or args.deploy_key:
-        return run_key_mode(context, "chat-key" if args.chat_key else "deploy-key")
+    if args.chat_key:
+        return run_key_mode(context, "chat-key")
+    if args.union_keys:  # only this step, after the sign-in it needs: the keys are made in the config's org
+        if not context.settings.read_only and not _signed_in(context, "union-keys"):
+            return EXIT_TODO
+        return run(context, [UnionKeysStep()])
     return run(context, build_steps())
 
 

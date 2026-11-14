@@ -168,16 +168,20 @@ def test_the_run_notes_its_key_only_by_client_id(monkeypatch):
     """The factory compares who aborted a run with the run's own key; the secret part never leaves it."""
     import base64
 
-    from flyte_agent_factory import _auth
+    from flyte_agent_factory import _auth, _union_identity
 
     key = base64.b64encode(b"tenant.example:pods-key-id:s3cr3t-part:org1").decode()
+    _union_identity.current.cache_clear()
     monkeypatch.delenv("EAGER_API_KEY", raising=False)
+    monkeypatch.delenv("_UNION_EAGER_API_KEY", raising=False)
+    monkeypatch.setenv(_union_identity.KEY_ENV, key)
+    assert _auth.own_client_id() == "pods-key-id"
+    # The key Union injects is not this pod's identity, whatever it holds.
+    _union_identity.current.cache_clear()
     monkeypatch.setenv("_UNION_EAGER_API_KEY", key)
-    assert _auth.own_client_id() == "pods-key-id"
-    monkeypatch.delenv("_UNION_EAGER_API_KEY")
-    monkeypatch.setenv("EAGER_API_KEY", key)  # the SDK's fallback name
-    assert _auth.own_client_id() == "pods-key-id"
-    monkeypatch.setenv("EAGER_API_KEY", "not-a-key")
+    monkeypatch.setenv(_union_identity.KEY_ENV, "not-a-key")
     assert _auth.own_client_id() == ""
-    monkeypatch.delenv("EAGER_API_KEY")
+    _union_identity.current.cache_clear()
+    monkeypatch.delenv(_union_identity.KEY_ENV)
     assert _auth.own_client_id() == ""
+    _union_identity.current.cache_clear()

@@ -40,8 +40,22 @@ _PERMISSIONS = {
     "pull_requests": "write",
     "statuses": "write",
     "checks": "read",
+    "actions": "read",  # `ci-status --logs` reads job logs
     "issues": "write",
 }
+
+
+def manifest_permissions(push_app: bool = False, workflows: bool = False) -> dict[str, str]:
+    """Return the App's permissions. Code write access only when the profile pushes by App token.
+
+    An App whose key a session might still reach (`_isolation_canary`) must not hold `contents: write`.
+    """
+    permissions = dict(_PERMISSIONS)
+    if push_app:
+        permissions["contents"] = "write"
+        if workflows:
+            permissions["workflows"] = "write"
+    return permissions
 
 
 class GhCli:
@@ -233,7 +247,9 @@ class GhCli:
         # `gh` cannot sign an App JWT and GitHub lists a user account's installations only to the App itself,
         # so the check is the App's own: asking for an installation token on the repository.
         try:
-            _github.GithubApp(registration.app_id, registration.pem).installation_token(repo)
+            _github.GithubApp(registration.app_id, registration.pem).installation_token(
+                repo, _github.METADATA_READ
+            )
         except _github.GithubError as exc:
             if exc.status == 404:
                 return False
@@ -280,7 +296,9 @@ def build_ruleset_body(name: str, deploy_key_bypass: bool) -> dict[str, object]:
     }
 
 
-def build_manifest(owner: str, repo: str, redirect_url: str) -> dict[str, object]:
+def build_manifest(
+    owner: str, repo: str, redirect_url: str, *, push_app: bool = False, workflows: bool = False
+) -> dict[str, object]:
     """Return the App manifest for the workspace.
 
     Webhooks stay off: `docs/deploy-webhook.md` sets them up later.
@@ -292,7 +310,7 @@ def build_manifest(owner: str, repo: str, redirect_url: str) -> dict[str, object
         "redirect_url": redirect_url,
         "public": False,
         "hook_attributes": {"url": workspace_url, "active": False},
-        "default_permissions": dict(_PERMISSIONS),
+        "default_permissions": manifest_permissions(push_app, workflows),
         "default_events": [],
     }
 
@@ -324,9 +342,19 @@ def read_callback_code(expected_state: str, query: str) -> str:
 class ManifestFlow:
     """A one-shot local web server: serves the auto-submitting form, then waits for GitHub's redirect."""
 
-    def __init__(self, owner: str, repo: str, is_org: bool, state: str | None = None) -> None:
+    def __init__(
+        self,
+        owner: str,
+        repo: str,
+        is_org: bool,
+        state: str | None = None,
+        *,
+        push_app: bool = False,
+        workflows: bool = False,
+    ) -> None:
         self.state = state or secrets.token_urlsafe(24)
         self._owner, self._repo, self._is_org = owner, repo, is_org
+        self._push_app, self._workflows = push_app, workflows
         self.code: str | None = None
         self._server = http.server.HTTPServer(("127.0.0.1", 0), self._make_handler())
         self._server.timeout = 1
@@ -337,7 +365,11 @@ class ManifestFlow:
 
     def _render_page(self) -> bytes:
         redirect = f"http://127.0.0.1:{self._server.server_port}/callback"
-        document = json.dumps(build_manifest(self._owner, self._repo, redirect))
+        document = json.dumps(
+            build_manifest(
+                self._owner, self._repo, redirect, push_app=self._push_app, workflows=self._workflows
+            )
+        )
         target = build_registration_url(self._owner, self._is_org, self.state)
         return (
             "<!doctype html><title>Register the factory's GitHub App</title>"
@@ -392,10 +424,17 @@ class ManifestFlow:
 
 
 def register_app(
-    owner: str, repo: str, is_org: bool, open_url: Callable[[str], object], say: Callable[[str], None]
+    owner: str,
+    repo: str,
+    is_org: bool,
+    open_url: Callable[[str], object],
+    say: Callable[[str], None],
+    *,
+    push_app: bool = False,
+    workflows: bool = False,
 ) -> str:
     """Run the manifest flow in the browser and return GitHub's one-time code."""
-    flow = ManifestFlow(owner, repo, is_org)
+    flow = ManifestFlow(owner, repo, is_org, push_app=push_app, workflows=workflows)
     say(f"Opening {flow.start_url} to register your GitHub App (open it yourself if no browser appears).")
     threading.Thread(target=open_url, args=(flow.start_url,), daemon=True).start()
     return flow.wait()

@@ -215,7 +215,13 @@ async def test_no_token_or_key_reaches_an_answer_file(service, bridge_root, gith
     await ask(service, bridge_root, sha=None, job=None)
     await ask(service, bridge_root, sha=None, job=9)
     await ask(service, bridge_root, sha="zz", job=None)
-    assert github.minted == 1
+    # One token per scope, each for this repo alone: contents (the branch head) and CI (runs, checks, logs).
+    assert github.minted == 2
+    scopes = [
+        json.loads(r.content)["permissions"] for r in github.requests if r.url.path.endswith("/access_tokens")
+    ]
+    assert {"contents": "read"} in scopes
+    assert {"checks": "read", "statuses": "read", "actions": "read"} in scopes
     for path in (bridge_root / "answers").iterdir():
         text = path.read_text()
         assert "ghs_installation_secret_token" not in text

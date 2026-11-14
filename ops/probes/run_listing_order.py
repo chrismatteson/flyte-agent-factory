@@ -12,6 +12,7 @@ rounds pass; otherwise keep the git-ref fallback. No object-storage state or pro
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import json
@@ -19,17 +20,34 @@ import os
 import sys
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import flyte
 import flyte.errors
 from flyte import remote
 
-from flyte_agent_factory.child import attach
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from flyte_agent_factory import _profile
+
+_profile.select_from_argv()  # before PROFILE below reads it
+
+from flyte_agent_factory import _union_identity  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory.child import attach  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+
+# The tier key, as every factory environment mounts it, so `create_and_list` lists and creates runs as
+# that key and not as the one Union injects into every pod (#183). No profile leaves the environment
+# without it, which only `--help` may do: `probe` requires one before it deploys anything.
+PROFILE = _profile.current()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue") if PROFILE else ([], {})
 env = flyte.TaskEnvironment(
     name="probe-run-listing",
     image=os.environ.get("FLYTE_INTERNAL_IMAGE", "python:3.12-slim"),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="512Mi"),
     interruptible=True,
 )
@@ -45,6 +63,7 @@ async def noop(nonce: str) -> str:
 @env.task(timeout=bound)
 async def create_and_list(cohort: str, nonce: str, task_name: str) -> dict[str, Any]:
     """Create a run in `cohort` and return its name with the cohort runs listed right after."""
+    _union_identity.establish()
     task = remote.Task.get(name=task_name, auto_version="latest")
     run = await flyte.with_runcontext(mode="remote", labels={"listing-probe": cohort}).run.aio(
         task, nonce=nonce
@@ -65,6 +84,7 @@ async def probe() -> dict[str, Any]:
     """Create runs concurrently and report whether each sees its older siblings in the listing."""
     if not os.environ.get("FLYTE_INTERNAL_IMAGE"):
         raise RuntimeError("run this probe in an attached session with FLYTE_INTERNAL_IMAGE")
+    _profile.require()  # the environment above carries the tier key only when a profile is selected
     ctx = attach()
     nonce = uuid.uuid4().hex
     task_name = f"{env.name}.noop"
@@ -122,6 +142,7 @@ async def probe() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__.split("\n\n")[0]).parse_args()  # only --help: no options
     with contextlib.redirect_stdout(sys.stderr):
         result = asyncio.run(probe())
     print(json.dumps(result, indent=2))

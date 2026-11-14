@@ -30,6 +30,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 from flyte_agent_factory import _deploy, _profile
 from flyte_agent_factory._errors import REMOTE_ERRORS
 

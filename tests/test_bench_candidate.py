@@ -197,7 +197,8 @@ class World:
         world = self
 
         class App:
-            def installation_token(self, repo):
+            def installation_token(self, repo, permissions):
+                assert dict(permissions) == {"contents": "read"}  # a fetch only
                 if world.public:
                     raise _github.GithubError("not installed", status=404)
                 return "token"
@@ -293,7 +294,7 @@ def test_a_candidate_repo_the_app_fails_on_for_another_reason_is_not_read_anonym
     world = World(monkeypatch)
 
     class Broken:
-        def installation_token(self, repo):
+        def installation_token(self, repo, permissions):
             raise _github.GithubError("bad credentials", status=401)
 
     with pytest.raises(_github.GithubError, match="bad credentials"):

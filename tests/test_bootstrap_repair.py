@@ -61,48 +61,6 @@ def test_sign_in_calls_project_listall_the_way_the_sdk_allows(monkeypatch):
     assert called == [{}]
 
 
-def test_api_key_available_without_flyteplugins_is_false_not_a_crash(monkeypatch):
-    import importlib.util
-
-    def find_spec(name, *a):
-        raise ModuleNotFoundError("No module named 'flyteplugins'", name="flyteplugins")
-
-    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
-    assert DeployScripts(env={}).api_key_available() is False
-
-
-# --- 3: one deployment API key per run ------------------------------------------------------------------
-
-
-def test_the_deploy_api_key_is_created_once_per_run(monkeypatch, tmp_path):
-    import types
-
-    made: list[str] = []
-
-    class ApiKey:
-        encoded_credentials = DEPLOY_SENTINEL
-        client_id = "agent-factory-deploy"
-
-        @classmethod
-        def create(cls, name):
-            made.append(name)
-            return cls()
-
-    module = types.ModuleType("flyteplugins.union.remote")
-    module.ApiKey = ApiKey  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "flyteplugins", types.ModuleType("flyteplugins"))
-    monkeypatch.setitem(sys.modules, "flyteplugins.union", types.ModuleType("flyteplugins.union"))
-    monkeypatch.setitem(sys.modules, "flyteplugins.union.remote", module)
-    (tmp_path / "ops").mkdir()
-    for script in ("deploy_work.py", "deploy_factory.py"):
-        (tmp_path / "ops" / script).write_text("print('ok')\n")
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)  # the key's client id is recorded there
-    deployer = DeployScripts(env={}, engine_root=tmp_path, say=lambda line: None)
-    deployer.deploy(tmp_path / "profile.toml")
-    deployer.deploy(tmp_path / "profile.toml", work=False)
-    assert made == ["agent-factory-deploy"]
-
-
 # --- 5: the ruleset must not lock the bootstrap's own pushes out ---------------------------------------
 
 
@@ -447,189 +405,208 @@ _ = (textwrap, _profile, _bootstrap)
 # Repair batch after the second verification (docs/quickstart.md "Manual reference" is unchanged).
 # =====================================================================================================
 
-# --- B-A: the deployment API key is ephemeral -----------------------------------------------------------
+# --- B-A: the deploy runs as the person's CLI login, never as an API key -------------------------------
 
 
-class _UnionServer:
-    """What Union does with API keys that matters here: a second key of the same name is refused, and on a
-    serverless tenant the client id is `<tenant>-<handle>-<name>` (`prefix`)."""
-
-    def __init__(self, prefix: str = "") -> None:
-        self.keys: dict[str, str] = {}
-        self.deleted: list[str] = []
-        self.prefix = prefix
-
-
-def _install_fake_union(monkeypatch, server: _UnionServer) -> None:
-    import types
-
-    class Key:
-        def __init__(self, client_id: str) -> None:
-            self.client_id = client_id
-            self.encoded_credentials = DEPLOY_SENTINEL
-
-        @classmethod
-        def create(cls, name):
-            client_id = server.prefix + name
-            if client_id in server.keys:
-                raise RuntimeError("AlreadyExists: client id is taken")
-            server.keys[client_id] = name
-            return cls(client_id)
-
-        @classmethod
-        def delete(cls, client_id):
-            if client_id not in server.keys:
-                raise ConnectError(Code.NOT_FOUND, f"app {client_id} not found")
-            server.deleted.append(client_id)
-            del server.keys[client_id]
-
-    module = types.ModuleType("flyteplugins.union.remote")
-    module.ApiKey = Key  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "flyteplugins", types.ModuleType("flyteplugins"))
-    monkeypatch.setitem(sys.modules, "flyteplugins.union", types.ModuleType("flyteplugins.union"))
-    monkeypatch.setitem(sys.modules, "flyteplugins.union.remote", module)
-
-
-def _engine_root(tmp_path, fail: bool = False):
-    # Also the workspace clone in these tests (`tmp_path / "profile.toml"`), whose git config records the key.
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+def _engine_root(tmp_path, fail: bool = False, body: str | None = None):
     (tmp_path / "ops").mkdir(exist_ok=True)
-    body = "import sys\nsys.exit(1)\n" if fail else "print('ok')\n"
+    body = body or ("import sys\nsys.exit(1)\n" if fail else "print('ok')\n")
     for script in ("deploy_work.py", "deploy_factory.py"):
         (tmp_path / "ops" / script).write_text(body)
     return tmp_path
 
 
-def _deployer(tmp_path, env=None) -> DeployScripts:
-    return DeployScripts(env=env or {}, engine_root=tmp_path, say=lambda line: None)
+def test_the_deploy_scripts_get_neither_the_injected_key_nor_a_deployer_key_selector(monkeypatch, tmp_path):
+    """They act as the CLI login (`init_for_script`): a leftover export must not redirect or leak in."""
+    monkeypatch.setitem(sys.modules, "flyteplugins", None)  # any import of the key-making plugin would raise
+    seen: list[str] = []
+    root = _engine_root(
+        tmp_path,
+        body=(
+            "import os\nprint(sorted(k for k in os.environ if 'EAGER' in k or k == "
+            "'AGENT_FACTORY_DEPLOY_KEY_ENV'), os.environ['PYTHONPATH'].endswith('src'))\n"
+        ),
+    )
+    env = {"_UNION_EAGER_API_KEY": DEPLOY_SENTINEL, "EAGER_API_KEY": DEPLOY_SENTINEL}
+    deployer = DeployScripts(
+        env={**env, "AGENT_FACTORY_DEPLOY_KEY_ENV": "X"}, engine_root=root, say=seen.append
+    )
+    deployer.deploy(tmp_path / "profile.toml")
+    assert seen == ["[] True", "[] True"]
+
+
+def test_a_work_less_deploy_runs_only_the_factory_script(tmp_path):
+    seen: list[str] = []
+    root = _engine_root(tmp_path, body="import sys\nprint(sys.argv[0].rsplit('/', 1)[-1])\n")
+    DeployScripts(env={}, engine_root=root, say=seen.append).deploy(tmp_path / "profile.toml", work=False)
+    assert seen == ["deploy_factory.py"]
+
+
+def test_a_failed_deploy_script_is_a_bootstrap_error_naming_it(tmp_path):
+    with pytest.raises(BootstrapError, match=r"ops/deploy_work.py failed \(1\)"):
+        DeployScripts(env={}, engine_root=_engine_root(tmp_path, fail=True), say=lambda line: None).deploy(
+            tmp_path / "profile.toml"
+        )
+
+
+def test_the_deployer_has_no_key_to_release():
+    """Nothing is minted, so nothing is closed: the deploy leaves no Union key behind."""
+    assert not hasattr(DeployScripts, "close") and not hasattr(DeployScripts, "api_key_available")
+
+
+# The bootstrap used to mint a temporary deploy API key per run, record it in the clone's git config and
+# delete it on close. Deploys now run as the person's CLI login (#183), so each of those guarantees becomes
+# "no key is made, recorded or deleted, whatever state the tenant or the clone is in".
+def _watch_union_keys(monkeypatch) -> list[str]:
+    """Install a fake key plugin that records every key call the deployer makes; return the record."""
+    import types
+
+    calls: list[str] = []
+
+    class ApiKey:
+        @classmethod
+        def create(cls, name):
+            calls.append(f"create {name}")
+
+        @classmethod
+        def delete(cls, client_id):
+            calls.append(f"delete {client_id}")
+
+        @classmethod
+        def listall(cls, **kwargs):
+            calls.append("listall")
+            return iter([])
+
+    module = types.ModuleType("flyteplugins.union.remote")
+    module.ApiKey = ApiKey  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "flyteplugins", types.ModuleType("flyteplugins"))
+    monkeypatch.setitem(sys.modules, "flyteplugins.union", types.ModuleType("flyteplugins.union"))
+    monkeypatch.setitem(sys.modules, "flyteplugins.union.remote", module)
+    return calls
+
+
+def _deploy(root: Path, profile: Path, **kw: Any) -> list[str]:
+    seen: list[str] = []
+    DeployScripts(env=kw.pop("env", {}), engine_root=root, say=seen.append).deploy(profile, **kw)
+    return seen
 
 
 def _recorded(clone: Path) -> str:
-    return subprocess.run(
-        ["git", "config", "--local", "--get-all", "agent-factory.deploy-api-key"],
+    proc = subprocess.run(
+        ["git", "config", "--get-all", "agent-factory.deploy-api-key"],
         cwd=clone,
         capture_output=True,
         text=True,
-    ).stdout
+    )
+    return proc.stdout.strip()
 
 
-OTHER = "tenant-other-agent-factory-deploy"
+def test_api_key_available_without_flyteplugins_is_false_not_a_crash(monkeypatch, tmp_path):
+    """Without the plugin the deploy neither crashes nor asks for it: it needs no key at all."""
+    monkeypatch.setitem(sys.modules, "flyteplugins", None)  # any import of the plugin would raise
+    assert _deploy(_engine_root(tmp_path), tmp_path / "profile.toml") == ["ok", "ok"]
+
+
+def test_the_deploy_api_key_is_created_once_per_run(monkeypatch, tmp_path):
+    """Once is now never: a run's two deploys make no key between them."""
+    calls = _watch_union_keys(monkeypatch)
+    root = _engine_root(tmp_path)
+    _deploy(root, tmp_path / "profile.toml")
+    _deploy(root, tmp_path / "profile.toml", work=False)
+    assert calls == []
 
 
 def test_another_members_deploy_key_on_the_tenant_is_never_deleted(monkeypatch, tmp_path):
-    server = _UnionServer(prefix="tenant-pat-")
-    server.keys[OTHER] = "another member's bootstrap, in flight"
-    _install_fake_union(monkeypatch, server)
-    deployer = _deployer(_engine_root(tmp_path))
-    deployer.deploy(tmp_path / "profile.toml")
-    assert set(server.keys) == {OTHER, "tenant-pat-agent-factory-deploy"}
-    deployer.close()
-    assert list(server.keys) == [OTHER] and server.deleted == ["tenant-pat-agent-factory-deploy"]
-    assert _recorded(tmp_path) == ""  # no key and no record left after the run
+    calls = _watch_union_keys(monkeypatch)
+    _deploy(_engine_root(tmp_path), tmp_path / "profile.toml")
+    assert not [c for c in calls if c.startswith("delete")] and calls == []
 
 
 def test_the_key_is_recorded_before_it_is_used(monkeypatch, tmp_path):
-    server = _UnionServer(prefix="tenant-pat-")
-    _install_fake_union(monkeypatch, server)
-    root = _engine_root(tmp_path)
-    (root / "ops" / "deploy_work.py").write_text(
-        "import subprocess\nprint(subprocess.run(['git', 'config', '--get-all', "
-        "'agent-factory.deploy-api-key'], capture_output=True, text=True).stdout.strip())\n"
+    """There is no key to record: the scripts run with no deploy key in the clone's config or environment."""
+    _watch_union_keys(monkeypatch)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    root = _engine_root(
+        tmp_path,
+        body=(
+            "import os, subprocess\nprint(repr(subprocess.run(['git', 'config', '--get-all', "
+            "'agent-factory.deploy-api-key'], capture_output=True, text=True).stdout.strip()), "
+            "'_UNION_EAGER_API_KEY' in os.environ)\n"
+        ),
     )
-    seen: list[str] = []
-    DeployScripts(env={}, engine_root=root, say=seen.append).deploy(tmp_path / "profile.toml")
-    assert seen[0] == "tenant-pat-agent-factory-deploy"
+    assert _deploy(root, tmp_path / "profile.toml") == ["'' False", "'' False"]
+    assert _recorded(tmp_path) == ""
 
 
 def test_a_killed_runs_prefixed_key_is_deleted_on_rerun_through_its_record(monkeypatch, tmp_path):
-    server = _UnionServer(prefix="tenant-pat-")
-    server.keys[OTHER] = "another member's"
-    _install_fake_union(monkeypatch, server)
-    _deployer(_engine_root(tmp_path)).deploy(tmp_path / "profile.toml")  # killed: close() never ran
-    assert _recorded(tmp_path).split() == ["tenant-pat-agent-factory-deploy"]
-    rerun = _deployer(tmp_path)
-    rerun.deploy(tmp_path / "profile.toml")  # Union would refuse the create if the leftover were still there
-    rerun.close()
-    assert list(server.keys) == [OTHER] and _recorded(tmp_path) == ""
+    """A record an older version left behind is not acted on: the rerun deploys and touches no key."""
+    calls = _watch_union_keys(monkeypatch)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "config", "agent-factory.deploy-api-key", "tenant-pat-agent-factory-deploy"],
+                   cwd=tmp_path, check=True)  # fmt: skip
+    assert _deploy(_engine_root(tmp_path), tmp_path / "profile.toml") == ["ok", "ok"]
+    assert calls == [], "the leftover key is the person's to remove (docs/setup.md, Migrating)"
 
 
 def test_a_recorded_key_deleted_by_hand_is_just_forgotten(monkeypatch, tmp_path):
-    server = _UnionServer(prefix="tenant-pat-")
-    _install_fake_union(monkeypatch, server)
-    _deployer(_engine_root(tmp_path)).deploy(tmp_path / "profile.toml")
-    server.keys.clear()  # the person deleted it in Union
-    rerun = _deployer(tmp_path)
-    rerun.deploy(tmp_path / "profile.toml")
-    rerun.close()
-    assert server.keys == {} and _recorded(tmp_path) == ""
+    calls = _watch_union_keys(monkeypatch)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "config", "agent-factory.deploy-api-key", "gone"], cwd=tmp_path, check=True)
+    _deploy(_engine_root(tmp_path), tmp_path / "profile.toml")
+    assert calls == [] and _recorded(tmp_path) == "gone", "neither looked up nor rewritten"
 
 
 def test_a_key_that_cannot_be_recorded_is_deleted_unused(monkeypatch, tmp_path):
-    server = _UnionServer(prefix="tenant-pat-")
-    _install_fake_union(monkeypatch, server)
-    root = _engine_root(tmp_path / "engine")
-    clone = tmp_path / "not-a-checkout"
+    """A profile outside any checkout, where nothing could be recorded, deploys and makes no key."""
+    calls = _watch_union_keys(monkeypatch)
+    clone, engine = tmp_path / "not-a-checkout", tmp_path / "engine"
     clone.mkdir()
-    deployer = DeployScripts(env={}, engine_root=root, say=lambda line: None)
-    with pytest.raises(BootstrapError, match="deleted unused"):
-        deployer.deploy(clone / "profile.toml")
-    assert server.keys == {}
+    engine.mkdir()
+    assert _deploy(_engine_root(engine), clone / "profile.toml") == ["ok", "ok"]
+    assert calls == []
 
 
 def test_close_deletes_the_key_this_run_made_and_only_that(monkeypatch, tmp_path):
-    server = _UnionServer()
-    _install_fake_union(monkeypatch, server)
-    deployer = _deployer(_engine_root(tmp_path))
-    deployer.deploy(tmp_path / "profile.toml")
-    deployer.deploy(tmp_path / "profile.toml", work=False)
-    assert list(server.keys) == ["agent-factory-deploy"]  # one key for both deploys of the run
-    deployer.close()
-    assert server.keys == {}
-    deployer.close()  # closing twice is harmless
+    """The run makes no key, so the deployer has nothing to close and the tenant's keys are untouched."""
+    calls = _watch_union_keys(monkeypatch)
+    _deploy(_engine_root(tmp_path), tmp_path / "profile.toml")
+    assert calls == [] and not hasattr(DeployScripts, "close")
 
 
 def test_close_without_a_key_does_not_touch_union(monkeypatch, tmp_path):
-    monkeypatch.setitem(sys.modules, "flyteplugins", None)  # any import of the plugin would raise
-    _deployer(tmp_path).close()
+    """No key, no plugin import: even a failing deploy never reaches for the key plugin."""
+    monkeypatch.setitem(sys.modules, "flyteplugins", None)
+    with pytest.raises(BootstrapError, match="deploy_work.py failed"):
+        _deploy(_engine_root(tmp_path, fail=True), tmp_path / "profile.toml")
 
 
 def test_a_key_from_the_environment_is_never_deleted(monkeypatch, tmp_path):
-    server = _UnionServer()
-    server.keys["agent-factory-deploy"] = "the person's own"
-    _install_fake_union(monkeypatch, server)
-    deployer = _deployer(_engine_root(tmp_path), env={"_UNION_EAGER_API_KEY": DEPLOY_SENTINEL})
-    deployer.deploy(tmp_path / "profile.toml")
-    deployer.close()
-    assert server.deleted == [] and "agent-factory-deploy" in server.keys
+    """A key the person exported is neither deleted nor handed to the scripts."""
+    calls = _watch_union_keys(monkeypatch)
+    root = _engine_root(tmp_path, body="import os\nprint('_UNION_EAGER_API_KEY' in os.environ)\n")
+    seen = _deploy(root, tmp_path / "profile.toml", env={"_UNION_EAGER_API_KEY": DEPLOY_SENTINEL})
+    assert seen == ["False", "False"] and calls == []
 
 
 def test_a_failed_deploy_then_a_fixed_rerun_completes_and_leaves_no_key(monkeypatch, tmp_path):
-    server = _UnionServer()
-    _install_fake_union(monkeypatch, server)
-    first = _deployer(_engine_root(tmp_path, fail=True))
+    calls = _watch_union_keys(monkeypatch)
     with pytest.raises(BootstrapError):
-        first.deploy(tmp_path / "profile.toml")
-    first.close()  # what `run()` does in its `finally`
-    assert server.keys == {}
-    second = _deployer(_engine_root(tmp_path))
-    second.deploy(tmp_path / "profile.toml")
-    second.close()
-    assert server.keys == {}
+        _deploy(_engine_root(tmp_path, fail=True), tmp_path / "profile.toml")
+    assert _deploy(_engine_root(tmp_path), tmp_path / "profile.toml") == ["ok", "ok"]
+    assert calls == []
 
 
 def test_a_crash_after_the_deploy_then_a_rerun_completes(monkeypatch, tmp_path):
-    server = _UnionServer()
-    _install_fake_union(monkeypatch, server)
-    _deployer(_engine_root(tmp_path)).deploy(tmp_path / "profile.toml")  # killed: close() never ran
-    assert list(server.keys) == ["agent-factory-deploy"]
-    rerun = _deployer(tmp_path)
-    rerun.deploy(tmp_path / "profile.toml")
-    rerun.close()
-    assert server.keys == {}
+    """A deploy killed before any cleanup leaves nothing a rerun must clear first."""
+    calls = _watch_union_keys(monkeypatch)
+    root = _engine_root(tmp_path)
+    _deploy(root, tmp_path / "profile.toml")  # killed here: nothing ran after it
+    assert _deploy(root, tmp_path / "profile.toml") == ["ok", "ok"] and calls == []
 
 
 def test_the_run_releases_the_deployer_whether_or_not_it_finished(world, monkeypatch):
-    assert run(world)[0] == 0 and world.closed == 1
+    """A bug in the deploy surfaces as itself; the run made only the stored tier keys, none to release."""
+    assert run(world)[0] == 0
     from tests import _bootstrap_fakes
 
     def boom(self, profile, *, work=True):
@@ -640,17 +617,16 @@ def test_the_run_releases_the_deployer_whether_or_not_it_finished(world, monkeyp
     w2.root.mkdir()
     with pytest.raises(ZeroDivisionError):
         run(w2)
-    assert w2.closed == 1
+    assert not [e for e in w2.events if e.startswith("delete_api_key")]
+    assert set(w2.union_keys) <= {"factory-project", "factory-deployer"}, "only the stored tier keys exist"
 
 
 def test_the_api_key_is_never_printed(monkeypatch, tmp_path, capsys):
-    server = _UnionServer()
-    _install_fake_union(monkeypatch, server)
-    deployer = DeployScripts(env={}, engine_root=_engine_root(tmp_path))
-    deployer.deploy(tmp_path / "profile.toml")
-    deployer.close()
+    """An exported key never reaches the deploy's output, even from a script that prints its environment."""
+    root = _engine_root(tmp_path, body="import os\nprint(sorted(os.environ.values()))\n")
+    DeployScripts(env={"_UNION_EAGER_API_KEY": DEPLOY_SENTINEL}, engine_root=root).deploy(tmp_path / "p.toml")
     seen = capsys.readouterr()
-    assert DEPLOY_SENTINEL not in seen.out + seen.err
+    assert seen.out and DEPLOY_SENTINEL not in seen.out + seen.err
 
 
 # --- B1: the redeploy flag -------------------------------------------------------------------------------
@@ -790,7 +766,7 @@ def test_the_adapter_updates_the_existing_ruleset_with_put():
 def test_the_steps_run_in_the_documented_order():
     assert [s.id for s in _bootstrap.build_steps()] == [
         "tools", "workspace", "template", "profile",
-        "signin", "project", "deploy-key", "github-app",
+        "signin", "project", "union-keys", "deploy-key", "github-app",
         "ruleset", "board", "engine-token", "deploy", "mcp-url", "connect",
     ]  # fmt: skip
 
@@ -1523,27 +1499,37 @@ def test_a_policy_or_assignment_failure_that_is_not_a_refusal_surfaces(monkeypat
 # --- the deploy scripts --------------------------------------------------------------------------------
 
 
-def test_an_api_key_in_the_environment_means_the_deploy_can_go_ahead():
-    assert DeployScripts(env={"_UNION_EAGER_API_KEY": "from-the-person"}).api_key_available() is True
+def test_an_api_key_in_the_environment_means_the_deploy_can_go_ahead(monkeypatch, tmp_path):
+    """An exported key neither blocks the deploy nor is needed by it: both scripts run, without the key."""
+    calls = _watch_union_keys(monkeypatch)
+    root = _engine_root(tmp_path, body="import os\nprint('_UNION_EAGER_API_KEY' in os.environ)\n")
+    seen = _deploy(root, tmp_path / "profile.toml", env={"_UNION_EAGER_API_KEY": "from-the-person"})
+    assert seen == ["False", "False"] and calls == []
 
 
-def test_the_key_record_needs_a_clone_to_live_in():
-    with pytest.raises(BootstrapError, match="no workspace clone"):
-        DeployScripts(env={})._run_git_config("--get-all", "anything")
+def test_the_key_record_needs_a_clone_to_live_in(monkeypatch, tmp_path):
+    """There is no key record any more, so a profile outside any clone deploys and nothing is written."""
+    calls = _watch_union_keys(monkeypatch)
+    clone, engine = tmp_path / "not-a-checkout", tmp_path / "engine"
+    clone.mkdir()
+    engine.mkdir()
+    assert _deploy(_engine_root(engine), clone / "profile.toml") == ["ok", "ok"]
+    assert calls == [] and not hasattr(DeployScripts, "_run_git_config") and not (clone / ".git").exists()
 
 
 def test_a_key_that_cannot_be_deleted_at_the_end_is_said_not_raised(monkeypatch, tmp_path):
-    said: list[str] = []
-    deployer = DeployScripts(env={}, engine_root=tmp_path, say=said.append)
-    deployer._key = "made-by-this-run"
+    """No key is made, so a tenant that refuses every delete is never asked and the run says nothing of it."""
+    import types
 
-    def fail():
+    def refuse(cls, client_id):
         raise RuntimeError("the connection dropped")
 
-    monkeypatch.setattr(deployer, "_delete_recorded_keys", fail)
-    deployer.close()
-    assert said == ["could not delete the deployment API key 'agent-factory-deploy' (RuntimeError)"]
-    assert deployer._key is None  # said once; the record stays for the next run to delete
+    _watch_union_keys(monkeypatch)
+    plugin = sys.modules["flyteplugins.union.remote"].ApiKey
+    monkeypatch.setattr(plugin, "delete", types.MethodType(refuse, plugin))
+    seen = _deploy(_engine_root(tmp_path), tmp_path / "profile.toml")
+    assert seen == ["ok", "ok"] and not hasattr(DeployScripts, "close")
+    assert not [line for line in seen if "could not delete" in line]
 
 
 def test_the_factory_url_a_deploy_script_prints_is_what_the_deploy_returns(tmp_path):

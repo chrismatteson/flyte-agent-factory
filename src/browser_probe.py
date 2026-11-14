@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 import flyte
 
-from flyte_agent_factory import _profile
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._bridge import redact
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._images import agent_image
@@ -40,19 +40,21 @@ from flyte_agent_factory.browser import browser_endpoint, browser_env
 if TYPE_CHECKING:
     import httpx
 
+PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="browser-probe",
     image=agent_image().with_pip_packages("httpx>=0.27"),
-    env_vars=_profile.pod_env(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="2Gi"),
     depends_on=[browser_env],
 )
 
-PROFILE = _profile.require()
 CONSOLE = f"{PROFILE.console_base}/runs"
 
-# Names the Flyte runtime uses for the in-pod API key, in precedence order.
-_KEY_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY", "FLYTE_API_KEY", "UNION_API_KEY")
+# The pod's key, as the factory mounts it (`_union_identity`).
+_KEY_VARS = (_union_identity.KEY_ENV, "FLYTE_API_KEY", "UNION_API_KEY")
 
 
 class _MCPTool(TypedDict):
@@ -163,6 +165,7 @@ async def _probe_navigation(mcp: MCP, label: str) -> dict[str, str | bool]:
 @env.task(report=True)
 async def probe() -> str:
     """Try the console with no credentials, then with the pod's API key."""
+    _union_identity.establish()
     import httpx
 
     key_var = next((v for v in _KEY_VARS if os.environ.get(v)), None)

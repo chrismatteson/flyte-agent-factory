@@ -10,6 +10,11 @@ project = "my-agents"                     # the Flyte project the factory runs i
 domain = "development"                    # the Flyte domain
 config = "~/.flyte/config.yaml"           # the Flyte config file the CLI is passed
 
+[union]
+# Union secrets that each hold an API key (profiles/README.md#union). Required for a Union backend.
+project_key = "factory-project-key"    # Union secret holding the project tier's API key
+deployer_key = "factory-deployer-key"  # Union secret holding the deployer's API key; may equal project_key
+
 [repo]
 project = "git@github.com:you/my-workspace.git"   # your workspace repository; projects push here
 

@@ -22,7 +22,10 @@ def test_is_the_stock_flyte_mcp_app_behind_union_auth():
     # sign-in token and a Union API key both work as the bearer; nothing here checks tokens.
     assert type(factory.app) is FlyteMCPAppEnvironment
     assert factory.app.requires_auth is True
-    assert not factory.app.secrets
+    # No token of its own: its one secret is the queue tier's Union key, so it acts as that key.
+    assert [(s.key, s.as_env_var) for s in cast(list[flyte.Secret], factory.app.secrets)] == [
+        (_factory_base.PROFILE.union.key_for("queue"), "AGENT_FACTORY_UNION_KEY")
+    ]
 
 
 def test_chat_can_read_a_tasks_result():

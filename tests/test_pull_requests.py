@@ -120,7 +120,7 @@ class FakeGithub:
 def gh():
     fake = FakeGithub()
     client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(fake.handler))
-    fake.app = RealGithubApp("12345", PRIVATE_PEM, client=client)
+    fake.app = RealGithubApp("12345", PRIVATE_PEM, client=client, permissions=_github.PR_WRITE)
     fake.rows = []
     fake.prs = _pull_requests.PullRequests(
         fake.app, REPO, "widget", RUN_URL, lambda icon, text: fake.rows.append(text)
@@ -131,6 +131,9 @@ def gh():
 class _OfflineApp:
     def __init__(self, *args, **kwargs):
         pass
+
+    def scoped(self, permissions):
+        return self
 
     def default_branch(self, repo):
         raise _github.GithubError("offline")

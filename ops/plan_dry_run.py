@@ -5,7 +5,7 @@
 Reads the board, the slots' live runs and their reports, and each repository's open pull requests
 and file list, then prints the proposal as JSON: `launches`, `waiting` (with the structured
 reason) and `unusable_slots`. It needs the board token (`GITHUB_BOARD_PAT`), the GitHub App key
-(`GITHUB_APP_PRIVATE_KEY`) and Flyte credentials (`_UNION_EAGER_API_KEY`), by name only.
+(`GITHUB_APP_PRIVATE_KEY`) by name only. Flyte access is your own CLI login.
 A launch outside the planner (a manual run) shows up as a live run with no issue and occupies its
 whole repository.
 """
@@ -14,25 +14,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-import flyte
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flyte_agent_factory import _profile
 
 _profile.select_from_argv()  # before _factory reads the profile at import
 
-from flyte_agent_factory import _factory, _factory_base, _planner  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory import _factory_base, _planner, _union_identity  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 from flyte_agent_factory._planner_facts import free_capacity  # noqa: E402, F401 -- after the profile; re-exported for tests
 from flyte_agent_factory._planner_facts import read_facts as _read_facts  # noqa: E402 -- after the profile is chosen
 
 
 def _init() -> None:
-    flyte.init_from_api_key(
-        api_key=os.environ["_UNION_EAGER_API_KEY"], project=_factory.PROJECT, domain=_factory.DOMAIN
-    )
+    _union_identity.init_for_script(_factory_base.PROFILE)
 
 
 def read_facts(profile: _profile.Profile) -> _planner.Facts:

@@ -55,9 +55,13 @@ MOUNTED = {
     "_UNION_LLM_GATEWAY_KEY": "gateway",
     "_UNION_ANTHROPIC_API_KEY": "project-key",
     "_UNION_SOMETHING_NEW": "a secret nobody listed",
+    # What Union injects: no child acts as it.
+    "_UNION_EAGER_API_KEY": "flyte-api-key",
+    "EAGER_API_KEY": "flyte-api-key",
 }
 KEPT = {
-    "_UNION_EAGER_API_KEY": "flyte-api-key",  # attach() needs it to submit child actions
+    "FLYTE_AUTH_TYPE": "ExternalCommand",  # how attach() reaches the tier key
+    "FLYTE_AUTH_COMMAND": '["python", "-m", "flyte_agent_factory._union_token"]',
     "PROJECT_ANTHROPIC_API_KEY": "project-key",  # reserved for the project's own API calls
 }
 ENV = {

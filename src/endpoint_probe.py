@@ -13,16 +13,18 @@ import os
 
 import flyte
 
-from flyte_agent_factory import _profile
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._images import agent_image
 from flyte_agent_factory.browser import APP_PORT, browser_env
 
 PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="endpoint-probe",
     image=agent_image().with_pip_packages("httpx>=0.27"),
-    env_vars=_profile.pod_env(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="2Gi"),
 )
 
@@ -30,6 +32,7 @@ env = flyte.TaskEnvironment(
 @env.task(report=True)
 async def probe() -> str:
     """Try each candidate address of the browser app from this pod and return the results as JSON."""
+    _union_identity.establish()
     import httpx
 
     namespace = f"{PROFILE.backend.project}-{PROFILE.backend.domain}"

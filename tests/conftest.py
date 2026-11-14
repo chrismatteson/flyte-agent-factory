@@ -10,6 +10,11 @@ from fsspec.utils import stringify_path  # type: ignore[import-untyped]  # no st
 
 from tests._git import git
 
+# Pytest loads this file as `conftest`; tests that `from tests.conftest import ...` would otherwise run it a
+# second time, as `tests.conftest`, and its environment scrub below would then delete the variables the
+# autouse fixtures set (a Union tier key) halfway through whichever test imported it first.
+sys.modules.setdefault("tests.conftest", sys.modules[__name__])
+
 # Fixture projects (the benchmark's reference service) carry tests of their own, run from a copy.
 collect_ignore = ["fixtures"]
 
@@ -575,3 +580,21 @@ def project(tmp_path):
     _gates.capture_base(tmp_path, "app")
     git(tmp_path, "config", "user.email", "app@agent-factory.localhost")
     return tmp_path, (tmp_path / ".claude-flyte/app/base-commit").read_text()
+
+
+@pytest.fixture(autouse=True)
+def _a_pod_with_its_tier_key(monkeypatch):
+    # Every entry task establishes its Union identity first (`_union_identity.establish`). Tests call those
+    # tasks directly, so give them a pod that holds a key; the probe would need a backend.
+    import base64
+
+    from flyte_agent_factory import _union_identity
+
+    key = base64.b64encode(b"union.example.org:test-client:test-secret:").decode()
+    monkeypatch.setenv(_union_identity.KEY_ENV, key)
+    monkeypatch.setenv(_union_identity.TIER_ENV, "project")
+    monkeypatch.setenv(_union_identity.SECRET_ENV, "test-project-key")
+    monkeypatch.setattr(_union_identity, "_probe", lambda: None)
+    _union_identity.current.cache_clear()
+    yield
+    _union_identity.current.cache_clear()

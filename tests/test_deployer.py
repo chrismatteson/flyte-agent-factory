@@ -3,9 +3,11 @@
 Fakes sit at GitHub HTTP, Flyte run submission/listing, and the final subprocess boundary.
 """
 
+import base64
 import contextlib
 import dataclasses
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +34,7 @@ from flyte_agent_factory import (
     _github,
     _profile,
     _standards,
+    _union_identity,
 )
 from flyte_agent_factory._deploy import DeployError, Refused
 from tests.test_github import PRIVATE_PEM, Clock, FakeGithub
@@ -41,6 +44,7 @@ SHA = "a" * 40
 OLD_SHA = "b" * 40
 DIRECTION_SHA = "d" * 40
 OLD_DIRECTION_SHA = "e" * 40
+MOVED_SHA = "c" * 40  # the head of the repo a commit moves [direction] to
 #: The real runs of the engine tree's own code, before `World` replaces them with in-process ones.
 REAL_CHECK_IN_TREE = _deploy.check_in_tree
 REAL_DEPLOY_IN_TREE = _deploy.deploy_in_tree
@@ -80,9 +84,15 @@ class GitRefs:
         self.commits = {}
         self.race = False
         self.requests: list[tuple[str, str]] = []
+        self.scopes: list[dict[str, str]] = []
 
-    def installation_token(self, repo):
+    def installation_token(self, repo, permissions):
+        assert permissions  # every token names its permissions (#179)
         return "token"  # the App is installed everywhere this model is used
+
+    def scoped(self, permissions):
+        self.scopes.append(dict(permissions))
+        return self
 
     def _call(self, repo, method, path, **kwargs):
         self.requests.append((method, path))
@@ -127,21 +137,16 @@ class World:
         self.direction_gh.head_sha = DIRECTION_SHA
         self.direction_gh.statuses = [{"context": "direction/profile-pins", "state": "success"}]
         self.direction_refs: dict[str, str] = {}
+        # A third, the repo a commit moves [direction] to: its own data, tree, fetch error and install state.
+        self.moved_gh = FakeGithub(self.clock)
+        self.moved_gh.head_sha = MOVED_SHA
+        self.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "success"}]
         client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(self.handler))
         self.app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=self.clock)
-        # The git-ref lock (`RUN_LISTING_CONSISTENT=False`, production) goes through the App's
-        # `_call`; FakeGithub has no git data API, so those calls go to a model of it.
+        # The git-ref lock (`RUN_LISTING_CONSISTENT=False`, production) uses the git data API, which
+        # FakeGithub does not have: `handler` sends those requests to a model of it. At the HTTP level,
+        # so the lock is served whichever scoped view of the App makes the call.
         self.refs = GitRefs()
-        real_call = self.app._call
-        monkeypatch.setattr(
-            self.app,
-            "_call",
-            lambda repo, method, path, **kw: (
-                self.refs._call(repo, method, path, **kw)
-                if "/git/" in path
-                else real_call(repo, method, path, **kw)
-            ),
-        )
         self.said: list[str] = []
         self.live_runs: list[str] = []
         self.runs: list[SimpleNamespace] = []
@@ -156,11 +161,19 @@ class World:
         self.direction_tree = tmp_path / "direction-tree"
         self.direction_tree.mkdir()
         self.direction_fetch_error: str | None = None
+        self.direction_reads: list[tuple[str, Any]] = []
+        self.moved_tree = tmp_path / "moved-tree"
+        self.moved_tree.mkdir()
+        self.moved_fetch_error: str | None = None
 
         @contextlib.contextmanager
         def fetched_tree(url, sha):
             self.fetched.append((url, sha))
-            if "acme/direction" in url:
+            if "acme/new-direction" in url:
+                if self.moved_fetch_error:
+                    raise DeployError(self.moved_fetch_error)
+                yield self.moved_tree
+            elif "acme/direction" in url:
                 if self.direction_fetch_error:
                     raise DeployError(self.direction_fetch_error)
                 yield self.direction_tree
@@ -254,8 +267,32 @@ class World:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if "/git/" in path:
+            body = json.loads(request.content) if request.content else None
+            try:
+                answer = self.refs._call("", request.method, path, **({"json": body} if body else {}))
+            except _github.GithubError as exc:
+                return httpx.Response(exc.status, json={"message": str(exc)})
+            return httpx.Response(200, json=answer)
+        if path.startswith("/repos/acme/new-direction"):
+            return self.moved_gh.handler(
+                httpx.Request(
+                    request.method,
+                    request.url.copy_with(path=path.replace("acme/new-direction", "acme/factory")),
+                )
+            )
         if not path.startswith("/repos/acme/direction"):
             return self.gh.handler(request)
+        if path.startswith("/repos/acme/direction/contents/"):
+            # The tick reads the direction profile at the head it judges, to find a move (`_move_head`).
+            self.direction_reads.append(
+                (path.removeprefix("/repos/acme/direction/contents/"), request.url.params)
+            )
+            file = self.direction_tree / path.removeprefix("/repos/acme/direction/contents/")
+            if self.direction_fetch_error or not file.is_file():
+                return httpx.Response(404, json={"message": "Not Found"})
+            content = base64.b64encode(file.read_bytes()).decode()
+            return httpx.Response(200, json={"encoding": "base64", "content": content})
         branch = path.removeprefix("/repos/acme/direction/commits/")
         if branch in self.direction_refs:
             return httpx.Response(200, json={"sha": self.direction_refs[branch]})
@@ -339,6 +376,13 @@ class World:
         path.write_text(self.profile.text + "\n# from direction\n" if text is None else text)
         return path
 
+    def ship_moved_profile(self, text: str) -> Path:
+        """Put the profile in the repo [direction] moves to."""
+        path = self.moved_tree / "profiles" / f"{self.profile.name}.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
     def record(self, sha: str, direction_sha: str = "") -> dict[str, Any]:
         pair = {"sha": sha, **({"direction_sha": direction_sha} if direction_sha else {})}
         self.add_run(
@@ -405,6 +449,16 @@ async def test_no_change_means_no_deploy(world, capsys):
     assert await world.tick() == f"up to date at {SHA}"
     assert not world.deployed and world.fetched == []
     assert f"[deploy] auto up to date at {SHA}" in capsys.readouterr().out
+
+
+async def test_every_token_a_deploy_mints_names_its_permissions_and_the_lock_writes_contents(world):
+    # The git-ref lock (this world's default) is a commit and a ref: contents:write, nothing more (#179).
+    world.record(OLD_SHA)
+    assert (await world.tick()).startswith(f"deployed {SHA}")
+    minted = [json.loads(r.content) for r in world.gh.requests if r.url.path.endswith("/access_tokens")]
+    assert minted and all(body["permissions"] for body in minted)
+    assert {"contents": "write"} in [body["permissions"] for body in minted]
+    assert world.refs.ref  # the lock was taken
 
 
 @both_paths
@@ -904,6 +958,7 @@ async def test_a_missing_app_key_is_a_reported_failure(world, monkeypatch):
         reports.append(html)
 
     monkeypatch.setattr(_deployer, "PROFILE", world.profile)
+    monkeypatch.setattr(_union_identity, "establish", lambda probe=True: None)  # no Union here
     monkeypatch.delenv("GITHUB_APP_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(flyte, "ctx", lambda: SimpleNamespace(action=SimpleNamespace(run_name="r")))
     monkeypatch.setattr(flyte.report, "replace", SimpleNamespace(aio=replace))
@@ -1242,18 +1297,31 @@ async def test_an_absent_or_invalid_direction_profile_fails_the_tick(directed, t
 @pytest.mark.parametrize("change", ["drop", "elsewhere"])
 async def test_a_direction_profile_that_changes_its_own_direction_fails_the_tick(directed, change):
     # qa: a direction file without [direction] deployed the deployer with direction off; every later direction
-    # commit was then ignored with no error. A different [direction] would silently follow another repo.
+    # commit was then ignored with no error. A move is two-sided: the old repo names the new one, and the new
+    # one must name itself, or the deployer would silently follow another repo.
     text = directed.profile.text
     start = text.index("[direction]")
     end = text.find("\n[", start + 1)
     table = text[start:] if end == -1 else text[start:end]
     if change == "drop":
-        shipped = text.replace(table, "")
+        directed.ship_direction_profile(text.replace(table, ""))
+        match = r"must keep a \[direction\]"
     else:
-        shipped = text.replace(table, table.replace("acme/direction.git", "acme/elsewhere.git"))
-    directed.ship_direction_profile(shipped)
-    with pytest.raises(DeployError, match=r"\[direction\]"):
-        await directed.tick()
+        # The old repo moves to acme/new-direction, which names acme/elsewhere.
+        directed.ship_direction_profile(moved_text(directed))
+        directed.ship_moved_profile(text.replace("acme/direction.git", "acme/elsewhere.git"))
+        match = (
+            f"profiles/work.toml at {DIRECTION_SHA} of acme/direction moves \\[direction\\] to "
+            f"acme/new-direction, but profiles/work.toml at {MOVED_SHA} of acme/new-direction names "
+            "acme/elsewhere, profiles/work.toml, ref default: a move needs the new profile to name its own "
+            "repo; nothing deployed"
+        )
+    if change == "drop":
+        with pytest.raises(DeployError, match=match):
+            await directed.tick()
+    else:
+        # Refused rather than failed: the new repo fixes it with a commit, which is not a new counted pair.
+        await refused_move(directed, match)
     assert not directed.deployed
 
 
@@ -1312,6 +1380,246 @@ async def test_a_failing_engine_commit_still_blocks_with_a_direction(directed):
     directed.gh.statuses = [{"context": "factory/verifier", "state": "failure"}]
     assert (await directed.tick()).startswith(f"skipped {SHA}")
     assert not directed.deployed
+
+
+# --- [direction]: a commit moves it to another repository ---------------------------------------
+
+
+def moved_text(world: World, *, to: str = "git@github.com:acme/new-direction.git") -> str:
+    return world.profile.text.replace("git@github.com:acme/direction.git", to)
+
+
+async def refused_move(world: World, match: str) -> str:
+    """Tick on a move the new repo refuses: said once, recorded, nothing deployed and no failed attempt."""
+    result = await world.tick()
+    assert re.search(match, result) and result.endswith("; leaving it for the next tick"), result
+    assert result.count("next tick") == 1, result
+    run = world.runs[-1]  # the attempt `tick` ran
+    assert run.phase == "SUCCEEDED" and run.output["refused"] in result
+    # The run succeeds, so its report is the only place outside the pod log that says why nothing deployed.
+    report = _deployer._describe_outcome(run.output)
+    assert run.output["refused"] in report and report.count("next tick") == 1, report
+    assert not world.deployed and world.last is None and world.failed is None
+    return result
+
+
+@pytest.fixture
+def moving(directed):
+    """The old repo's profile names acme/new-direction, whose own profile names itself."""
+    directed.ship_direction_profile(moved_text(directed) + "\n# from new direction\n")
+    directed.ship_moved_profile(moved_text(directed) + "\n# from new direction\n")
+    return directed
+
+
+async def test_a_move_both_repos_agree_on_deploys_from_the_new_repo(moving):
+    result = await moving.tick()
+    assert result.startswith(f"deployed {SHA} with direction {MOVED_SHA}")
+    (slots,) = moving.slot_calls
+    assert slots["profile"].direction.repo == "git@github.com:acme/new-direction.git"
+    assert slots["profile"].text.endswith("# from new direction\n")
+    assert moving.last["direction_sha"] == MOVED_SHA
+    assert f"direction moved: acme/direction -> acme/new-direction at {MOVED_SHA}" in moving.said
+    # The old repo is read once (to find the move) and not deployed from again after it.
+    assert len(moving.slot_calls) == len(moving.factory_calls) == 1
+    # The redeployed deployer reads the new repo and has nothing to redo.
+    moving.profile = _profile.parse(slots["profile"].deployment_text(), "work+moved")
+    assert await moving.tick() == f"up to date at {SHA} with direction {MOVED_SHA}"
+
+
+async def test_a_move_the_new_profile_does_not_name_is_refused(moving):
+    moving.ship_moved_profile(moving.profile.text + "\n# names the old repo\n")
+    await refused_move(moving, "names acme/direction, profiles/work.toml, ref default: a move needs")
+
+
+async def test_a_move_the_new_profile_without_direction_is_refused(moving):
+    moving.ship_moved_profile(moving.profile.text.split("[direction]")[0])
+    await refused_move(moving, r"names no \[direction\]: a move needs the new profile")
+
+
+@pytest.mark.parametrize("failure", ["fetch error", "app not installed"])
+async def test_a_move_to_an_unreadable_repo_deploys_nothing(moving, failure):
+    if failure == "fetch error":
+        moving.moved_fetch_error = "git fetch of cccc failed: not found"
+        reason = "git fetch of cccc failed"
+    else:
+        moving.moved_gh.installed = False
+        reason = "not installed"
+    # Not a failed attempt (#180): installing the App or fixing the new repo does not change the counted pair,
+    # so counting it would give up on the move for good after MAX_ATTEMPTS ticks.
+    message = await refused_move(
+        moving,
+        re.escape("[direction] move to acme/new-direction refused: acme/new-direction cannot be read ("),
+    )
+    assert reason in message and "nothing deployed" in message
+    assert "Install the GitHub App on acme/new-direction or fix [direction] in acme/direction." in message
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [(None, "is not in the direction repository"), ("name = 'x'\nnot toml [", "not valid TOML")],
+)
+async def test_a_move_to_a_repo_without_a_usable_profile_is_refused(moving, text, message):
+    path = moving.moved_tree / "profiles" / f"{moving.profile.name}.toml"
+    path.unlink() if text is None else path.write_text(text)
+    result = await refused_move(moving, message)
+    assert "(new direction acme/new-direction)" in result
+
+
+async def test_a_move_to_a_profile_of_another_name_is_refused(moving):
+    moving.ship_moved_profile(moving.profile.text.replace('name = "work"', 'name = "other"'))
+    await refused_move(moving, r"is profile 'other'.*\(new direction acme/new-direction\)")
+
+
+async def test_a_move_to_a_commit_failing_ci_is_not_deployed(moving):
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "failure"}]
+    result = await moving.tick()
+    # Refused by the tick, as the direction repo's own CI is: no deploy run is spent finding it out.
+    assert result == f"skipped direction {MOVED_SHA}: direction/profile-pins failing"
+    assert moving.runs == [] and moving.fetched == []
+    assert not moving.deployed and moving.last is None and moving.failed is None
+
+
+async def test_a_move_whose_new_commit_fails_ci_after_the_tick_is_refused_by_the_attempt(moving):
+    # Green when the tick judged it, failing by the time the attempt deploys: the attempt judges it again.
+    assert (await _deployer.run_once(moving.profile, "run-me", moving.app, moving.clock())).startswith(
+        "submitted"
+    )
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "failure"}]
+    result = await moving.attempt(moving.runs[-1])
+    assert result.endswith(
+        f"skipped direction {MOVED_SHA}: direction/profile-pins failing; leaving it for the next tick"
+    )
+    assert _deployer._describe_outcome(moving.runs[-1].output).endswith(
+        f"skipped direction {MOVED_SHA}: direction/profile-pins failing; leaving it for the next tick"
+    )
+    assert not moving.deployed and moving.last is None and moving.failed is None
+
+
+async def test_a_move_to_a_pending_commit_waits(moving):
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "pending"}]
+    assert "direction/profile-pins pending; retrying next tick" in await moving.tick()
+    assert not moving.deployed
+
+
+async def test_a_move_committed_old_side_first_deploys_once_the_new_side_follows(directed):
+    # #180: the owner commits the old repo's [direction] before the new repo names itself. Every tick until
+    # then is refused, and none of them counts: they all have the same pair, so counting would give up on it
+    # and the new repo's commit (which is not part of the pair) would never be deployed.
+    directed.ship_direction_profile(moved_text(directed))
+    directed.ship_moved_profile(directed.profile.text)  # still names the old repo
+    for _ in range(_deployer.MAX_ATTEMPTS + 1):
+        await refused_move(directed, "names acme/direction, profiles/work.toml, ref default: a move needs")
+    directed.moved_gh.head_sha = "e" * 40
+    directed.ship_moved_profile(moved_text(directed))
+    result = await directed.tick()
+    assert result.startswith(f"deployed {SHA} with direction {'e' * 40}"), result
+    assert f"direction moved: acme/direction -> acme/new-direction at {'e' * 40}" in directed.said
+
+
+async def test_a_move_whose_new_profile_the_engine_refuses_deploys_once_the_new_repo_fixes_it(moving):
+    # Review round 1, finding 1 (C35): the engine check rejecting B's profile is fixed in B, so it is not
+    # counted on the (engine, A) pair; otherwise the pair is given up on and the fix in B is never deployed.
+    moving.ship_moved_profile("typo_key = 1\n" + moved_text(moving))
+    for _ in range(_deployer.MAX_ATTEMPTS + 1):
+        await refused_move(
+            moving,
+            r"unknown top-level key\(s\): typo_key \(new direction acme/new-direction\); nothing deployed",
+        )
+    moving.moved_gh.head_sha = "2" * 40
+    moving.ship_moved_profile(moved_text(moving) + "\n# fixed\n")
+    result = await moving.tick()
+    assert result.startswith(f"deployed {SHA} with direction {'2' * 40}"), result
+    assert f"direction moved: acme/direction -> acme/new-direction at {'2' * 40}" in moving.said
+
+
+async def test_a_move_whose_new_profile_waits_for_secrets_is_not_a_refusal(moving, monkeypatch):
+    # Missing secrets are created by the owner, not fixed by a commit in the new repo: they are reported as
+    # waiting, as in the steady case, and not as a refused move.
+    needs = {"browser_personal_token": ["claude-browser-personal"]}
+    _missing(moving, monkeypatch, needs)
+    await moving.tick()
+    run = moving.runs[-1]
+    assert run.phase == "SUCCEEDED"
+    assert run.output == {"deployed": False, "waiting_for_secrets": needs}
+    assert not moving.deployed and moving.failed is None
+
+
+async def test_a_move_to_a_commit_failing_ci_is_never_given_up_on(moving):
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "failure"}]
+    for _ in range(_deployer.MAX_ATTEMPTS + 2):
+        assert await moving.tick() == f"skipped direction {MOVED_SHA}: direction/profile-pins failing"
+    assert moving.runs == [] and moving.failed is None
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "success"}]
+    assert (await moving.tick()).startswith(f"deployed {SHA} with direction {MOVED_SHA}")
+
+
+async def test_a_move_to_a_pending_commit_says_it_retries_once_and_is_not_counted(moving):
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "pending"}]
+    for _ in range(_deployer.MAX_ATTEMPTS + 1):
+        result = await moving.tick()
+        # Not "retrying next tick; leaving it for the next tick": that reads as two retries.
+        assert result == f"skipped direction {MOVED_SHA}: direction/profile-pins pending; retrying next tick"
+    # A check that stays pending (one that never reports, say) costs no deploy run per tick.
+    assert moving.runs == [] and not moving.deployed and moving.failed is None
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "success"}]
+    assert (await moving.tick()).startswith(f"deployed {SHA} with direction {MOVED_SHA}")
+
+
+async def test_a_move_pending_when_the_attempt_deploys_says_it_retries_once(moving):
+    assert (await _deployer.run_once(moving.profile, "run-me", moving.app, moving.clock())).startswith(
+        "submitted"
+    )
+    moving.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "pending"}]
+    result = await moving.attempt(moving.runs[-1])
+    assert result == f"skipped direction {MOVED_SHA}: direction/profile-pins pending; retrying next tick"
+    report = _deployer._describe_outcome(moving.runs[-1].output)
+    assert report.endswith("pending; retrying next tick") and report.count("next tick") == 1, report
+    assert not moving.deployed and moving.failed is None
+
+
+async def test_a_failing_move_is_counted_on_the_new_repos_head_too(moving):
+    # A move that resolves but fails to deploy is a failed attempt, counted on (engine, old repo, new repo):
+    # the fix may be a commit in the new repo, which must start the count again rather than stay given up on.
+    moving.slot_rc = 1
+    for _ in range(_deployer.MAX_ATTEMPTS):
+        with pytest.raises(DeployError):
+            await moving.tick()
+    assert all(run.pb2.labels["deploy-move"] == MOVED_SHA for run in moving.runs)
+    assert moving.failed["attempts"] == _deployer.MAX_ATTEMPTS
+    given_up = await moving.tick()
+    assert given_up == (
+        f"giving up on {SHA} with direction {DIRECTION_SHA} moving to acme/new-direction at {MOVED_SHA} "
+        f"after {_deployer.MAX_ATTEMPTS} attempts; waiting for a new commit"
+    )
+    moving.slot_rc = 0
+    moving.moved_gh.head_sha = "3" * 40
+    assert (await moving.tick()).startswith(f"deployed {SHA} with direction {'3' * 40}")
+
+
+async def test_a_steady_pair_is_labelled_as_before_a_move_existed(directed):
+    # Attempts made before the upgrade carry no move label: a pair that moves nothing keeps their labels,
+    # so they still count.
+    directed.ship_direction_profile()
+    directed.slot_rc = 1
+    with pytest.raises(DeployError):
+        await directed.tick()
+    (run,) = directed.runs
+    assert run.pb2.labels == _deployer._pair_labels(directed.profile, SHA, DIRECTION_SHA)
+    assert "deploy-move" not in run.pb2.labels
+
+
+async def test_a_move_naming_the_new_repo_in_another_case_is_the_same_direction(moving):
+    # GitHub repository names are case-insensitive: the new repo naming itself `Acme/New-Direction` agrees.
+    moving.ship_moved_profile(moved_text(moving, to="https://github.com/Acme/New-Direction"))
+    assert (await moving.tick()).startswith(f"deployed {SHA} with direction {MOVED_SHA}")
+
+
+async def test_the_new_repo_naming_itself_while_the_old_one_does_not_move_is_a_steady_deploy(directed):
+    # The deployer never reads a repo the current direction does not name.
+    directed.ship_moved_profile(moved_text(directed))
+    await directed.tick()
+    assert directed.deployed and directed.last["direction_sha"] == DIRECTION_SHA
+    assert not [url for url, _ in directed.fetched if "new-direction" in url]
 
 
 async def test_without_direction_the_tree_profile_and_pod_fallback_are_unchanged(world):
@@ -1471,7 +1779,7 @@ SLOTS_CHILD, FACTORY_CHILD, APPS_CHILD = (
 _FLYTE_STUB_BODY = r'''
 _FLYTE_STUB = """
 import json as _json
-flyte.init_from_api_key = lambda **kw: None
+flyte.init_from_config = lambda *args, **kw: None
 
 
 class _App:
@@ -1554,7 +1862,6 @@ def real_engine(world, monkeypatch, *, knows: tuple[str, ...] = (), widget: bool
     deploy_py.write_text(deploy_source + _FLYTE_STUB_BODY + _FLYTE_STUB)
     world.deploy_log = world.tree.parent / "deploy-log.jsonl"
     monkeypatch.setenv("TEST_DEPLOY_LOG", str(world.deploy_log))
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "unused")
     monkeypatch.setattr(_deploy, "check_in_tree", REAL_CHECK_IN_TREE)
     monkeypatch.setattr(_deploy, "deploy_in_tree", REAL_DEPLOY_IN_TREE)
 
@@ -1950,7 +2257,9 @@ def test_direction_capture_log_and_bundle_survive_fetched_tree(tmp_path, monkeyp
             yield tree
 
     monkeypatch.setattr(_deploy, "fetched_tree", fetched_tree)
-    app = cast(_github.GithubApp, SimpleNamespace(installation_token=lambda _repo: "unused-token"))
+    app = cast(
+        _github.GithubApp, SimpleNamespace(installation_token=lambda _repo, _permissions=None: "unused-token")
+    )
     shipped = _deployer._direction_profile(profile, app, sha)
     assert fetched and not fetched[0].exists()
     deployed = _profile.parse(shipped.deployment_text(), _profile.TOML_ENV)
@@ -2055,7 +2364,7 @@ async def test_only_a_commit_whose_ci_passed_deploys(world, statuses, deploys):
 
 def test_the_deploy_reader_does_not_go_anonymous_on_an_error_other_than_not_installed():
     class App:
-        def installation_token(self, repo):
+        def installation_token(self, repo, permissions=None):
             raise _github.GithubError("server error", status=500)
 
     with pytest.raises(_github.GithubError, match="server error"):

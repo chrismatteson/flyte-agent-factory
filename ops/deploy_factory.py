@@ -17,6 +17,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 from flyte_agent_factory import _deploy, _profile
 
 _profile.select_from_argv()  # before the profile is read below
@@ -47,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    env = _deploy.factory_env(os.environ, PROJECT, DOMAIN)
+    env = _deploy.factory_env(_deploy.strip_hand_deploy_keys(os.environ), PROJECT, DOMAIN)
     with _deploy.worktree(REPO, sha, "deploy-factory-") as tree:
         print(
             f"deploying {', '.join(sorted(ALLOWED))} from {args.ref} ({sha})"

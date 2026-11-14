@@ -55,6 +55,7 @@ def _section(login: str, when: str, text: str, *, new: bool = False) -> str:
 def render(app: _github.GithubApp, issue_ref: str, profile: _profile.Profile, since: str) -> str:
     """Return ISSUE.md's text for `issue_ref`; `since` is the previous fetch time ("" for none)."""
     repo, number = _issues.parse_issue(issue_ref)
+    app = app.scoped(_github.ISSUES_READ)  # the issue and its comments are read, never written (#179)
     issue = app.issue(repo, number)
     comments = app.comments(repo, number)
     author = issue.get("user") or {}

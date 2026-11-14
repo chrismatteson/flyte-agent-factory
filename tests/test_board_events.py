@@ -282,7 +282,7 @@ async def test_hourly_entry_point_flags_open_issue_without_project_runs(world, m
     monkeypatch.setattr(_reconcile, "project_runs", lambda: [])
     monkeypatch.setattr(_board, "take_token", lambda *args: "token")
     monkeypatch.setattr(_pull_requests, "take_app_key", lambda *args: "key")
-    monkeypatch.setattr(_github, "GithubApp", lambda *args: app)
+    monkeypatch.setattr(_github, "GithubApp", lambda *args, **kwargs: app)
     result = await _reconcile.reconcile()
     assert board.items[f"{REPO}#49"]["status"] == "Backlog"
     assert app.closed == []
@@ -712,7 +712,7 @@ def test_drift_thousand_closed_cards_uses_bulk_states_and_single_nodes(world, mo
             return httpx.Response(200, json=[])
         pytest.fail(f"unexpected REST call: {path}")
 
-    monkeypatch.setattr(gh.app, "installation_token", lambda repo: "token")
+    monkeypatch.setattr(gh.app, "installation_token", lambda repo, permissions: "token")
     gh.app._http = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handle_rest))
     _board_events.drift(profile, "token", gh.app, lambda ref: None)
     assert len(rest) == 13

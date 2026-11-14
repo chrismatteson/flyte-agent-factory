@@ -25,7 +25,7 @@ the same tasks and are there for scripts and automation.
 
 | | The factory, on its own | The operator, on your word |
 |---|---|---|
-| Code | push to the repository it was launched on, with that repository's deploy key: branch `factory/<name>` with `[github]`, the default branch without it (the `pre-push` hook pins the repository, not the branch; branch protection holds the rest) | merge a pull request, with the GitHub connector |
+| Code | push to the repository it was launched on, with that repository's deploy key (or, in `[github] push = "app"` mode once the isolation canary reports `isolated`, a one-repository App token): branch `factory/<name>` with `[github]`, the default branch without it (the `pre-push` hook pins the repository, not the branch; branch protection holds the rest) | merge a pull request, with the GitHub connector |
 | Pull requests | open a draft, mark it ready on a pass, post the `factory/verifier` status, through the GitHub App (Contents: read by default, so it cannot merge; the settings below need write added to the App) | review, comment, merge, close |
 | Other repositories | pushes code to none: a project that delivers elsewhere works on an imported copy | promote it with `ops/promote.py`, which needs a shell and your git credentials: an operator with a shell (Claude Code) runs it, otherwise you do ([Promotion](architecture-repos.md#promotion)) |
 | Issues and the board | intake comments with `[github]`; with `[board]`, moves a project's card to In flight, In review and Done with the board's own token; by default it never sets Backlog or Ready, by rule rather than for want of access (the settings below change that) | file and edit issues, set Backlog and Ready, order the backlog |

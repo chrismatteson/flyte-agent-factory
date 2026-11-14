@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import importlib
 import importlib.util
@@ -13,8 +14,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import flyte
 import pytest
 
 from flyte_agent_factory import _gate_base, _gates, _instructions, _names, _profile, _standards, _workspace
@@ -337,6 +339,49 @@ def test_selected_by_flag(monkeypatch):
     monkeypatch.delenv("AGENT_FACTORY_PROFILE")
 
 
+def test_help_alone_selects_the_shipped_example_and_never_overrides_a_choice(monkeypatch, tmp_path):
+    # The ops scripts read the profile at import: `--help` with none selected must still print usage (#223).
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE")
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE_TOML", raising=False)
+    monkeypatch.setattr(_profile, "PROFILES_DIR", tmp_path)  # no local `.default`
+    _profile.select_from_argv(["status"])
+    assert "AGENT_FACTORY_PROFILE" not in os.environ  # only for help: a real run still says none is selected
+    for flag in ("--help", "-h"):
+        monkeypatch.delenv("AGENT_FACTORY_PROFILE", raising=False)
+        _profile.select_from_argv([flag])
+        assert _profile.load(os.environ["AGENT_FACTORY_PROFILE"]).name == "example"
+    _profile.select_from_argv(["--help", "--profile", str(OTHER)])
+    assert _current().name == "other"
+    monkeypatch.setenv("AGENT_FACTORY_PROFILE_TOML", OTHER.read_text())
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE")
+    _profile.select_from_argv(["--help"])
+    assert "AGENT_FACTORY_PROFILE" not in os.environ
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE_TOML")
+    (tmp_path / "other.toml").write_text(OTHER.read_text())
+    (tmp_path / ".default").write_text("other")
+    _profile.select_from_argv(["--help"])
+    assert "AGENT_FACTORY_PROFILE" not in os.environ
+
+
+def test_help_under_a_refused_profile_prints_usage_then_the_refusal(monkeypatch, capsys):
+    # A pod or shell still carrying a profile from before [union]: `--help` must not exit 1 on it (#223).
+    refused = re.sub(r"(?ms)^\[union\]\n.*?(?=^\[)", "", WORK.read_text())  # the [union] table, dropped
+    with pytest.raises(_profile.ProfileError):
+        _profile.parse(refused, "refused")
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE")
+    monkeypatch.setenv("AGENT_FACTORY_PROFILE_TOML", refused)
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda fn, *a, **kw: registered.append((fn, a, kw)))
+    _profile.select_from_argv(["status"])  # not help: nothing changes, and the real run refuses it
+    assert "AGENT_FACTORY_PROFILE" not in os.environ and not registered
+    _profile.select_from_argv(["--help"])
+    assert _current().name == "example"
+    assert "AGENT_FACTORY_PROFILE_TOML" not in os.environ
+    ((fn, args, kwargs),) = registered
+    fn(*args, **kwargs)
+    assert "the selected profile is not usable" in capsys.readouterr().err
+
+
 def test_the_flag_is_accepted_after_operates_subcommand(other_profile, monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT / "ops"))
     operate = _ops("operate")
@@ -544,7 +589,8 @@ def test_factory_mcp_takes_url_and_repos_from_the_profile(other_profile, monkeyp
     monkeypatch.delenv("FACTORY_MCP_PUBLIC_URL", raising=False)
     from flyte_agent_factory import _factory_base, _factory_mcp
 
-    assert not _factory_mcp.app.secrets
+    mounted = cast(list[flyte.Secret], _factory_mcp.app.secrets)
+    assert [s.key for s in mounted] == ["other-project-key"]  # the queue tier's key only
     assert _factory_mcp.app.allowed_hosts == ["mcp.example.org"]
     assert _factory_mcp.app.allowed_origins == ["https://mcp.example.org"]
     assert _mcp(_factory_base.PROFILE).repos == ("project", "factory")

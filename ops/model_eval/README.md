@@ -1,8 +1,9 @@
 # Factory model evaluation
 
 Run from the repository root with its environment (`uv sync --group dev`), using
-`PYTHONPATH=src uv run python -m ops.model_eval`. Use the same profile and API-key
-environment as `ops/operate.py`. No command attaches to a parent Flyte run.
+`PYTHONPATH=src uv run python -m ops.model_eval` (the package also finds `src` itself). It acts as your own
+`flyte` login, through the selected profile's `[backend] config`, as `ops/operate.py` does: no API key is
+needed. No command attaches to a parent Flyte run.
 
 ```bash
 # Read-only; --days lists operated project tasks in the selected profile.

@@ -29,6 +29,10 @@ SECRET_CODEX_LOGIN = "codex_login_agent_factory"
 _EXAMPLES = {"claude": "example-claude-personal.toml", "codex": "example-codex-personal.toml"}
 #: Where the Flyte config lives, written into `[backend] config`: the path `FlyteSdk` uses by default.
 FLYTE_CONFIG = "~/.flyte/config.yaml"
+#: The Union secrets `[union]` names, one per key the `union-keys` step makes. The session and queue tiers use
+#: the project's until their owner splits them.
+SECRET_UNION_PROJECT = "agent_factory_union_project_key"
+SECRET_UNION_DEPLOYER = "agent_factory_union_deployer_key"
 
 
 def _render_value(value: object) -> str:
@@ -78,6 +82,8 @@ def collect_wanted_keys(
         "state": {"uri": settings.state_uri},
         "mcp": {"public_url": mcp_url},
     }
+    if settings.backend == "union":  # a Union backend requires it; an OSS one has no such secrets
+        keys["union"] = {"project_key": SECRET_UNION_PROJECT, "deployer_key": SECRET_UNION_DEPLOYER}
     if app_id:
         keys["github"] = {"app_id": app_id, "private_key_secret": SECRET_APP_KEY}
         keys["deploy"] = {"auto": True}
@@ -93,8 +99,9 @@ def render(settings: Settings, app_id: str | None) -> str:
         "# Keep this file out of any public repository: it holds your project, host and secret names.\n"
         f'name = "{settings.repo_name}"\n'
     ]
-    for table in ("backend", "repo"):
-        parts.append(_render_table(table, keys[table]))
+    for table in ("backend", "union", "repo"):
+        if table in keys:
+            parts.append(_render_table(table, keys[table]))
     parts.append(_render_slots(settings))
     for table in ("secrets", "state", "mcp", "github", "deploy", "direction"):
         if table in keys:

@@ -12,6 +12,11 @@ endpoint = "flyte.example.com"
 project = "my-agents"
 domain = "development"
 
+[union]
+# Union secrets that each hold an API key (profiles/README.md#union). Required for a Union backend.
+project_key = "factory-project-key"
+deployer_key = "factory-deployer-key"
+
 [repo]
 # The only repository the factory writes to: this workspace. The deploy key reaches nothing else.
 project = "git@github.com:OWNER/agent-workspace.git"

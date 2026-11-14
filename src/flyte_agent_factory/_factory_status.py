@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from collections.abc import Mapping
 from typing import Any
 
-from flyte_agent_factory import _dashboard
+from flyte_agent_factory import _dashboard, _github_mode, _profile_union
+from flyte_agent_factory._profile import IDENTITIES_ENV, Profile
 
 _HTML_ROW = re.compile(r"<tr><td><code>([^<]*)</code></td><td>([^<]*)</td><td>(.*?)</td></tr>", re.DOTALL)
 _HTML_STATUS = re.compile(r"<p><b>Status:</b> (.*?)</p>", re.DOTALL)
@@ -26,6 +29,48 @@ def _html_timeline(page: str) -> list[dict[str, Any]]:
         for at, icon, text in _HTML_ROW.findall(table)
     ]
     return rows[::-1]  # the table is newest first
+
+
+def github_fields(profile: Profile, env: Mapping[str, str]) -> dict[str, str]:
+    """How this deploy talks to GitHub: the mode and the sentence a person reads."""
+    return {
+        "github_mode": _github_mode.mode(profile, env),
+        "github": _github_mode.describe(profile, env),
+    }
+
+
+def union_fields(profile: Profile, deploy_output: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return the `[union]` display: each tier and the secret it acts as, never a key.
+
+    A row carries the client id the latest successful deploy's outputs recorded for it
+    (`deploy_output["identities"]`) when there is one.
+    """
+    recorded = deploy_output.get("identities") if deploy_output else None
+    clients = {
+        (row.get("tier"), row.get("secret")): row.get("client_id")
+        for row in (recorded if isinstance(recorded, list) else [])
+        if isinstance(row, dict)
+    }
+    return {
+        "union": [
+            {
+                **row,
+                **({"client_id": clients[key]} if (key := (row["tier"], row["secret"])) in clients else {}),
+            }
+            # `_union_identity.describe`, spelled out: the slot bundle carries this module (`_factory`
+            # imports it) but not `_union_identity`, which only the pods that act as a tier key ship.
+            for row in ({"tier": t, "secret": profile.union.key_for(t)} for t in _profile_union.TIERS)
+        ]
+    }
+
+
+def status_fields(profile: Profile, env: Mapping[str, str]) -> dict[str, Any]:
+    """`github_fields` and `union_fields`, from what the deployer passed this pod (`IDENTITIES_ENV`)."""
+    try:
+        recorded = json.loads(env.get(IDENTITIES_ENV) or "[]")
+    except ValueError:  # status must not fail on a garbled value
+        recorded = []
+    return {**github_fields(profile, env), **union_fields(profile, {"identities": recorded})}
 
 
 def phase_fields(phase: dict[str, Any]) -> dict[str, Any]:

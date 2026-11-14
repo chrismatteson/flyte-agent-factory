@@ -9,7 +9,7 @@ from dataclasses import replace
 
 import pytest
 
-from flyte_agent_factory import _author, _bench, _bench_flow, _profile
+from flyte_agent_factory import _author, _bench, _bench_flow, _profile, _union_identity
 from tests.conftest import reload_agent
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -23,6 +23,10 @@ kind = "union"
 endpoint = "union.example.org"
 project = "proj"
 domain = "development"
+
+[union]
+project_key = "factory-project-key"
+deployer_key = "factory-deployer-key"
 
 [repo]
 project = "git@github.com:example-org/sandbox.git"
@@ -151,9 +155,12 @@ def test_every_environment_mounts_the_one_token_and_no_login(monkeypatch):
             assert "CLAUDE_CREDENTIALS_JSON" not in mounted.values()
             assert "work_codex_token" in mounted
             assert not {k for k in mounted if "login" in str(k)}
-        # The setup environment signs nobody in.
+        # The setup environment signs nobody in: its one secret is the project tier's Union key, which every
+        # factory pod acts as (#183), never a Claude or Codex credential.
         assert module.setup_env.name == "factory-setup"
-        assert not module.setup_env.secrets
+        assert [(s.key, s.as_env_var) for s in module.setup_env.secrets] == [
+            (profile.union.key_for("project"), _union_identity.KEY_ENV)
+        ]
         # Only the Codex device-code login is back: it holds no credential until you sign in.
         registered = {name for name in dir(module) if "bootstrap_login" in name}
         assert registered == {"codex_bootstrap_login"}

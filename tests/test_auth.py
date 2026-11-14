@@ -98,9 +98,13 @@ def test_subagent_environment_carries_only_the_claude_token(monkeypatch):
     parent = {s.key for s in cast(list[flyte.Secret], agent_module.env.secrets)}
     child = {s.key for s in cast(list[flyte.Secret], agent_module.subagent_env.secrets)}
 
-    assert child == {"claude_setup_token"}
+    # Its own tier's Union key is the one addition: it is how the sub-agent acts on Union at all.
+    profile = _session_config._PROFILE
+    assert profile is not None
+    session_key = profile.union.key_for("session")
+    assert child == {"claude_setup_token", session_key}
     assert "github_token" in parent, "the parent should still get its declared extras"
-    assert not (child - {"claude_setup_token"}), f"sub-agent leaked: {child}"
+    assert not (child - {"claude_setup_token", session_key}), f"sub-agent leaked: {child}"
 
 
 def test_deploy_key_is_written_privately_and_used_exclusively(tmp_path, monkeypatch):
@@ -308,14 +312,16 @@ def test_the_session_never_sees_an_anthropic_api_key():
             "ANTHROPIC_API_KEY": "sk-ant-secret",
             "ANTHROPIC_AUTH_TOKEN": "also-secret",
             "PATH": "/usr/bin",
-            "_UNION_EAGER_API_KEY": "needed-for-child-actions",
+            "AGENT_FACTORY_UNION_KEY": "needed-for-child-actions",
+            "_UNION_EAGER_API_KEY": "another-tiers-identity",
         }
     )
     assert "ANTHROPIC_API_KEY" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert env["PATH"] == "/usr/bin"
-    # Not stripped: the session submits child actions with it.
-    assert env["_UNION_EAGER_API_KEY"] == "needed-for-child-actions"
+    # Not stripped: the session submits child actions with its tier key, never the key Union injects.
+    assert env["AGENT_FACTORY_UNION_KEY"] == "needed-for-child-actions"
+    assert "_UNION_EAGER_API_KEY" not in env
 
 
 def test_both_sessions_are_started_through_the_filter():

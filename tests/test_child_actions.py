@@ -2,7 +2,7 @@
 
 import pytest
 
-from flyte_agent_factory import _instructions, child
+from flyte_agent_factory import _instructions, _union_identity, child
 
 
 @pytest.fixture(autouse=True)
@@ -49,10 +49,13 @@ def test_attach_creates_a_controller_when_there_is_none(monkeypatch, tmp_path):
         raise RuntimeError("Controller is not initialized")
 
     monkeypatch.setattr(controllers, "get_controller", no_controller)
-    monkeypatch.setattr(controllers, "create_controller", lambda ct, **kw: created.append(ct))
+    monkeypatch.setattr(controllers, "create_controller", lambda ct, **kw: created.append((ct, kw)))
+    monkeypatch.setattr(_union_identity, "controller_kwargs", lambda: {"endpoint": "tier-endpoint"})
 
     assert child.attach(tmp_path) == "ctx"  # type: ignore[comparison-overlap]  # the fake context is a str
-    assert created == ["rust"], "submission needs the remote controller"
+    assert created == [("remote", {"endpoint": "tier-endpoint"})], (
+        "submission needs the remote controller, built from this pod's tier key and never the rust one"
+    )
 
 
 def test_attach_reuses_an_existing_controller(monkeypatch, tmp_path):
@@ -66,6 +69,34 @@ def test_attach_reuses_an_existing_controller(monkeypatch, tmp_path):
 
     child.attach(tmp_path)
     assert created == [], "a second attach must not build another controller"
+
+
+def test_attach_from_a_workspace_project_finds_the_context_at_the_workspace_root(monkeypatch, tmp_path):
+    # checks.sh runs in projects/<name>/ while the supervisor drops the context at the workspace root.
+    import flyte
+    from flyte._internal import controllers
+
+    child.context_path(tmp_path).parent.mkdir()
+    child.context_path(tmp_path).write_text("{}")
+    project = tmp_path / "projects" / "demo"
+    project.mkdir(parents=True)
+    monkeypatch.chdir(project)
+    loaded = []
+
+    def load(path=None):
+        loaded.append(path)
+        return "ctx"
+
+    monkeypatch.setattr(flyte, "load_interactive_ctx", load)
+    monkeypatch.setattr(controllers, "get_controller", lambda: "existing")
+
+    assert child.find_base() == project.resolve().parents[1] == tmp_path.resolve()
+    child.attach()
+    assert loaded == [child.context_path(tmp_path.resolve())]
+
+
+def test_find_base_without_a_context_is_the_start(tmp_path):
+    assert child.find_base(tmp_path) == tmp_path
 
 
 def test_module_documents_the_image_constraint():

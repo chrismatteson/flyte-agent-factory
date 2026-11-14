@@ -28,8 +28,11 @@ and takes you from GitHub access to a first launch one step at a time; every sec
    (section 1 below). Every Claude session runs on it.
 3. **Add a deploy key** for the workspace repository, store it as a secret and name it in
    `[secrets] deploy_key` (section 3). To launch projects into another repository, give it a
-   deploy key too and list it under `[repo_keys]`. The workspace deploy key is the only GitHub credential setup requires; the
-   GitHub App is optional and yours to register ([github-app.md](github-app.md)).
+   deploy key too and list it under `[repo_keys]`. The GitHub App is the guided-setup default (read-only on code; pushes stay on deploy keys until the isolation canary reports `isolated`), yours to register
+   ([github-app.md](github-app.md)); without it the workspace deploy key is the only GitHub credential setup requires,
+   and there is no CI visibility. A launch repository where the App is installed and no deploy key reaches is cloned
+   with a contents-read token for that one repository, so reading it needs no `[repo_keys]` entry; pushing to it still
+   needs its deploy key (or `push = "app"`).
 4. **Select the profile and deploy** with `--profile <workspace clone>/profile.toml` (or `AGENT_FACTORY_PROFILE` set to
    that path). The first install is `ops/deploy_work.py` and `ops/deploy_factory.py` ("Deploying", below): the only
    hand step besides creating secrets. After that a merge to the workspace deploys itself when the profile has
@@ -137,12 +140,11 @@ requests. A project then works on `factory/<name>`, the supervisor opens a
 draft PR (a ready one where the repository has no drafts) when the session
 declares DONE and marks it ready, with a verdict
 comment and a `factory/verifier` commit status, when review passes. The App's
-key and tokens are kept out of the session's and sub-agents' environments and
-the session still pushes with the deploy key. The session runs as the same user
-as the supervisor and holds a Union API key (`_secret_env.SESSION_KEEPS` keeps
-`_UNION_EAGER_API_KEY`), so it can still reach slot secrets through the Flyte API; the
-supervisor is non-dumpable, so `/proc` is closed. This is not a security boundary until the
-session runs as a separate user (tracked separately). Without `[github]`,
+private key is held by the supervisor only. No session or delegate worker has it in its environment or files, but while Union injects its own key into every pod a session can launch a task that mounts the App key secret; that is what the isolation canary's `not isolated` reports ([github-app.md](github-app.md)). Every installation token
+is limited to one repository and named permissions. Until the deployer's isolation canary reports `isolated`, the
+session still pushes with the deploy key ([github-app.md](github-app.md)). Union injects `_UNION_EAGER_API_KEY` into
+every pod; the factory ignores and removes it, and each tier acts as its own scoped key
+([Union keys](#union-keys)), so a session reaches only what its tier key may. Without `[github]`,
 projects push to the default branch and open no pull request. Merging is not gated on the verdict until
 branch protection requires it ([branch protection](branch-protection.md)).
 
@@ -166,18 +168,19 @@ A secret that doesn't exist is a hard pod mount failure in Flyte, so optional
 secrets are opted into at deploy time:
 
 ```bash
-AGENT_FACTORY_SECRETS=github_token,npm_token=NPM_TOKEN flyte deploy src/flyte_agent_factory/agent.py
+AGENT_FACTORY_SECRETS=github_token,npm_token=NPM_TOKEN PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" \
+  deploy --all --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/flyte_agent_factory/agent.py
 ```
 
 ## Deploying
 
-Flyte's CLI loads a task file two different ways, and a package layout needs
-help with both: `flyte deploy --all` imports it package-aware as dotted path
-relative to `--root-dir`, while `flyte run <file>` imports it as a top-level
-module via `spec_from_file_location` with no package at all. So every
-invocation carries `--root-dir src` (which makes the in-container module name
-`flyte_agent_factory.agent`) and `PYTHONPATH=src` (which resolves the absolute
-intra-package imports locally). Use the direct commands below. In order, they:
+Flyte's CLI loads a task file two different ways: `flyte deploy --all` imports it package-aware as a dotted path
+relative to `--root-dir`, while `flyte run <file>` imports it as a top-level module via `spec_from_file_location`.
+Either way `--root-dir src` is what makes the package layout work: it makes the in-container module name
+`flyte_agent_factory.agent`, and the CLI appends it to `sys.path`, which resolves the absolute intra-package imports
+locally. Without it both fail with `ModuleNotFoundError: No module named 'flyte_agent_factory'`; with it,
+`PYTHONPATH=src` changes nothing, and these docs carry it on `flyte` commands only so that every command running the
+package reads the same way. Use the direct commands below. In order, they:
 
 1. store a `claude setup-token` token as the Flyte secret named in `[secrets] claude_token`;
 2. redeploy only the work slots from `origin/main` (safe from inside the agent);
@@ -193,6 +196,12 @@ PYTHONPATH=src uv run python ops/deploy_factory.py
 PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" run --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/sandbox_probe.py probe
 PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" run --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/flyte_agent_factory/agent.py project
 ```
+
+A hand deploy acts as your own `flyte` login (the profile's `[backend] config`) and needs no API key: the scripts
+leave `AGENT_FACTORY_DEPLOY_KEY_ENV` and the key Union injects into pods (`_UNION_EAGER_API_KEY`, `EAGER_API_KEY`)
+out of what they run, even when your shell has them set. Every `ops/` script puts `src` on the path itself:
+`PYTHONPATH=src` is needed only where a command imports the package itself (`python -m` on one of its modules, a
+`python -c` or a heredoc); `flyte run` and `flyte deploy` find `src` through `--root-dir src`, and carry it anyway.
 
 Merged changes deploy themselves: with `[deploy] auto = true` in the profile, the `factory-deployer` task polls the
 default branch of `[deploy] repo` (default `[repo] factory`) every 5 minutes and ships a head whose CI passed, so a
@@ -229,3 +238,62 @@ time (`convert_upload_default_inputs`) and rejects an `int` there; a dry run (`-
 deploy sends. When a deploy reports `cannot schedule new futures after shutdown` for one task, the cause is the first
 `Failed to deploy task` line in the log: the SDK keeps deploying the other tasks while the process exits, and one of
 them then finds the event loop's thread pool closed.
+
+## Union keys
+
+Union injects `_UNION_EAGER_API_KEY` into every task pod. The factory never reads it: `_union_identity.establish()` removes
+it at startup. Each tier instead acts as an owner-chosen scoped API key stored as a named Flyte secret, which the
+deployer mounts as `AGENT_FACTORY_UNION_KEY` (with `FLYTE_AUTH_TYPE=ExternalCommand`, whose command runs
+the module `flyte_agent_factory._union_token`). There is no fallback: a tier whose key is missing fails at start with a
+message naming the tier, the secret and `python ops/bootstrap.py --union-keys`. A permission-denied error names the tier,
+the key's client id and the secret.
+
+The profile's `[union]` table ([profiles/README.md](../profiles/README.md#union)) names the secrets:
+
+| Key | Required | Acts as | Role |
+|---|---|---|---|
+| `project_key` | yes, for a Union backend | slot supervisors and setup tasks; the default for `session_key` and `queue_key` | `contributor` on the one project and domain; nothing org-wide |
+| `deployer_key` | yes, for a Union backend | the deployer and its deploy children | `contributor` on the same project and domain; it may be the same key as `project_key`, but that is your choice |
+| `session_key` | no | every Claude process, sub-agents, delegates and reviewers | optional separate key; use one whose role cannot mount secrets to isolate the GitHub App ([github-app.md](github-app.md)) |
+| `queue_key` | no | the factory, gardening, loop, issues, webhook, factory-mcp, bench, browser and voice | defaults to `project_key` |
+
+**Create one in the console.** In the Union console, create an API key with no default policies, bind it to a policy with the
+role `contributor` on the work project and domain only, copy the credential it shows once, and store it as a secret in
+that project and domain (the secret names are placeholders such as `factory_project_key`). The easiest way is
+`python ops/bootstrap.py --union-keys`: it prints the console steps, reads the key at a hidden prompt, stores it as a
+secret and never echoes it. It works on a Mac; nobody needs `flyte create api-key` locally. If you may not manage access in
+the organization, ask an admin for the `--grant` command it prints.
+
+**What a project tier cannot do** (measured live on 2026-11-12 with a key that was `contributor` on one project and
+domain): the pod authenticated with the scoped key and listed runs in its own project and domain; a child launched by that
+identity ran; listing projects org-wide was refused (unauthorized); and a launch into the staging domain was refused
+(permission denied, naming the key's identity). Union **still injects** `_UNION_EAGER_API_KEY` into pods, including
+those launched by the scoped identity; the factory ignores and removes it, but it is present in the pod environment.
+
+Hand deploy scripts and `ops/*.py` use your CLI login (`flyte.init_from_config`) by default, or a named key variable
+(`_union_identity.init_for_script`). The default-lane test `tests/test_union_identity_guard.py` fails on any engine code that
+names the injected key, builds the rust controller or calls `init_in_cluster` outside `_union_identity`.
+
+## Migrating an existing install
+
+For an owner whose factory already runs on the old credential.
+
+1. **Before merging**, create (or reuse) a key with `contributor` on the work project and domain for `project_key`, and a
+   deployer key. Store both as secrets in that project and domain ([Union keys](#union-keys)), and add `[union]` to the
+   direction repository's profile. The running deployer tolerates the unknown table.
+2. **Merge.** The running deployer deploys the engine with its old credential for the last time. Check that
+   `factory.status` lists the tiers and their client ids. Run a project, a review round, a queue dispatch and a deploy.
+3. **To move direction**, use the two-sided commit handoff ([profiles/README.md](../profiles/README.md)):
+   commit in the new repository a profile whose `[direction]` names the new repository itself, then commit in the old
+   repository `[direction]` naming the new one. No hand deploy is needed. Then archive the old repository.
+4. **GitHub isolation is optional and gated.** Create a session key whose role cannot mount secrets and set
+   `session_key`. Set `[github] push = "app"` (and `workflows = true` if you push `.github/workflows/`), accept the App's
+   new permissions, and confirm the deploy report says `isolated` and `factory.status` says `app`. Only then delete the
+   deploy-key secrets and `[repo_keys]`. Until then two GitHub credentials remain ([github-app.md](github-app.md)).
+   While Union injects its own key into every pod (measured above), the canary reports not isolated whatever the
+   session key's role, because a pod holding that key can launch a task that mounts the App key: this step waits on
+   Union, and the deploy report names the reason.
+5. **Rollback.**
+   - Revert the engine commit; the deployer redeploys the previous engine.
+   - Revoke keys individually.
+   - Remove `push = "app"` to return to deploy keys, and keep those keys until a week of green.

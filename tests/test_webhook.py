@@ -21,6 +21,7 @@ from flyte_agent_factory import (
     _loop,
     _profile,
     _pull_requests,
+    _union_identity,
     _webhook,
 )
 from tests.test_deployer import make_direction_profile, make_profile
@@ -258,9 +259,10 @@ def test_deployment_wires_webhook_and_actual_reconcile_trigger(monkeypatch, conf
         env = webhook["env"]
         assert env.name == "factory-webhook"
         assert env.requires_auth is False
-        assert len(env.secrets) == 1
-        assert env.secrets[0].key == "hook"
-        assert env.secrets[0].as_env_var == _webhook.SECRET_ENV
+        assert [(s.key, s.as_env_var) for s in env.secrets] == [
+            ("hook", _webhook.SECRET_ENV),
+            (_webhook.PROFILE.union.key_for("queue"), _union_identity.KEY_ENV),
+        ]
         assert not any(secret.key == "hook" for secret in deployed["env"].secrets)
     else:
         with pytest.raises(_deploy.Refused):
@@ -707,9 +709,14 @@ def test_issue_tasks_ship_with_the_webhook_and_hold_the_app_key_alone(monkeypatc
     assert app.depends_on == [issues]
     assert issues.name == "factory-issues"
     _deploy.check_environments(app)  # the dependency walk admits factory-issues with the webhook
-    # The public app mounts only the webhook secret; the App's private key only the intake tasks.
-    assert [(s.key, s.as_env_var) for s in app.secrets] == [("hook", _webhook.SECRET_ENV)]
-    assert [s.key for s in issues.secrets] == [profile.github.private_key_secret]
+    # The public app mounts only the webhook secret (and its tier key); the App's private key only the
+    # intake tasks (and theirs).
+    queue = profile.union.key_for("queue")
+    assert [(s.key, s.as_env_var) for s in app.secrets] == [
+        ("hook", _webhook.SECRET_ENV),
+        (queue, _union_identity.KEY_ENV),
+    ]
+    assert [s.key for s in issues.secrets] == [profile.github.private_key_secret, queue]
 
 
 def test_webhook_without_maintainers_deploys_no_issue_tasks(monkeypatch):
@@ -783,7 +790,9 @@ async def test_loop_wakeup_adopts_each_pr_head_once(monkeypatch):
     ]
     monkeypatch.setattr(_pull_requests, "take_app_key", lambda secret: "offline")
     monkeypatch.setattr(
-        _github, "GithubApp", lambda *args: SimpleNamespace(_get_pages=lambda *args, **kwargs: pulls)
+        _github,
+        "GithubApp",
+        lambda *args, **kwargs: SimpleNamespace(_get_pages=lambda *args, **kwargs: pulls),
     )
     monkeypatch.setattr(_loop, "loop_pull", lambda app, repo, pull: True)
     runs: dict[str, Any] = {}
@@ -876,7 +885,9 @@ async def test_loop_wakeup_ignores_a_pr_that_shares_the_head_but_is_not_the_loop
     pulls = [{"number": 1, "head": {"sha": SHA}}, {"number": 2, "head": {"sha": SHA}}]
     monkeypatch.setattr(_pull_requests, "take_app_key", lambda secret: "offline")
     monkeypatch.setattr(
-        _github, "GithubApp", lambda *args: SimpleNamespace(_get_pages=lambda *args, **kwargs: pulls)
+        _github,
+        "GithubApp",
+        lambda *args, **kwargs: SimpleNamespace(_get_pages=lambda *args, **kwargs: pulls),
     )
     monkeypatch.setattr(_loop, "loop_pull", lambda app, repo, pull: pull["number"] == 2)
     started = []

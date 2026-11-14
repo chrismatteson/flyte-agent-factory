@@ -9,15 +9,25 @@ Codex to open https://example.com and prints only the page title it reports.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
-from flyte_agent_factory import _local_browser, browser
-from flyte_agent_factory._author import _login_with_access_token
-from flyte_agent_factory._session_config import CODEX_TOKEN_ENV_VAR
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+
+from flyte_agent_factory import _profile
+
+_profile.select_from_argv()  # before browser and _author read the profile at import
+
+from flyte_agent_factory import _local_browser, browser  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory._author import _login_with_access_token  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory._session_config import CODEX_TOKEN_ENV_VAR  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
 PROMPT = (
     "Use the browser tools to open https://example.com and read the page title. "
@@ -72,4 +82,5 @@ async def probe() -> str:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__.split("\n\n")[0]).parse_args()  # only --help: no options
     print(asyncio.run(probe()))

@@ -429,7 +429,8 @@ only a snapshot and can be many and cheap. It is checkpointed on a timer, so a r
 resumes from its saved thread).
 
 **A session cannot read its own issue.** The factory's GitHub App key and tokens are kept out of the session's
-environment; the session holds a deploy key for one repository and nothing for GitHub's API. The supervisor, which
+environment; the session holds a deploy key or a one-repository installation token for its own repository and nothing
+for GitHub's API. The supervisor, which
 holds the App, reads the issue, checks that its author is a listed maintainer, and hands the session the issue text
 as the brief, framed as data to do the work from and not as instructions to change the factory or its security
 settings. The supervisor also posts the status comments. The session works from the brief it was given. The supervisor, which holds the App, also writes the linked issue's title, body, labels and comments to `.claude-flyte/ISSUE.md` beside `BRIEF.md` on every start and resume (read-only, allowlisted authors only, tokens redacted), so the session needs no GitHub credential to read it.

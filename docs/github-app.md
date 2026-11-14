@@ -5,11 +5,56 @@ key would let anyone holding it act on every repository it is installed on, so e
 App is the default in [guided setup](quickstart.md) and optional: setup works without it, with the losses listed
 [below](#what-works-without-it).
 
-The deploy key into your `agent-workspace` repository (one per repository, write access) is the
-only GitHub credential setup requires; everything the App adds is optional. "The App by default plus a deploy key" is the
-credential model this guide assumes. It is still open: issue #179 decides the final model. The deploy key is what a
-session pushes with. The App's key is stored only as a Flyte secret and mounted in the factory and deployer
-tasks, never in a project slot's environment or a chat. It cannot write contents: pushes are the deploy key's job.
+The App is the guided-setup default, read-only on code (`contents: read`); pushes stay on deploy keys until the
+isolation canary reports `isolated`. It gives the factory CI visibility (check-runs, statuses and, for
+`ci-status --logs`, `actions: read`), draft pull requests and the verifier status. Every installation token the factory
+mints is limited to **one repository** and to the permissions its call names (the scopes in `_github.py`: `CI_READ`,
+`METADATA_READ`, `CONTENTS_READ`, `CONTENTS_WRITE` for the deployer's lock ref, `ISSUES_READ`, `ISSUES_WRITE`,
+`PR_WRITE`, `VERIFIER` and the session push scope), so a token for one repository cannot touch another and no token
+carries everything the installation holds: an App handle made without permissions refuses to mint one at all.
+
+The App's private key is held by the supervisor only. It is stored as a Flyte secret and mounted in the factory and
+deployer tasks and the slot's supervisor, and it is **no longer mounted in a slot's sessions**: no session or delegate
+worker has it in its environment or files. It is not yet out of their reach: while Union injects its own key into every
+pod, a session can launch a task that mounts the App key secret, which is what the canary below reports as
+`not isolated`.
+
+**What a session can reach today.** Union injects its org-level API key (`_UNION_EAGER_API_KEY`) into every pod,
+including pods launched with a scoped key (measured 2026-11-12). While that holds, a session can reach every secret
+the factory stores: deploy keys, Union tier keys, model keys and the GitHub App key. With the App key a session could
+forge the `factory/verifier` status, open or edit pull requests and issue comments, and read the repositories the App
+is installed on. It cannot push with it: the App is `contents: read`. The fix is Union no longer injecting its org key
+into factory pods, or limiting it to the factory's project and domain. Until then `factory.status` and the deploy report
+say `App key reachable from sessions: <reason>; factory/verifier advisory`, and the canary runs on every deploy
+whenever an App is configured, not only when `push = "app"`. The exposure is temporary: Union is removing the
+injected key. Once it is gone the canary reports `isolated` with no change here, the status says so, and
+[migrating to one credential](setup.md#migrating-an-existing-install) (`push = "app"`) retires the deploy keys.
+
+Two ways to push, chosen by `[github] push` (default `deploy_key`):
+
+| `[github] push` | A session pushes with | Needs |
+|---|---|---|
+| `deploy_key` (default) | the repository's deploy key | nothing beyond the deploy key |
+| `app` | a one-repository App installation token | the isolation canary reporting `isolated` (below), and [`[github] workflows`](#workflows) to push `.github/workflows/` |
+
+**Two GitHub credentials remain for now.** App push takes effect only when the deployer's isolation canary
+(`_isolation_canary.py`) reports `isolated`. The canary launches a no-op task as the session tier that tries to mount the
+App key; the verdict is `isolated` only if that launch is refused, or the pod has neither the App key nor Union's
+injected `_UNION_EAGER_API_KEY`. Union injects that key into every pod, including pods launched by a scoped identity
+(measured 2026-11-12), so today the canary reports **not isolated** wherever Union injects it. Until it reports
+`isolated`, a per-repository deploy key does the session push and the App does everything else. `factory.status` and the
+deploy report say which mode is active (`app`, `app-read` or `deploy-keys`) and why.
+
+**Deploy-key-only mode** (no App) is a documented fallback with **no CI visibility**: the deployer cannot read
+check-runs or statuses, so there is no auto-deploy gate, no draft pull request and no verifier status. In that mode the
+deploy key into your `agent-workspace` repository (one per repository, write access) is the only GitHub credential setup
+requires, and everything the App adds is optional.
+
+**A private repository you control** (for example a direction repository or a repository you only read): install the App
+on that repository. A project launched into it, when no deploy key reaches it, is cloned and fetched with a
+contents-read token the supervisor mints for that one repository and re-mints every 45 minutes, so you create no
+per-repository key by hand. The token reads; it cannot push. Deploy keys (`[repo_keys]`) are still what a session pushes
+to another repository with, and are used for reading too where the App is not installed.
 
 ## What it enables
 
@@ -22,6 +67,13 @@ tasks, never in a project slot's environment or a chat. It cannot write contents
 
 The chat operator's GitHub connector is a separate credential and is not replaced by the App
 ([github-connector.md](github-connector.md)).
+
+## Workflows
+
+A push that touches `.github/workflows/` needs the GitHub App's `workflows: write` permission, so it is off by default.
+Set `[github] workflows = true` (with `push = "app"`) to allow it, and accept the new permission on the App's
+installation page. Without `workflows = true` the push is refused with a message that points here
+(`docs/github-app.md#workflows`). The setting applies to pushes made with the App token only.
 
 ## Register it with the bootstrap (default)
 
@@ -68,7 +120,7 @@ Settings > Developer settings > GitHub Apps > **New GitHub App** (for an organiz
   | Checks | read |
   | Issues | write |
 
-  Contents is read-only on purpose. Issues write is for intake status comments and the `[loop]` labels. The
+  Contents is read-only on purpose: a push uses the deploy key, or the App token only in `push = "app"` mode, whose installation grants contents write for that one repository (accept the new permission when GitHub asks). Issues write is for intake status comments and the `[loop]` labels. The
   settings that merge or write refs (`[loop] merge`, `[planner]`, `[bench]`) need more; see
   [profiles/README.md](../profiles/README.md).
 - **Subscribe to events** (only with a webhook): Push, Issues, Issue comment, Pull request.

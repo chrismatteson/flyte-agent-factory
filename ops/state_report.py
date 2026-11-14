@@ -19,20 +19,23 @@ Everything is left in place. The prefix is emptied by the owner after state step
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
 import sys
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
-import flyte
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flyte_agent_factory import _profile
 
 _profile.select_from_argv()
 
-from flyte_agent_factory import _factory, _factory_base, _queue  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory import _factory_base, _queue, _union_identity  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
 #: Comment bodies the reconciler re-derives from a run's report (`_issues.derive`), by their first words.
 DERIVABLE = ("Started: ", "QA round ", "PR opened: ", "Released/ended: ")
@@ -77,15 +80,16 @@ def report(uri: str, now: float) -> list[str]:
     return lines
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Print the state report for the profile's `[state] uri`, if it has one."""
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--profile", help="deployment profile name or path (default: $AGENT_FACTORY_PROFILE)")
+    parser.parse_args(argv)  # --profile is read at import (select_from_argv)
     uri = _factory_base.PROFILE.state.uri
     if not uri:
         print("this profile has no [state] uri: there is nothing to report")
         return 0
-    flyte.init_from_api_key(
-        api_key=os.environ["_UNION_EAGER_API_KEY"], project=_factory.PROJECT, domain=_factory.DOMAIN
-    )
+    _union_identity.init_for_script(_factory_base.PROFILE)
     print("\n".join(report(uri, time.time())))
     return 0
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import os
 import re
 import tempfile
 import time
@@ -140,15 +139,13 @@ class Backend:
     """Reads historical runs from Flyte and replays sub-agent calls against candidate settings."""
 
     def __init__(self, config: dict[str, Any], allow_live: bool = False) -> None:
-        """Connect to Flyte with the evaluation API key; `allow_live` permits replays on live slots."""
+        """Connect to Flyte as your own CLI login; `allow_live` permits replays on live slots."""
         import flyte
         from flyte import remote
 
-        from flyte_agent_factory import _factory, _factory_base
+        from flyte_agent_factory import _factory, _factory_base, _union_identity
 
-        flyte.init_from_api_key(
-            api_key=os.environ["_UNION_EAGER_API_KEY"], project=_factory.PROJECT, domain=_factory.DOMAIN
-        )
+        _union_identity.init_for_script(_factory_base.PROFILE)
         self.flyte, self.remote, self.factory = flyte, remote, _factory
         self.base = _factory_base  # where SLOTS and PROFILE live; `_factory` does not re-export them
         self.config = config

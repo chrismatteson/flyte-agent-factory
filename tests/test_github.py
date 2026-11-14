@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from flyte_agent_factory import _github
 
 REPO = "acme/factory"
+#: Every token names its permissions (#179); which ones is not what these tests are about.
+SCOPE = _github.CONTENTS_READ
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 PRIVATE_PEM = KEY.private_bytes(
     serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
@@ -95,7 +97,7 @@ def gh():
     clock = Clock()
     fake = FakeGithub(clock)
     client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(fake.handler))
-    fake.app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=clock)
+    fake.app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=clock, permissions=SCOPE)
     fake.clock_obj = clock
     return fake
 
@@ -131,26 +133,26 @@ def test_app_jwt_claims(gh):
 
 
 def test_installation_token_is_fetched_with_the_app_jwt_and_cached(gh):
-    assert gh.app.installation_token(REPO) == "ghs_token1"
-    assert gh.app.installation_token(REPO) == "ghs_token1"
+    assert gh.app.installation_token(REPO, SCOPE) == "ghs_token1"
+    assert gh.app.installation_token(REPO, SCOPE) == "ghs_token1"
     assert gh.minted == 1
     lookup = gh.requests[0]
     assert lookup.headers["authorization"].startswith("Bearer ey")  # the JWT, not an installation token
 
 
 def test_installation_token_is_refreshed_near_expiry(gh):
-    gh.app.installation_token(REPO)
+    gh.app.installation_token(REPO, SCOPE)
     gh.clock_obj.now = NOW + 3600 - 6 * 60  # still 6 minutes left: keep
-    assert gh.app.installation_token(REPO) == "ghs_token1"
+    assert gh.app.installation_token(REPO, SCOPE) == "ghs_token1"
     gh.clock_obj.now = NOW + 3600 - 4 * 60  # inside the 5-minute margin: refresh
-    assert gh.app.installation_token(REPO) == "ghs_token2"
+    assert gh.app.installation_token(REPO, SCOPE) == "ghs_token2"
     assert gh.minted == 2
 
 
 def test_missing_installation_names_the_repo(gh):
     gh.installed = False
     with pytest.raises(_github.GithubError, match="not installed on acme/factory"):
-        gh.app.installation_token(REPO)
+        gh.app.installation_token(REPO, SCOPE)
 
 
 def test_default_branch_sha_uses_the_installation_token(gh):
@@ -167,7 +169,7 @@ def test_token_never_appears_in_error_text(gh):
 
 
 def test_clone_url_carries_the_token_and_redact_hides_it(gh):
-    token = gh.app.installation_token(REPO)
+    token = gh.app.installation_token(REPO, SCOPE)
     url = _github.clone_url(REPO, token)
     assert url == f"https://x-access-token:{token}@github.com/acme/factory.git"
     assert token not in gh.app.redact(f"fatal: unable to access '{url}'")
@@ -287,7 +289,7 @@ def _paged(gh, statuses, runs):
         return inner(request)
 
     client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(handler))
-    app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=gh.clock_obj)
+    app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=gh.clock_obj, permissions=SCOPE)
     return app, asked
 
 
@@ -417,7 +419,7 @@ def test_a_timeout_is_a_github_error_not_an_httpx_one(gh):
 
     gh.app._http = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(timeout))
     with pytest.raises(_github.GithubError, match="ReadTimeout"):
-        gh.app.installation_token(REPO)
+        gh.app.installation_token(REPO, SCOPE)
 
 
 def test_a_2xx_that_is_not_json_is_a_github_error(gh):
@@ -453,7 +455,7 @@ def test_a_malformed_token_response_is_a_github_error_without_the_token(gh, issu
 
     gh.app._http = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(malformed))
     with pytest.raises(_github.GithubError, match="unusable installation token") as e:
-        gh.app.installation_token(REPO)
+        gh.app.installation_token(REPO, SCOPE)
     assert "ghs_secret" not in str(e.value)
 
 
@@ -481,7 +483,7 @@ def _answering(gh, path, response):
 def test_a_wrong_shaped_token_answer_is_a_github_error_naming_the_field(gh, path, body, field):
     app = _answering(gh, path, httpx.Response(200, json=body))
     with pytest.raises(_github.GithubError, match=f"`{field}`") as e:
-        app.installation_token(REPO)
+        app.installation_token(REPO, SCOPE)
     assert "ghs_secret" not in str(e.value)
 
 
@@ -566,6 +568,7 @@ def test_issue_comments_are_read_with_a_conditional_get():
         PRIVATE_PEM,
         client=httpx.Client(base_url=_github.API, transport=httpx.MockTransport(handler)),
         clock=clock,
+        permissions=SCOPE,
     )
     assert app.issue_comments_since(REPO, 12) == comments
     assert app.issue_comments_since(REPO, 12) == comments
@@ -589,6 +592,7 @@ def test_delete_duplicate_comment_accepts_204_and_refreshes_auth():
         PRIVATE_PEM,
         client=httpx.Client(base_url=_github.API, transport=httpx.MockTransport(handle)),
         clock=Clock(),
+        permissions=SCOPE,
     )
     app.delete_comment(REPO, 42)
     assert calls.count(("DELETE", f"/repos/{REPO}/issues/comments/42")) == 2
@@ -607,6 +611,7 @@ def _app_answering(routes):
         PRIVATE_PEM,
         client=httpx.Client(base_url=_github.API, transport=httpx.MockTransport(handle)),
         clock=Clock(),
+        permissions=SCOPE,
     )
 
 

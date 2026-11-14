@@ -797,8 +797,8 @@ def test_an_engine_already_deployed_is_not_deployed_again(monkeypatch):
         return 0
 
     class App:
-        def installation_token(self, repo):
-            fetched.append(repo)
+        def installation_token(self, repo, permissions):
+            fetched.append((repo, dict(permissions)))
             return "token"
 
     class Tree:
@@ -820,7 +820,7 @@ def test_an_engine_already_deployed_is_not_deployed_again(monkeypatch):
         "bench-0123456-2",
     ]
     assert calls == [(["bench-0123456-2"], SHA, set())]  # only the missing one, and never with the App key
-    assert fetched == ["example-org/factory"]
+    assert fetched == [("example-org/factory", {"contents": "read"})]  # a fetch only
     deployed.add("bench-0123456-2.project")
     calls.clear()
     _bench_flow.deploy_engine_sync(cast(GithubApp, App()), SHA)

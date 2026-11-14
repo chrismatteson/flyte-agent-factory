@@ -9,6 +9,10 @@ project = "proj-x"
 domain = "staging"
 console_host = "console.example.org"
 
+[union]
+project_key = "other-project-key"
+deployer_key = "other-deployer-key"
+
 [repo]
 project = "git@example.org:team/sandbox.git"
 factory = "git@example.org:team/factory.git"

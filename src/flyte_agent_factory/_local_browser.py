@@ -39,9 +39,9 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 # Keep runtime imports usable when deployment tools load this file by path.
 if TYPE_CHECKING:
-    from . import _browser_exit_node, _secret_env
+    from . import _browser_exit_node, _secret_env, _union_identity
 else:
-    from flyte_agent_factory import _browser_exit_node, _secret_env
+    from flyte_agent_factory import _browser_exit_node, _secret_env, _union_identity
 
 #: Loopback port for the MCP server. Arbitrary, but matches the app so the
 #: two paths differ only in host.
@@ -239,8 +239,8 @@ async def _wait(predicate: Callable[[], bool], timeout: float) -> bool:
     return False
 
 
-#: Names the Flyte runtime uses for the in-pod API key, in precedence order.
-API_KEY_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY", "FLYTE_API_KEY", "UNION_API_KEY")
+#: The pod's own key, under the one name every tier mounts it as.
+API_KEY_VARS = (_union_identity.KEY_ENV,)
 
 
 def api_key() -> str:

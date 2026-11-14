@@ -31,6 +31,7 @@ from tests import _bootstrap_fakes as fakes
 from tests._bootstrap_fakes import (
     APP_PEM,
     CLAUDE_TOKEN,
+    KEY_SECRET,
     FakeGitHub,
     World,
     make_context,
@@ -90,13 +91,20 @@ def test_first_run_does_every_step_in_order(world):
     status = statuses(out)
     assert list(status) == [s.id for s in _bootstrap.build_steps()]
     assert status["tools"] == "skip"
-    for step in ("signin", "project", "workspace", "template", "ruleset", "deploy-key", "engine-token"):
+    for step in (
+        "signin", "project", "workspace", "template", "ruleset", "union-keys", "deploy-key", "engine-token"
+    ):  # fmt: skip
         assert status[step] == "done", out
     for step in ("github-app", "board", "profile", "deploy", "mcp-url", "connect"):
         assert status[step] == "done", out
-    assert {"agent_factory_claude_token", "agent_factory_deploy_key", "agent_factory_github_app_key"} == set(
-        world.secrets
-    )
+    assert {
+        "agent_factory_claude_token",
+        "agent_factory_deploy_key",
+        "agent_factory_github_app_key",
+        "agent_factory_union_project_key",
+        "agent_factory_union_deployer_key",
+    } == set(world.secrets)
+    assert world.secrets["agent_factory_union_project_key"] == KEY_SECRET
     assert world.secrets["agent_factory_github_app_key"] == APP_PEM
     assert world.secrets["agent_factory_deploy_key"].startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
     assert "agent-factory" in world.deploy_keys and "agent-workspace-main" in world.rulesets
@@ -117,6 +125,15 @@ def test_a_second_run_changes_nothing(world):
     assert world.events == before
     status = statuses(out)
     assert {v for k, v in status.items() if k != "connect"} == {"skip"}
+
+
+# The changes after which a Union key exists and no secret holds it yet (made, then granted, then stored).
+_LOST_UNION_KEY = {
+    "assign_policy factory-project": "factory-project",
+    "create_secret agent_factory_union_project_key": "factory-project",
+    "assign_policy factory-deployer": "factory-deployer",
+    "create_secret agent_factory_union_deployer_key": "factory-deployer",
+}
 
 
 def test_an_interruption_at_any_change_is_resumed_without_duplicates(world, tmp_path):
@@ -142,6 +159,14 @@ def test_an_interruption_at_any_change_is_resumed_without_duplicates(world, tmp_
             assert w.count("register_app") == 1
             w.apps.clear()
             code, out = run(w)
+        # The same window for a Union key: made, but the run died before storing it, and its secret cannot
+        # be read back. The rerun says which key to delete rather than making a second one.
+        lost_policy = _LOST_UNION_KEY.get(probe[at - 1])
+        if lost_policy:
+            assert code == 3 and statuses(out)["union-keys"] == "blocked", (at, out)
+            assert "delete it" in out[-1] and lost_policy in out[-1], (at, out)
+            w.union_keys.clear()
+            code, out = run(w)
         assert code == 0, (at, out)
         creates = [e for e in w.events if e.startswith(("create_", "register_app", "deploy"))]
         # One of each kind of thing, except the factory deploys (work+factory, then factory again for the
@@ -150,8 +175,10 @@ def test_an_interruption_at_any_change_is_resumed_without_duplicates(world, tmp_
         if key_lost:
             once.remove("register_app")
             assert w.count("register_app") == 2
+        if lost_policy:
+            once.remove(f"create_api_key {lost_policy}")
         assert len(once) == len(set(once)), (at, [e for e in once if once.count(e) > 1])
-        assert w.count("create_secret") == 3, (at, w.events)
+        assert w.count("create_secret") == 5, (at, w.events)
         assert w.count("add_deploy_key") - w.count("delete_deploy_key") == 1, (at, w.events)
 
 
@@ -308,11 +335,29 @@ def test_no_board_skips_the_board(world):
 
 
 def test_a_missing_deploy_api_key_stops_before_the_deploy_with_the_one_command(world):
-    world.api_key = False
+    """Without the factory's Union keys the run stops before the deploy, saying how to get past it.
+
+    The deploy's API keys are now the factory's own Union keys: none is stored and nothing valid is pasted.
+    """
+    world.can_manage_keys = False
     code, out = run(world)
-    assert code == 3 and statuses(out)["deploy"] == "blocked"
+    assert code == 3 and statuses(out)["union-keys"] == "blocked", out
     assert world.count("deploy") == 0
-    assert any("Local Union deployment bootstrap" in line for line in out)
+    assert "agent_factory_union_project_key" not in world.secrets
+    assert any("not a Union API key; run this again" in line for line in out), out
+
+
+def test_a_machine_that_cannot_make_keys_still_deploys_once_the_keys_are_stored(world):
+    """The deploy runs as the person's CLI login, so it needs no API key of its own and no Linux machine."""
+    world.can_manage_keys = False
+    world.secrets.update(
+        {"agent_factory_union_project_key": "stored", "agent_factory_union_deployer_key": "stored"}
+    )
+    code, out = run(world)
+    assert code == 0, out
+    assert statuses(out)["union-keys"] == "skip" and statuses(out)["deploy"] == "done"
+    assert world.count("deploy work=True") == 1
+    assert not any("_UNION_EAGER_API_KEY" in line or "API_KEY" in line for line in out)
 
 
 def test_a_deploy_key_on_github_without_its_secret_is_replaced_not_duplicated(world):
@@ -452,7 +497,7 @@ def test_the_manifest_asks_for_the_documented_permissions_and_no_webhook():
     m = _bootstrap_github.build_manifest("pat", "agent-workspace", "http://127.0.0.1:1/callback")
     assert m["default_permissions"] == {
         "contents": "read", "metadata": "read", "pull_requests": "write",
-        "statuses": "write", "checks": "read", "issues": "write",
+        "statuses": "write", "checks": "read", "actions": "read", "issues": "write",
     }  # fmt: skip
     hooks = m["hook_attributes"]
     assert isinstance(hooks, dict) and hooks["active"] is False and m["public"] is False
@@ -661,3 +706,10 @@ def test_an_existing_policy_with_the_right_binding_is_reused_not_remade(world):
     flyte.ensure_policy("p")
     flyte.ensure_policy("p")
     assert world.count("create_policy") == 1
+
+
+def test_every_flag_the_scripts_usage_names_is_an_option_of_its_parser():
+    # Review round 1: the usage line still said `--deploy-key` after it became `--union-keys`.
+    usage = cast(str, runpy.run_path(str(ROOT / "ops" / "bootstrap.py"), run_name="usage")["__doc__"])
+    flags = re.compile(r"--[a-z][a-z-]*")
+    assert set(flags.findall(usage)) <= set(flags.findall(_bootstrap._build_parser().format_help()))

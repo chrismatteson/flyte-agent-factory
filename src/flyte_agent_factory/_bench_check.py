@@ -24,9 +24,9 @@ import flyte
 import flyte.io
 
 if TYPE_CHECKING:
-    from . import _bench_suite
+    from . import _bench_suite, _union_identity
 else:
-    from flyte_agent_factory import _bench_suite
+    from flyte_agent_factory import _bench_suite, _union_identity
 if TYPE_CHECKING:
     from ._images import TERRAFORM_SHA256, TERRAFORM_VERSION
 else:
@@ -163,7 +163,7 @@ def run_hidden_check(
     project: Path,
     *,
     timeout: float = COMMAND_TIMEOUT_S,
-    key_vars: tuple[str, ...] = ("_UNION_EAGER_API_KEY",),
+    key_vars: tuple[str, ...] = (*_union_identity.INJECTED_VARS, _union_identity.KEY_ENV),
     terraform_budget_s: float | None = None,
 ) -> CheckResult:
     """`{"exit_code", "summary"}` of `task`'s check commands run in `project`, stopping at the first failure.

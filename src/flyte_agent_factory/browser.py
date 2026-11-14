@@ -62,14 +62,19 @@ import flyte.app
 if TYPE_CHECKING:
     from kubernetes.client import V1PodSpec
 
-    from . import _names, _profile
+    from . import _names, _profile, _union_identity
     from ._images import browser_image
 else:
-    from flyte_agent_factory import _names, _profile
+    from flyte_agent_factory import _names, _profile, _union_identity
     from flyte_agent_factory._images import browser_image
 
 APP_NAME = "claude-browser"
 APP_PORT = 8080
+
+_PROFILE = _profile.current()
+# The app itself calls no Union API; it carries the queue tier's key for the callers that share its
+# environment. Without a profile nothing names a key, and the module otherwise defines no identity apps.
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_PROFILE, "queue") if _PROFILE else ([], {})
 
 browser_env = flyte.app.AppEnvironment(
     name=APP_NAME,
@@ -81,7 +86,9 @@ browser_env = flyte.app.AppEnvironment(
     # which crashes renderers on real pages.
     resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="20Gi", shm="2Gi"),
     scaling=flyte.app.Scaling(replicas=(1, 1)),
+    secrets=[*_QUEUE_SECRETS],
     env_vars={
+        **_QUEUE_ENV,
         "BROWSER_APP_PORT": str(APP_PORT),
         # Isolated profiles so several projects can drive the browser at once.
         # A persistent profile admits exactly one client and its lock can
@@ -97,7 +104,6 @@ browser_env = flyte.app.AppEnvironment(
 )
 
 
-_PROFILE = _profile.current()
 #: The deploy-time override of `[browser] exit_node`; an identity's own `exit_node` still wins over it.
 _EXIT_NODE = _names.getenv("AGENT_FACTORY_BROWSER_EXIT_NODE", _PROFILE.browser.exit_node if _PROFILE else "")
 #: Seconds from SIGTERM to SIGKILL: shutdown stops Chromium, saves the profile, logs out of Tailscale.
@@ -146,6 +152,7 @@ def personal_app(
     profile: _profile.Profile, identity: _profile.BrowserIdentity, exit_node: str
 ) -> flyte.app.AppEnvironment:
     """Return the personal browser app of `identity`. Needs no `kubernetes`: see `_PersonalPodTemplate`."""
+    queue_secrets, queue_env = _union_identity.pod_spec(profile, "queue")
     return flyte.app.AppEnvironment(
         name=identity.app,
         pod_template=_PersonalPodTemplate(),
@@ -155,6 +162,7 @@ def personal_app(
         resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="20Gi", shm="2Gi"),
         scaling=flyte.app.Scaling(replicas=(1, 1)),
         env_vars={
+            **queue_env,
             "BROWSER_APP_PORT": str(APP_PORT),
             "BROWSER_ISOLATED": "0",
             "BROWSER_PERSONAL": "1",
@@ -173,6 +181,7 @@ def personal_app(
                     ("tailscale_oauth_client_id", "tailscale_oauth_client_secret") if exit_node else ()
                 )
             ),
+            *queue_secrets,
         ],
         # No link to /view/: it needs a one-time ticket, which comes from `factory.browser_link` (or
         # `view_link(identity)` in a session that is granted the identity).
@@ -253,7 +262,7 @@ def _public_endpoint(app: flyte.app.AppEnvironment) -> str:
     try:
         return app.endpoint
     except InitializationError:
-        flyte.init_in_cluster()
+        _union_identity.controller_kwargs()  # initialises the SDK as the pod's tier key
         return app.endpoint
 
 

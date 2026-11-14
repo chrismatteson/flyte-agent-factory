@@ -32,7 +32,7 @@ owner rather than merging itself.
 
 ### `Standards gate`
 
-The factory's own gate, held to the bar it enforces on projects: `python -m flyte_agent_factory._gates standards .
+The factory's own gate, held to the bar it enforces on projects: `PYTHONPATH=src uv run python -m flyte_agent_factory._gates standards .
 --standards src/flyte_agent_factory/_assets/workspace_template/standards`, the code the DONE gate uses, against the
 workspace template's example set (the engine has no standards of its own). Every MUST rule of that set runs; none
 is skipped or waived for the engine. A failing rule fails the check-run, so a pull request's check is red and the

@@ -149,23 +149,71 @@ def test_the_endpoint_is_reduced_to_its_host(given, host):
     assert normalise_endpoint(given) == host
 
 
-# B6: no machine without flyteplugins-union can make the key; every place says so in the same words.
-def test_the_missing_key_message_and_the_documents_state_the_same_platform_requirement(world):
-    from flyte_agent_factory._bootstrap_base import API_KEY_REQUIREMENT
+# B6: making a key from the command line needs the plugin; every place says so in the same words. The deploy
+# itself needs no key and no platform (it runs as the CLI login), so it never says this.
+def test_the_key_making_message_and_the_documents_state_the_same_platform_requirement(world):
+    from flyte_agent_factory._bootstrap_base import KEY_PLUGIN_REQUIREMENT
 
-    world.api_key = False
+    assert "Linux x86_64" in KEY_PLUGIN_REQUIREMENT
+    for doc in ("docs/factory-mcp-setup.md", "skills/agent-factory/references/setup.md"):
+        assert KEY_PLUGIN_REQUIREMENT in squashed((ROOT / doc).read_text()), doc
     code, out = run(world)
-    assert code == 3
-    line = next(line for line in out if line.startswith("[blocked] deploy"))
-    assert API_KEY_REQUIREMENT in line and "Linux x86_64" in line
-    assert "_UNION_EAGER_API_KEY" in line and "Local Union deployment bootstrap" in line
-    for doc in (
-        "docs/quickstart.md",
-        "skills/agent-factory/references/setup.md",
-        "docs/factory-mcp-setup.md",
-    ):
-        assert API_KEY_REQUIREMENT in squashed((ROOT / doc).read_text()), doc
+    assert code == 0, out
+    assert not any("flyteplugins-union" in line for line in out)
     assert "on Union, nothing:" not in (ROOT / "docs/quickstart.md").read_text()
+
+
+def _key_world(tmp_path: Path) -> World:
+    """A world signed in to the endpoint's org, as the key modes need."""
+    world = World(tmp_path)
+    world.mcp_url = "https://factory-mcp.example.test"
+    (tmp_path / "flyte-config.yaml").write_text("admin:\n  endpoint: dns:///flyte.example.test\n")
+    return world
+
+
+def test_the_missing_key_message_and_the_documents_state_the_same_platform_requirement(tmp_path, capsys):
+    """Where no key can be made here, the blocked line quotes the same requirement the documents do."""
+    from flyte_agent_factory._bootstrap_base import KEY_PLUGIN_REQUIREMENT
+    from tests.test_bootstrap_keys import key_run
+
+    world = _key_world(tmp_path)
+    world.can_manage_keys = False
+    code, out = key_run(world, "--chat-key", capsys)
+    assert code == 3 and out[0].startswith("[blocked] chat-key"), out
+    assert KEY_PLUGIN_REQUIREMENT in out[0] and "Linux x86_64" in out[0]
+    assert "_UNION_EAGER_API_KEY" not in out[0] and world.events == []
+    for doc in ("docs/factory-mcp-setup.md", "skills/agent-factory/references/setup.md"):
+        assert KEY_PLUGIN_REQUIREMENT in squashed((ROOT / doc).read_text()), doc
+
+
+def test_a_failed_cleanup_of_old_keys_reports_its_own_error(tmp_path, capsys, monkeypatch):
+    """The only key cleanup left, of a key made but unusable, says so when the delete itself fails."""
+    from tests import _bootstrap_fakes
+    from tests.test_bootstrap_keys import key_run
+
+    def unavailable(self, client_id):
+        raise ConnectionError("connection reset")
+
+    monkeypatch.setattr(_bootstrap_fakes.FakeFlyte, "delete_api_key", unavailable)
+    world = _key_world(tmp_path)
+    world.assign_error = True
+    code, out = key_run(world, "--chat-key", capsys)
+    assert code == 3
+    [cleanup] = [line for line in out if "could not delete the unused API key" in line]
+    assert "client-factory-chat" in cleanup and "ConnectionError" in cleanup and "by hand" in cleanup
+
+
+def test_a_key_this_tool_did_not_record_is_never_deleted(tmp_path, capsys):
+    """A tier key of the factory's name that this tool holds no secret for is left alone, with the way out."""
+    from tests.test_bootstrap_keys import key_run
+
+    world = _key_world(tmp_path)
+    world.union_keys["factory-project"] = "client-the-persons-own"
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 3 and out[0].startswith("[blocked] union-keys"), out
+    assert "already exists" in out[0] and "factory-project" in out[0]
+    assert world.union_keys["factory-project"] == "client-the-persons-own"
+    assert not [e for e in world.events if e.startswith("delete_api_key")]
 
 
 # B7: every subprocess in the bootstrap is bounded, and a timeout reads as a plain message.
@@ -345,6 +393,10 @@ def test_moving_onto_direction_points_at_the_one_redeploy_command():
         assert "`[direction]`" in move[:80] and "`--redeploy`" in move[:400], doc
         assert "ops/deploy_factory.py --profile" not in text, doc
         assert "--redeploy" in text and "ops/bootstrap.py --endpoint" in text, doc
+        # Moving [direction] to another repository is a commit, not a hand deploy.
+        assert "to another repository" in text, doc
+        assert "naming itself" in text and "verifies both" in text, doc
+        assert "refuses to change its own direction" not in text, doc
 
 
 # N4: --status on a fresh install says the repository-dependent steps wait on it.
@@ -363,45 +415,6 @@ def test_the_template_readme_start_section_names_both_skills():
     readme = (ROOT / "src/flyte_agent_factory/_assets/workspace_template/README.md").read_text()
     start = readme.split("## Start", 1)[1].split("\n## ", 1)[0]
     assert "`agent-factory`" in start and "`since`" in start
-
-
-# N6: a failure while clearing old keys shows its own error; unexpected errors are not swallowed.
-def test_a_failed_cleanup_of_old_keys_reports_its_own_error(monkeypatch, tmp_path):
-    from connectrpc.code import Code
-    from connectrpc.errors import ConnectError
-
-    from tests.test_bootstrap_repair import _deployer, _engine_root, _install_fake_union, _UnionServer
-
-    server = _UnionServer()
-    _install_fake_union(monkeypatch, server)
-    clone = _engine_root(tmp_path)
-    subprocess.run(
-        ["git", "config", "--local", "--add", "agent-factory.deploy-api-key", "old-client"],
-        cwd=clone,
-        check=True,
-    )
-    server.keys["old-client"] = "x"
-    import sys as _sys
-
-    key_class = _sys.modules["flyteplugins.union.remote"].ApiKey
-
-    def unavailable(cls, client_id):
-        raise ConnectError(Code.UNAVAILABLE, "connection reset")
-
-    monkeypatch.setattr(key_class, "delete", classmethod(unavailable))
-    with pytest.raises(ConnectError, match="connection reset"):
-        _deployer(clone).deploy(clone / "profile.toml")
-
-
-def test_a_key_this_tool_did_not_record_is_never_deleted(monkeypatch, tmp_path):
-    from tests.test_bootstrap_repair import _deployer, _engine_root, _install_fake_union, _UnionServer
-
-    server = _UnionServer()
-    server.keys["agent-factory-deploy"] = "the person's own"
-    _install_fake_union(monkeypatch, server)
-    with pytest.raises(BootstrapError, match="delete the key in Union by hand"):
-        _deployer(_engine_root(tmp_path)).deploy(tmp_path / "profile.toml")
-    assert server.deleted == [] and "agent-factory-deploy" in server.keys
 
 
 def test_a_bug_is_not_reported_as_an_expected_failure():

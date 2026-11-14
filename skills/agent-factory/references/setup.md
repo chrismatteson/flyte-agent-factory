@@ -76,7 +76,7 @@ d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; {
 
 It is idempotent: each step checks live state first and is skipped when done, so a rerun after any interruption
 resumes. Optional flags: `--domain`, `--backend union|oss`, `--engine claude|codex`, `--no-app`, `--no-board`,
-`--dir <path to the workspace clone>`, `--redeploy`, `--dry-run`. With a Union deployment key in `_UNION_EAGER_API_KEY` (see the deploy prompt below) the deploy needs no further input. Its output is one line per step,
+`--dir <path to the workspace clone>`, `--redeploy`, `--dry-run`.  The deploy runs as the person's Flyte CLI login, so it needs no API key of its own. Its output is one line per step,
 `[done|skip|todo|blocked] <step>: <detail>`, and it never prints a secret.
 
 Explain each prompt before they meet it:
@@ -88,20 +88,24 @@ Explain each prompt before they meet it:
   and click Create GitHub App. The key is stored in a Flyte secret, never printed.
 - **Install page** for the workspace: they install the App on it; the command waits until it sees the installation.
   An organization where they are not an admin may make that impossible; setup then works without the App (see below).
-- The deploy needs a Union deployment API key (`--deploy-key`, not the GitHub SSH key of the `deploy-key` step). The command uses `_UNION_EAGER_API_KEY` from their environment, otherwise
-  creates one for the run and deletes it at the end, otherwise stops: the deploy makes its one-off Union API key with flyteplugins-union, which installs on Linux x86_64 only, so on macOS or Linux on ARM tell them
-  to run the command on a Linux x86_64 machine, or to export `_UNION_EAGER_API_KEY` with a key made there
+- The `union-keys` step makes the factory's two Union API keys (`factory-project`, `factory-deployer`; no default
+  policies, each with its own policy binding `contributor` to the project and domain) and stores each as a Flyte
+  secret over their CLI login. It prints only client IDs. On Linux x86_64 it makes them with flyteplugins-union; on
+  macOS, or without the plugin, it prints console steps and reads each key at a **hidden prompt** (never echoed or
+  written to disk). Nothing in the factory uses the key Union injects into task pods: every pod acts as its tier's
+  key. If Union refuses the policy or the assignment (another admin grants), the step still stores the keys, ends
+  `todo` and prints one filled-in command per key for that admin: the same command with `--grant factory-project` or
+  `--grant factory-deployer` and the key's non-secret client_id in place of `--union-keys`. It makes no key; tell
+  them to send it as printed. To run only this step, the same command with `--union-keys` (below).
+- The chat key (`--chat-key`) is separate: making a Union API key from the command line needs flyteplugins-union, which installs on Linux x86_64 only. On macOS or Linux on ARM tell them to run the
+  command on a Linux x86_64 machine
   (https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/quickstart.md, Local Union deployment bootstrap).
-  The stopped `deploy` line prints that Union key's command filled in; it is this one, with the same arguments plus
-  `--deploy-key`. If that machine has no Flyte config for `--endpoint`, the command writes one and opens the browser sign-in first; a config for another endpoint stops it before any change. It makes the `factory-deploy` key and its `factory-deploy` policy and assignment (`contributor` on
-  the project and domain), shows the key once on that terminal only (never stdout, never chat), and says to store it
-  in a password manager and load it with the quickstart's hidden-prompt block. If Union refuses them the policy or
-  the assignment (another admin grants), it still shows the key, ends `todo` and prints one filled-in command for
-  that admin: the same command with `--grant factory-deploy` and the key's non-secret client_id in place of
-  `--deploy-key`. It gives the policy to that key and makes no key; tell them to send it as printed.
+  If that machine has no Flyte config for `--endpoint`, the command writes one and opens the browser sign-in first; a
+  config for another endpoint stops it before any change. It shows the key once on that terminal only (never stdout,
+  never chat).
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --deploy-key
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --union-keys
 ```
 
 Never ask for a credential, token or key in chat, and never use the MCP `create_secret` for engine credentials.
@@ -112,7 +116,7 @@ If they paste something that looks like one, tell them to rotate it.
 `ops/bootstrap.py --status` with the same identifying arguments is read-only and prints the step table. Ask them to
 paste it back (it has no secrets). Read it and continue at the first `todo` or `blocked` line; do not redo `done` or
 `skip` steps. The steps, in the command's order, are: `tools`, `workspace`, `template`, `profile`, `signin`, `project`,
-`deploy-key`, `github-app`, `ruleset`, `board`, `engine-token`, `deploy`, `mcp-url`, `connect`. Distinguish
+`union-keys`, `deploy-key`, `github-app`, `ruleset`, `board`, `engine-token`, `deploy`, `mcp-url`, `connect`. Distinguish
 absent from inaccessible; an auth or network failure is not evidence that something is missing. If you cannot inspect
 something, say “not checked” and ask for the next read-only check.
 
@@ -133,14 +137,18 @@ ruleset lets through; the engine token (`engine-token`) comes after the board.
    (`auto = false` stays). It is the only profile name; never suggest another path.
 3. **Write deploy key.** `ssh-keygen` in a `mktemp` directory, `gh repo deploy-key add --allow-write`, then the
    private half is stored as a Flyte secret through the Flyte SDK, and the directory wiped. Never in chat.
-4. **Your own GitHub App.** The default, through the manifest flow. Permissions: Contents read, Metadata read, Pull
+4. **Your own GitHub App.** The guided-setup default, read-only on code (pushes stay on deploy keys until the isolation canary reports `isolated`), through the manifest flow. Permissions: Contents read, Metadata read, Pull
    requests write, Commit statuses write, Checks read, Issues write. It enables CI visibility, draft PRs and the
    verifier, auto-deploy with `[direction]`, and issue intake. Without it, projects push the default branch, there are
    no PRs or verifier status, and every deploy is by hand. There is no shared public App. If the installation cannot
    happen (an organization they do not own), the profile has no trace of the App: tell them to run the command again
    with `--no-app`; the ruleset is then updated to let the deploy key push. Rerunning without `--no-app` later adds
    the App and takes that bypass off; rerunning with `--no-app` over an App profile removes the App's keys, and says
-   so in the `profile` line. Details:
+   so in the `profile` line. Two GitHub credentials remain for now: App push (`[github] push = "app"`) takes effect only
+   when the deployer's isolation canary reports `isolated`, and Union injects its own API key into every pod,
+   so today the per-repository deploy key does the session push and the App does everything else. Deploy-key-only mode
+   (`--no-app`) has no CI visibility. A private repository the person controls is read through the App installed on it,
+   not a hand-made key; pushing to it still needs its deploy key. Details:
    https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/github-app.md
 5. **Protected main.** A `main` ruleset named `agent-workspace-main` through `gh api`; the deploy key may bypass it
    exactly when there is no App, and a rerun in the other mode updates the existing ruleset. On a refusal it prints
@@ -156,10 +164,13 @@ ruleset lets through; the engine token (`engine-token`) comes after the board.
    click (workspace, Projects tab) only if the link check shows it missing. The classic-token `[board]` automation is optional; do not add it unasked.
 7. **First deploy.** From the public `unionai-oss/flyte-agent-factory` `main`, with `--profile <workspace
    clone>/profile.toml`, so there is no separate move step for a new user; the deployer then follows `[direction]`.
-   Moving an existing install onto `[direction]` later needs one deploy with that `--profile`, because the
-   deployer refuses to change its own direction, on purpose: when it applies and the person asks, run the
-   `--redeploy` command below once yourself where your shell holds their deploy credentials; otherwise say which tool
-   or access is missing and give them the command with their values filled in.
+   Moving an existing install onto `[direction]` later needs one deploy with that `--profile`, because a deployer
+   with no `[direction]` has no repo to read: when it applies and the person asks, run the `--redeploy` command below
+   once yourself where your shell holds their deploy credentials; otherwise say which tool or access is missing and
+   give them the command with their values filled in. Moving `[direction]` to another repository afterwards is a
+   commit, no deploy: put the new location in the new repository's profile (naming itself) first, then change
+   `[direction]` in the old repository's profile; the deployer verifies both and moves, and the old repository can be
+   archived.
 
    **Deploying later engine changes.** The deployer deploys the default-branch head of `[deploy] repo` (default
    `[repo] factory`, the public engine) once that head's CI passed. The person's App is installed on their workspace,

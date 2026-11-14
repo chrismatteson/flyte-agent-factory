@@ -109,6 +109,6 @@ Codex runs on one of two credentials:
   and in the run report, and stores the resulting `auth.json` as the Flyte secret `secret_name`. With no argument
   it uses the profile's only slot `codex_login`. The name must start with `codex_login`, because chat may start the
   task (`run_task(name="factory-setup.codex_bootstrap_login", inputs={"secret_name": "codex_login_..."})`) and it
-  must not be able to overwrite any other secret. From a shell: `flyte run --root-dir src -p <project> -d <domain>
-  src/flyte_agent_factory/agent.py codex_bootstrap_login --secret_name codex_login_...`
+  must not be able to overwrite any other secret. From a shell: `PYTHONPATH=src uv run flyte run --root-dir src
+  -p <project> -d <domain> src/flyte_agent_factory/agent.py codex_bootstrap_login --secret_name codex_login_...`
   ([quickstart.md](quickstart.md#codex-sign-in)). All secrets: [secrets.md](secrets.md).

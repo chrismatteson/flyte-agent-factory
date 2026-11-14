@@ -156,10 +156,11 @@ def _summarize_checks(pr: PullRequests, sha: str) -> dict[str, Any]:
     A part the App may not read is left empty and named in `missing`, so the session knows the
     list is incomplete rather than that CI is quiet.
     """
-    app, repo = pr.app, pr.repo
+    repo = pr.repo
+    app = pr.app.scoped(_github.CI_READ)
     if not sha:
         try:
-            sha = app.default_branch_sha(repo, pr.branch)[1]
+            sha = pr.app.scoped(_github.CONTENTS_READ).default_branch_sha(repo, pr.branch)[1]
         except _github.GithubError as exc:
             if exc.status in (404, 422):
                 raise _Refused(f"branch {pr.branch} is not on GitHub yet: push it first") from exc
@@ -212,7 +213,7 @@ def _summarize_checks(pr: PullRequests, sha: str) -> dict[str, Any]:
 
 def _read_job_log(pr: PullRequests, job: int) -> dict[str, Any]:
     try:
-        log = pr.app.job_log(pr.repo, job)
+        log = pr.app.scoped(_github.CI_READ).job_log(pr.repo, job)
     except _github.GithubError as exc:
         if _github.missing_permission(exc):
             raise _Refused(

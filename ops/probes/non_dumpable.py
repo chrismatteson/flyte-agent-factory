@@ -10,9 +10,15 @@ it reports `skipped` and exits 0.
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import in
+# main fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 # The child opens the parent's environ by pid and reports only whether that worked.
 _CHILD = """
@@ -29,10 +35,14 @@ else:
 
 def main(argv: list[str]) -> int:
     """Report whether a child can read this process's environ; return the exit status."""
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--control", action="store_true", help="skip set_non_dumpable(): the child can read it"
+    )
+    control = parser.parse_args(argv).control
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
         print("skipped")
         return 0
-    control = "--control" in argv
     if not control:
         from flyte_agent_factory import _auth
 

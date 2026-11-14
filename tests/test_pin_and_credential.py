@@ -20,6 +20,7 @@ from flyte_agent_factory import (
     _author,
     _factory,
     _factory_base,
+    _factory_envs,
     _factory_meters,
     _factory_policy,
     _issues,
@@ -377,7 +378,7 @@ def test_r3_admission_launches_claude_after_a_token_swap(monkeypatch):
 
 
 def _secrets(profile: Profile) -> list[flyte.Secret]:
-    mounted = _factory._env_secrets(profile)
+    mounted = _factory_envs.env_secrets(profile)
     assert all(isinstance(s, flyte.Secret) for s in mounted)
     return cast(list[flyte.Secret], mounted)
 

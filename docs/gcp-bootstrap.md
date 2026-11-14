@@ -7,7 +7,7 @@ Flyte secret.
 ```bash
 PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" run --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/flyte_agent_factory/agent.py gcp_bootstrap --project_id my-infra-123 \
   --billing_account 012345-6789AB-CDEF01 --create_project
-# or: flyte run ... src/flyte_agent_factory/agent.py gcp_bootstrap --project_id my-infra-123
+# or: PYTHONPATH=src uv run flyte ... run --root-dir src ... src/flyte_agent_factory/agent.py gcp_bootstrap --project_id my-infra-123
 ```
 
 `project_id` is required and there is no default: the task grants a service account (Owner,

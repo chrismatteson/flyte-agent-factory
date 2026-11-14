@@ -21,11 +21,17 @@ import flyte
 import flyte.sandbox
 from flyte.io import Dir
 
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._images import agent_image
+
+PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 
 env = flyte.TaskEnvironment(
     name="sandbox-probe",
     image=agent_image(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="2Gi"),
 )
 
@@ -53,6 +59,7 @@ print(f"input files seen: {found}", flush=True)
 @env.task(report=True)
 async def probe() -> str:
     """Ship a directory to a built-on-demand container and read its output back."""
+    _union_identity.establish()
     work = Path("/tmp/probe-input")
     work.mkdir(parents=True, exist_ok=True)
     (work / "alpha.txt").write_text("first\n")

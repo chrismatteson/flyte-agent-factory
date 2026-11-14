@@ -24,6 +24,7 @@ from flyte_agent_factory import (
     _factory_recreate,
     _meter,
     _queue,
+    _union_identity,
 )
 from flyte_agent_factory import _factory as factory
 
@@ -141,7 +142,8 @@ def test_factory_env_holds_the_queue_tasks_and_the_meter_task():
         "factory.garden_weekly",
     }
     assert [(s.key, s.as_env_var) for s in cast(list[flyte.Secret], factory.env.secrets)] == [
-        (_factory_base.PROFILE.secrets.claude_token, _factory_meters.TOKEN_ENV)
+        (_factory_base.PROFILE.secrets.claude_token, _factory_meters.TOKEN_ENV),
+        (_factory_base.PROFILE.union.key_for("queue"), _union_identity.KEY_ENV),
     ]
 
 
@@ -1316,3 +1318,13 @@ def test_status_shrinks_its_timeline_and_then_its_decisions_to_fit_the_size_limi
     assert "error" not in result and result["decisions"], "decisions stay while there is a timeline to cut"
     # The newest decisions are the ones kept.
     assert result["decisions"][-1]["id"] == "decision-020"
+
+
+def test_status_shows_the_github_mode_and_each_union_tier(monkeypatch):
+    """`factory.status` says which GitHub mode is on and the secret each Union tier acts as (#179, #183)."""
+    monkeypatch.setenv(
+        "AGENT_FACTORY_UNION_IDENTITIES", '[{"tier": "project", "secret": "s", "client_id": "c"}]'
+    )
+    result = _status_of(monkeypatch, {"schema": 1, "timeline": []})
+    assert result["github_mode"] in ("app", "app-read", "deploy-keys") and result["github"]
+    assert [row["tier"] for row in result["union"]] == ["project", "session", "queue", "deployer"]

@@ -40,7 +40,11 @@ EXPECTED = {
         "factory-bench.run_case",
     ],
     "factory-bench-check": ["factory-bench-check.hidden_check"],
-    "factory-deployer": ["factory-deployer.deploy_if_changed", "factory-deployer.deploy_pair"],
+    "factory-deployer": [
+        "factory-deployer.deploy_if_changed",
+        "factory-deployer.deploy_pair",
+        "factory-deployer.isolation_canary",
+    ],
     "factory-issues": ["factory-issues.process", "factory-issues.wake_loop"],
     "factory-loop": ["factory-loop.generate_backlog", "factory-loop.loop_run"],
     "factory-reconcile": ["factory-reconcile.reconcile"],

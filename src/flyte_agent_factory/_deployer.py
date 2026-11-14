@@ -21,8 +21,10 @@ import html
 import json
 import os
 import subprocess
+import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, TypeVar, TypeVarTuple, Unpack, cast
 
@@ -32,11 +34,29 @@ from flyte import remote
 
 # Deploy tools also load this file by path, without a package context.
 if TYPE_CHECKING:
-    from . import _deploy, _github, _profile, _pull_requests, _standards
+    from . import (
+        _deploy,
+        _github,
+        _github_mode,
+        _isolation_canary,
+        _profile,
+        _pull_requests,
+        _standards,
+        _union_identity,
+    )
     from ._errors import REMOTE_ERRORS
     from ._images import agent_image
 else:
-    from flyte_agent_factory import _deploy, _github, _profile, _pull_requests, _standards
+    from flyte_agent_factory import (
+        _deploy,
+        _github,
+        _github_mode,
+        _isolation_canary,
+        _profile,
+        _pull_requests,
+        _standards,
+        _union_identity,
+    )
     from flyte_agent_factory._errors import REMOTE_ERRORS
     from flyte_agent_factory._images import agent_image
 
@@ -56,6 +76,65 @@ _LIVE = _deploy.LIVE_PHASES
 _TERMINAL = ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED")
 _FAILED = ("FAILED", "TIMED_OUT", "ABORTED")
 
+
+def _tier_mounts(profile: _profile.Profile) -> dict[str, str]:
+    """Union secret name -> the variable it is mounted under, one entry per distinct secret.
+
+    The deployer's own key is `KEY_ENV`, as in every tier. Each other tier's key is mounted under
+    `<KEY_ENV>_<TIER>` for reporting client ids and for the isolation canary; a tier that shares a secret
+    with an earlier one is not mounted twice.
+    """
+    mounts = {profile.union.key_for("deployer"): _union_identity.KEY_ENV}
+    for tier in ("project", "session", "queue"):
+        mounts.setdefault(profile.union.key_for(tier), f"{_union_identity.KEY_ENV}_{tier.upper()}")
+    return mounts
+
+
+def tier_secrets_and_env(profile: _profile.Profile) -> tuple[list[flyte.Secret], dict[str, str]]:
+    """Return the secrets for every tier key, and the setting that points children at the deployer's own."""
+    secrets, env_vars = _union_identity.pod_spec(profile, "deployer")
+    secrets += [
+        flyte.Secret(key=secret, as_env_var=var)
+        for secret, var in _tier_mounts(profile).items()
+        if var != _union_identity.KEY_ENV
+    ]
+    # Deploy children act as the deployer's key (`init_for_script`), never the key Union injects.
+    return secrets, {**env_vars, _deploy.DEPLOY_KEY_ENV: _union_identity.KEY_ENV}
+
+
+def identities(profile: _profile.Profile) -> list[dict[str, str]]:
+    """`[{tier, secret, client_id}]` for every tier, read from the mounted keys; never a key."""
+    mounts = _tier_mounts(profile)
+    found = []
+    for row in _union_identity.describe(profile):
+        key = os.environ.get(mounts.get(row["secret"], ""), "")
+        try:
+            client_id = _union_identity.client_id_of(key) if key else "unknown"
+        except ValueError:  # reporting must not fail a deploy
+            client_id = "unknown"
+        found.append({**row, "client_id": client_id})
+    return found
+
+
+def _child_env(profile: _profile.Profile) -> dict[str, str]:
+    """Return this pod's environment for a child process, without any credential it must not pass on.
+
+    That is the App's credentials, the key Union injects into every pod, and any tier key but the
+    deployer's own (`KEY_ENV`), under either of its names.
+    """
+    hidden = {
+        *_pull_requests.credential_env_vars(profile.github.private_key_secret, os.environ),
+        *_union_identity.INJECTED_VARS,
+    }
+    for secret, var in _tier_mounts(profile).items():
+        hidden.add(_pull_requests.prefixed_key_env_var(secret, os.environ))
+        if var != _union_identity.KEY_ENV:
+            hidden.add(var)
+    return {k: v for k, v in os.environ.items() if k not in hidden}
+
+
+_IDENTITY_SECRETS, _IDENTITY_ENV = tier_secrets_and_env(PROFILE)
+
 env = flyte.TaskEnvironment(
     name="factory-deployer",
     # It imports the factory-mcp app to deploy it, so it needs flyte's `mcp` extra (pins as pyproject).
@@ -74,13 +153,32 @@ env = flyte.TaskEnvironment(
     resources=flyte.Resources(cpu=1, memory="2Gi"),
     # Spot: a preempted tick records nothing, and the next one retries.
     interruptible=True,
-    secrets=(
-        [flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV)]
-        if PROFILE.github.private_key_secret
-        else []
-    ),
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env()},
+    secrets=[
+        *(
+            [flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV)]
+            if PROFILE.github.private_key_secret
+            else []
+        ),
+        *_IDENTITY_SECRETS,
+    ],
+    env_vars={
+        "FLYTE_MCP_PROJECT": PROJECT,
+        "FLYTE_MCP_DOMAIN": DOMAIN,
+        **_profile.pod_env(),
+        **_IDENTITY_ENV,
+    },
 )
+
+# The isolation measurement (`_isolation_canary`): the session-tier launcher overrides this task's secrets
+# with the App key's (`_CANARY_LAUNCH`), replacing the deployer's tier keys, so it needs no environment
+# of its own (which the deploy would have to allow). It only reports whether the key reached it.
+CANARY_TASK = "factory-deployer.isolation_canary"
+
+
+@env.task
+def isolation_canary(secret: str) -> dict[str, bool]:
+    return _isolation_canary.probe(secret)
+
 
 _reconcile_minutes = _deploy.reconcile_minutes
 
@@ -119,7 +217,8 @@ def _deploy_repo(profile: _profile.Profile) -> str:
 def _deploy_reader(app: _github.GithubApp, repo: str) -> _github.GithubApp | _github.PublicGithub:
     """Return the App where it is installed on `repo`, else anonymous reads (the deploy repo is public)."""
     try:
-        app.installation_token(repo)
+        # Contents-read, the scope the reads and the clone use: the probe mints no broader token.
+        app.installation_token(repo, _github.CONTENTS_READ)
     except _github.GithubError as exc:
         if exc.status != 404:
             raise
@@ -128,13 +227,18 @@ def _deploy_reader(app: _github.GithubApp, repo: str) -> _github.GithubApp | _gi
 
 
 def _clone_url(app: _github.GithubApp, repo: str) -> str:
+    """Return the deploy repo's fetch URL: with the App's token where it is installed, else anonymous."""
     if _deploy_reader(app, repo) is app:
-        return _github.clone_url(repo, app.installation_token(repo))
+        return _app_clone_url(app, repo)
     return f"https://github.com/{repo}.git"
 
 
-def _pair_labels(profile: _profile.Profile, sha: str, direction_sha: str) -> dict[str, str]:
-    return {**release_labels(profile), "deploy-sha": sha, "deploy-direction": direction_sha or "none"}
+def _pair_labels(
+    profile: _profile.Profile, sha: str, direction_sha: str, move_sha: str = ""
+) -> dict[str, str]:
+    """Return the labels an attempt is counted on; a [direction] move's add the new repo's head (#180)."""
+    labels = {**release_labels(profile), "deploy-sha": sha, "deploy-direction": direction_sha or "none"}
+    return {**labels, "deploy-move": move_sha} if move_sha else labels
 
 
 class _RunFilters(TypedDict):
@@ -153,6 +257,11 @@ class DeployOutput(TypedDict):
     standards: NotRequired[dict[str, bool | str | None]]
     #: Secret name -> environments that need it: nothing was deployed because they do not exist yet.
     waiting_for_secrets: NotRequired[dict[str, list[str]]]
+    #: Why a [direction] move was not deployed (`_MoveNotReady`): not a failure, so nothing else records it.
+    refused: NotRequired[str]
+    #: `AGENT_FACTORY_GITHUB_PUSH` the slots were deployed with, and what the isolation canary said.
+    github_push: NotRequired[str]
+    isolation: NotRequired[list[str]]
 
 
 async def _runs(profile: _profile.Profile, **kwargs: Unpack[_RunFilters]) -> list[remote.Run]:
@@ -242,13 +351,15 @@ def _heads(profile: _profile.Profile, app: _github.GithubApp) -> tuple[str, str,
     # `git ls-remote` is not REST: a tick whose head is already deployed spends none of an anonymous
     # reader's 60 calls an hour. A repository it cannot read (private) falls back to the App.
     sha = _deploy.public_head(repo)
+    contents = app.scoped(_github.CONTENTS_READ)
     if not sha:
-        _, sha = _deploy_reader(app, repo).default_branch_sha(repo)
+        reader = _deploy_reader(app, repo)
+        _, sha = (contents if reader is app else reader).default_branch_sha(repo)
     direction_repo = direction_sha = ""
     if profile.direction:
         direction_repo = _github.parse_repo(profile.direction.repo)
         try:
-            _, direction_sha = app.default_branch_sha(direction_repo, profile.direction.ref)
+            _, direction_sha = contents.default_branch_sha(direction_repo, profile.direction.ref)
         except _github.GithubError as exc:
             raise _deploy.DeployError(
                 f"direction repo {direction_repo} cannot be read, nothing deployed: {exc}"
@@ -265,25 +376,73 @@ async def _not_deployable(
     app: _github.GithubApp,
     heads: tuple[str, str, str, str],
     last: remote.Run | None,
-) -> str | None:
-    """Why the tick's checks refuse these heads (given up on, or CI not green), or None to deploy."""
+) -> tuple[str | None, dict[str, str]]:
+    """Why the tick's checks refuse these heads (given up on, or CI not green), or None to deploy.
+
+    Also return the labels an attempt at these heads is counted on.
+    """
     repo, sha, direction_repo, direction_sha = heads
     shown = _shown(sha, direction_sha)
-    if await _failed_attempts(profile, _pair_labels(profile, sha, direction_sha), last) >= MAX_ATTEMPTS:
-        return f"giving up on {shown} after {MAX_ATTEMPTS} attempts; waiting for a new commit"
     targets = [(repo, sha, "")]
     if direction_repo:
         targets.append((direction_repo, direction_sha, "direction "))
     for target, head, prefix in targets:
         reader = _deploy_reader(app, target) if target == repo else app
-        health, detail = reader.commit_health(target, head)
-        if health in ("failing", "pending"):
-            retry = "; retrying next tick" if health == "pending" else ""
-            return f"skipped {prefix}{head}: {detail}{retry}"
-        if health == "none" and target == repo:
-            # Deploying code nothing tested is the bug a CI-less repository would silently reintroduce.
-            return f"no CI reported on {head}: not deployed; the deploy repo must run CI"
-        _say(f"deploying {prefix}{head} (CI: {health}, {detail})")
+        refused = _unhealthy(reader, target, head, prefix, needs_ci=target == repo)
+        if refused:
+            return refused, _pair_labels(profile, sha, direction_sha)
+    move_repo, move_sha = _move_head(profile, app, direction_sha)
+    labels = _pair_labels(profile, sha, direction_sha, move_sha)
+    if move_repo:
+        # Judged here, like the direction repo's own CI: a check that stays pending must not cost a deploy run
+        # every tick. Optional, as there; the attempt judges it again before it deploys.
+        refused = _unhealthy(app, move_repo, move_sha, "direction ", needs_ci=False)
+        if refused:
+            return refused, labels
+    if await _failed_attempts(profile, labels, last) >= MAX_ATTEMPTS:
+        shown += f" moving to {move_repo} at {move_sha}" if move_repo else ""
+        return f"giving up on {shown} after {MAX_ATTEMPTS} attempts; waiting for a new commit", labels
+    return None, labels
+
+
+def _move_head(profile: _profile.Profile, app: _github.GithubApp, direction_sha: str) -> tuple[str, str]:
+    """(repo, head) of the repository the direction profile at `direction_sha` moves [direction] to.
+
+    ("", "") when it names the same [direction], or when anything on the way cannot be read: the attempt then
+    resolves the move itself and, refusing it, says why in its report.
+    """
+    direction = profile.direction
+    if direction is None or not direction_sha:
+        return "", ""
+    contents = app.scoped(_github.CONTENTS_READ)
+    try:
+        # The one file through the contents API, not a clone: the attempt fetches the trees it deploys from.
+        text = contents.read_file(_github.parse_repo(direction.repo), direction.profile, ref=direction_sha)
+        shipped = _profile.parse(text, direction.profile, tolerate_unknown=True)
+        if shipped.direction is None or _same_direction(shipped.direction, direction):
+            return "", ""
+        new_repo = _github.parse_repo(shipped.direction.repo)
+        _, new_sha = contents.default_branch_sha(new_repo, shipped.direction.ref)
+    except (_profile.ProfileError, _github.GithubError):
+        return "", ""
+    return new_repo, new_sha
+
+
+def _unhealthy(
+    reader: _github.GithubApp | _github.PublicGithub, repo: str, head: str, prefix: str, *, needs_ci: bool
+) -> str | None:
+    """Why CI refuses this commit (failing, pending, or none when `needs_ci`), or None, saying it deploys."""
+    # The App reads CI with a CI-only token; an anonymous reader has no token to scope.
+    if isinstance(reader, _github.GithubApp):
+        reader = reader.scoped(_github.CI_READ)
+    health, detail = reader.commit_health(repo, head)
+    if health in ("failing", "pending"):
+        retry = "; retrying next tick" if health == "pending" else ""
+        return f"skipped {prefix}{head}: {detail}{retry}"
+    if health == "none" and needs_ci:
+        # Deploying code nothing tested is the bug a CI-less repository would silently reintroduce.
+        return f"no CI reported on {head}: not deployed; the deploy repo must run CI"
+    _say(f"deploying {prefix}{head} (CI: {health}, {detail})")
     return None
 
 
@@ -333,6 +492,8 @@ def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: st
     A missing/unreadable holder never expires: fail closed until its Flyte phase is authoritative.
     """
     repo = _lock_repo(profile, app)
+    # The lock is a git ref and commit: writing those needs contents:write and nothing else.
+    app = app.scoped(_github.CONTENTS_WRITE)
     key = hashlib.sha256(f"{PROJECT}/{DOMAIN}/{profile.name}".encode()).hexdigest()
     ref = f"heads/factory-deployer-lock/{key}"
     path = f"/repos/{repo}/git"
@@ -399,50 +560,161 @@ async def _admitted(profile: _profile.Profile, app: _github.GithubApp, run_name:
     return True
 
 
-def _direction_profile(profile: _profile.Profile, app: _github.GithubApp, sha: str) -> _profile.Profile:
-    """Return the profile at `sha` of the direction repo.
+@dataclass(frozen=True)
+class _ResolvedDirection:
+    """The direction profile to deploy: `profile` at `sha` of `repo`; `moved_from` is a move's old repo."""
 
-    Never falls back: an unreadable one fails the deploy.
+    profile: _profile.Profile
+    direction: _profile.Direction  # where `profile` was read: its repo, path and ref
+    repo: str
+    sha: str
+    moved_from: str = ""
+
+
+def _same_direction(a: _profile.Direction, b: _profile.Direction) -> bool:
+    # The repo by owner/name, so an https spelling of the same repo is the same [direction]; GitHub names are
+    # case-insensitive, so `Acme/Direction` is it too. The path and the ref are git's, which are not.
+    same_repo = _github.parse_repo(a.repo).lower() == _github.parse_repo(b.repo).lower()
+    return same_repo and (a.profile, a.ref) == (b.profile, b.ref)
+
+
+def _app_clone_url(app: _github.GithubApp, repo: str) -> str:
+    # Source is read, never written: the token that reaches git (and a child's checkout) is contents-read.
+    return _github.clone_url(repo, app.installation_token(repo, _github.CONTENTS_READ))
+
+
+def _read_direction(app: _github.GithubApp, direction: _profile.Direction, sha: str) -> _profile.Profile:
+    """Read the direction repo's profile at `sha`: DeployError if unfetchable, ProfileError if unusable."""
+    repo = _github.parse_repo(direction.repo)
+    with _deploy.fetched_tree(_app_clone_url(app, repo), sha) as tree:
+        # Unknown top-level keys may be the deployed engine's: `_deploy_sha` has it check them.
+        return _profile.load_from_direction(tree, direction.profile, tolerate_unknown=True)
+
+
+def _check_direction_name(
+    shipped: _profile.Profile,
+    profile: _profile.Profile,
+    direction: _profile.Direction,
+    sha: str,
+    note: str,
+    error: type[_deploy.DeployError] = _deploy.DeployError,
+) -> None:
+    if shipped.name != profile.name:  # the release history and deployed envs are keyed on it
+        repo = _github.parse_repo(direction.repo)
+        raise error(
+            f"{direction.profile} at {sha} of {repo} is profile {shipped.name!r}, not {profile.name!r}{note}"
+        )
+
+
+def _resolve_direction(profile: _profile.Profile, app: _github.GithubApp, sha: str) -> _ResolvedDirection:
+    """Resolve the profile to deploy from the direction repo; `sha` is its head, per the deployed [direction].
+
+    Never falls back: an unreadable one fails the deploy, before anything is deployed.
+
+    The deployer redeploys itself with this profile, so its [direction] decides where the next deployer reads.
+    The profile at `sha` of the deployed repo ("old") either names that same [direction] (steady) or names
+    another one ("new"): a move, which is two-sided. The new repo's head is resolved with the GitHub App and
+    its profile must name the new repo itself, so the move is deployed only when both repos agree. The new
+    repo is read only because the old one names it: the deployer never follows a repo the current direction
+    did not name. A move the new repo refuses raises `_MoveNotReady`, which is not a failed attempt: the fix
+    is in the new repo, whose commits do not change the pair attempts are counted on.
     """
     # Only called after the caller has checked profile.direction.
     direction = cast(_profile.Direction, profile.direction)
     repo = _github.parse_repo(direction.repo)
-    with _deploy.fetched_tree(_github.clone_url(repo, app.installation_token(repo)), sha) as tree:
-        try:
-            # Unknown top-level keys may be the deployed engine's: `_deploy_sha` has it check them.
-            shipped = _profile.load_from_direction(tree, direction.profile, tolerate_unknown=True)
-        except _profile.ProfileError as exc:
-            raise _deploy.DeployError(f"{direction.profile} at {sha} of {repo} is not usable: {exc}") from exc
-    if shipped.name != profile.name:  # the release history and deployed envs are keyed on it
+    try:
+        shipped = _read_direction(app, direction, sha)
+    except _profile.ProfileError as exc:
+        raise _deploy.DeployError(f"{direction.profile} at {sha} of {repo} is not usable: {exc}") from exc
+    _check_direction_name(shipped, profile, direction, sha, "")
+    if shipped.direction is None:
+        # Without it the next deployer would stop reading the direction repo, silently.
         raise _deploy.DeployError(
-            f"{direction.profile} at {sha} of {repo} is profile {shipped.name!r}, not {profile.name!r}"
+            f"{direction.profile} at {sha} of {repo} must keep a [direction]: removing it would stop the "
+            f"deployer reading {repo}; nothing deployed"
         )
-    same = shipped.direction is not None and (
-        _github.parse_repo(shipped.direction.repo) == repo
-        and (shipped.direction.profile, shipped.direction.ref) == (direction.profile, direction.ref)
-    )  # the repo by owner/name, so an https spelling of the same repo is the same [direction]
-    if not same:
-        # The deployer redeploys itself with this profile: without the same [direction] the next deployer
-        # would stop reading (or read another) direction repo, silently. Changing it is a hand deploy.
-        raise _deploy.DeployError(
-            f"{direction.profile} at {sha} of {repo} must keep [direction] as deployed ({direction.repo}, "
-            f"{direction.profile}, ref {direction.ref or 'default'}); change it with a hand deploy"
+    if _same_direction(shipped.direction, direction):
+        return _adopt(shipped, direction, repo, sha)
+    return _resolve_move(profile, app, direction, sha, shipped.direction)
+
+
+def _resolve_move(
+    profile: _profile.Profile,
+    app: _github.GithubApp,
+    old: _profile.Direction,
+    old_sha: str,
+    new: _profile.Direction,
+) -> _ResolvedDirection:
+    old_repo, new_repo = _github.parse_repo(old.repo), _github.parse_repo(new.repo)
+    try:
+        _, new_sha = app.scoped(_github.CONTENTS_READ).default_branch_sha(new_repo, new.ref)
+        shipped = _read_direction(app, new, new_sha)
+    except _profile.ProfileError as exc:
+        raise _MoveNotReady(
+            f"{new.profile} at {new_sha} of {new_repo} is not usable: {exc} (new direction {new_repo})"
+        ) from exc
+    except (_github.GithubError, _deploy.DeployError) as exc:
+        raise _MoveNotReady(
+            f"[direction] move to {new_repo} refused: {new_repo} cannot be read ({exc}); nothing deployed. "
+            f"Install the GitHub App on {new_repo} or fix [direction] in {old_repo}."
+        ) from exc
+    _check_direction_name(shipped, profile, new, new_sha, f" (new direction {new_repo})", _MoveNotReady)
+    if shipped.direction is None or not _same_direction(shipped.direction, new):
+        names = (
+            "no [direction]"
+            if shipped.direction is None
+            else f"{_github.parse_repo(shipped.direction.repo)}, {shipped.direction.profile}, "
+            f"ref {shipped.direction.ref or 'default'}"
         )
+        raise _MoveNotReady(
+            f"{old.profile} at {old_sha} of {old_repo} moves [direction] to {new_repo}, but {new.profile} at "
+            f"{new_sha} of {new_repo} names {names}: a move needs the new profile to name its own repo; "
+            "nothing deployed"
+        )
+    return _adopt(shipped, new, new_repo, new_sha, moved_from=old_repo)
+
+
+def _adopt(
+    shipped: _profile.Profile, direction: _profile.Direction, repo: str, sha: str, moved_from: str = ""
+) -> _ResolvedDirection:
     _say(f"profile: {direction.profile} from {repo} at {sha}")
     captured = _standards.decode(shipped.standards_payload)
     if captured:
         _say(f"direction standards captured: {len(captured)} files from {repo}, {direction.profile} at {sha}")
-    return shipped
+    return _ResolvedDirection(shipped, direction, repo, sha, moved_from)
+
+
+class _MoveNotReady(_deploy.DeployError):
+    """The new repo of a [direction] move does not allow it yet: nothing deployed, and not an attempt.
+
+    It cannot be read, its profile is unusable or does not name the new repo itself, the engine being deployed
+    refuses its profile, or its CI is failing or pending. Each is fixed in the new repo, and a commit there
+    does not change the pair `_failed_attempts` counts on: counted, an owner who committed the old side first
+    would see the deployer give up on that pair and never deploy the new side's commit that completes the
+    move (#180). So `run_pair` reports the refusal and leaves it for the next tick, as it does pending CI.
+    """
+
+
+def _direction_profile(profile: _profile.Profile, app: _github.GithubApp, sha: str) -> _profile.Profile:
+    """Return the profile at `sha` of the direction repo (or of the repo a commit there moves it to)."""
+    return _resolve_direction(profile, app, sha).profile
 
 
 def _deploy_sha(
-    profile: _profile.Profile, app: _github.GithubApp, repo: str, sha: str, direction_sha: str = ""
-) -> tuple[list[str], _profile.Profile, dict[str, bool | str | None]]:
+    profile: _profile.Profile,
+    app: _github.GithubApp,
+    repo: str,
+    sha: str,
+    direction_sha: str = "",
+    push: str = "deploy_key",
+    isolation: Sequence[str] = (),
+) -> tuple[list[str], _profile.Profile, dict[str, bool | str | None], _ResolvedDirection | None]:
     """Deploy `sha` of `repo`: slots, factory, then apps.
 
     Return its environments, profile and standards diagnostics.
 
-    With `[direction]` the profile is the one at `direction_sha` of the direction repo. Otherwise it is
+    With `[direction]` the profile is the one at `direction_sha` of the direction repo, or of the repo a
+    commit there moves `[direction]` to (the fourth item returned says so). Otherwise it is
     the merged tree's `profiles/<name>.toml` when it has one, else `profile`, the one this
     pod started with: the children take their profile text from here, so a pod profile alone would
     ship every later change to it (and to the standards) only by hand, and the deployer would
@@ -455,15 +727,27 @@ def _deploy_sha(
     step, and a key that code does not know either (a typo) fails the check, naming it, before
     anything is deployed.
     """
-    # The children import and run the deployed code: they get neither the App key nor a token.
-    credentials = _pull_requests.credential_env_vars(profile.github.private_key_secret, os.environ)
-    base = {k: v for k, v in os.environ.items() if k not in credentials}
+    # The children import and run the deployed code: they get neither the App key nor a token, nor the key
+    # Union injects, nor any tier key but the deployer's. `push` is what the slots are to run with.
+    base = {
+        **_child_env(profile),
+        _github_mode.PUSH_ENV_VAR: push,
+        **({_github_mode.ISOLATION_ENV_VAR: "; ".join(isolation)} if isolation else {}),
+        _profile.IDENTITIES_ENV: json.dumps(identities(profile)),
+    }
     with _deploy.fetched_tree(_clone_url(app, repo), sha) as tree:
+        direction = None
         if profile.direction:
             # The direction's profile carries its own standards, captured from the direction repository: the
             # children must not capture them again from the engine tree.
-            text = _direction_profile(profile, app, direction_sha).deployment_text()
-            where, standards = f"{profile.direction.profile} at {direction_sha}", None
+            direction = _resolve_direction(profile, app, direction_sha)
+            if direction.moved_from:
+                # The direction repo is read with the App, like the old one; its CI is optional, as there.
+                refused = _unhealthy(app, direction.repo, direction.sha, "direction ", needs_ci=False)
+                if refused:
+                    raise _MoveNotReady(refused)
+            text = direction.profile.deployment_text()
+            where, standards = f"{direction.direction.profile} at {direction.sha}", None
         else:
             try:
                 shipped = _profile.load_from_tree(tree, profile.name, tolerate_unknown=True)
@@ -483,9 +767,17 @@ def _deploy_sha(
             "configured": None,
             "warning": "standards metadata unavailable (older engine)",
         }
-        planned = _deploy.check_in_tree(
-            src, text, where, tree=standards, base_env=base, diagnostics=diagnostics
-        )
+        try:
+            planned = _deploy.check_in_tree(
+                src, text, where, tree=standards, base_env=base, diagnostics=diagnostics
+            )
+        except _deploy.MissingSecrets:
+            raise  # not about the text: the owner creates them, and run_pair reports it as waiting
+        except _deploy.DeployError as exc:
+            if direction is None or not direction.moved_from:
+                raise
+            # The refused text is the new repo's: a commit there fixes it, so this is not a counted attempt.
+            raise _MoveNotReady(f"{exc} (new direction {direction.repo}); nothing deployed") from exc
         _say(f"the engine at {sha} accepts {where}; deploying {', '.join(planned)}")
         deployed = _deploy.deploy_in_tree(
             src, text, where, tree=standards, project=PROJECT, domain=DOMAIN, ref=sha, base_env=base
@@ -493,7 +785,97 @@ def _deploy_sha(
     missing = sorted(set(planned) - set(deployed))
     if missing:  # a success must not claim an environment that was not deployed
         raise _deploy.DeployError(f"deploy of {sha} did not deploy {', '.join(missing)}")
-    return deployed, _profile.parse(text, where, tolerate_unknown=True), diagnostics
+    return deployed, _profile.parse(text, where, tolerate_unknown=True), diagnostics, direction
+
+
+# Runs as the session tier's key, in a subprocess so the deployer's own process never holds it as its
+# identity. argv carries no secret: the SDK logs command lines.
+_CANARY_LAUNCH = """
+import json, sys
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
+import flyte
+import flyte.remote
+from flyte_agent_factory import _profile
+from flyte_agent_factory._pull_requests import KEY_ENV_VAR
+from flyte_agent_factory._union_identity import KEY_ENV, init_for_script
+project, domain, task_name, secret = sys.argv[1:5]
+init_for_script(_profile.require(), key_env=KEY_ENV, project=project, domain=domain)
+try:
+    task = flyte.remote.Task.get(name=task_name, auto_version="latest", project=project, domain=domain)
+    task = task.fetch()
+    task = task.override(secrets=[flyte.Secret(key=secret, as_env_var=KEY_ENV_VAR)])
+    run = flyte.with_runcontext(mode="remote", project=project, domain=domain).run(task, secret=secret)
+    run.wait()
+    (answer,) = run.outputs()
+except ConnectError as exc:
+    if exc.code != Code.PERMISSION_DENIED:
+        raise
+    print("REFUSED PERMISSION_DENIED")
+else:
+    print(json.dumps(answer))
+"""
+CANARY_TIMEOUT_S = 900  # a cold pod and an image pull, then a no-op
+
+
+def launch_canary(secret: str) -> dict[str, object]:
+    """Launch `isolation-canary` (which declares `secret`) as the session tier; its answer.
+
+    Raises `LaunchRefused` when Union refuses the launch for lack of permission. Anything else that goes
+    wrong raises `SubprocessError`, which the canary reads as "not isolated". Only the exit code is
+    reported: the child's stderr may carry a token.
+    """
+    session = PROFILE.union.key_for("session")
+    var = _tier_mounts(PROFILE)[session]
+    key = os.environ.get(var, "")
+    if not key:
+        raise _union_identity.IdentityMissing(
+            f"the session tier's key (secret {session}) is not mounted as {var}: isolation cannot be measured"
+        )
+    child_env = {
+        **_child_env(PROFILE),
+        _union_identity.KEY_ENV: key,
+        _union_identity.TIER_ENV: "session",
+        _union_identity.SECRET_ENV: session,
+    }
+    done = subprocess.run(
+        [sys.executable, "-c", _CANARY_LAUNCH, PROJECT, DOMAIN, CANARY_TASK, secret],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=CANARY_TIMEOUT_S,
+    )
+    if done.returncode:
+        raise subprocess.SubprocessError(f"the canary launch exited {done.returncode}")
+    lines = done.stdout.strip().splitlines()
+    if lines and lines[-1].startswith("REFUSED"):
+        raise _isolation_canary.LaunchRefused(lines[-1])
+    try:
+        answer = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict):
+        raise subprocess.SubprocessError("the canary launch printed no answer")
+    return answer
+
+
+def _push_mode(profile: _profile.Profile) -> tuple[str, list[str]]:
+    """`AGENT_FACTORY_GITHUB_PUSH` for the slots, and why: `app` only if asked for and isolation held.
+
+    With an App configured the canary runs whatever `push` is, so `factory.status` can say whether sessions
+    can reach the App key; without one there is nothing to measure. A canary that fails is a reason, never
+    a failed deploy.
+    """
+    if not profile.github.configured:
+        return "deploy_key", []
+    try:
+        verdict = _isolation_canary.check(profile, launch_canary)
+    except (_union_identity.IdentityMissing, *_DEPLOY_ERRORS) as exc:
+        return "deploy_key", [str(exc)]
+    for reason in verdict.reasons:
+        _say(f"isolation canary: {reason}")
+    push = "app" if verdict.isolated and profile.github.push == "app" else "deploy_key"
+    return push, ([_github_mode.ISOLATED, *verdict.reasons] if verdict.isolated else verdict.reasons)
 
 
 #: The whole dispatch wake, app discovery included: a stalled control-plane read must not hold the deploy.
@@ -567,12 +949,11 @@ async def run_once(
         if release and release[1] == (sha, direction_sha):
             return _say(f"up to date at {shown}")
         _lock_repo(profile, app)  # refuse here, where the owner reads it, rather than in the deploy run
-        refused = await _not_deployable(profile, app, heads, release and release[0])
+        refused, labels = await _not_deployable(profile, app, heads, release and release[0])
         if refused:
             return _say(refused)
         if await _runs(profile, in_phase=_LIVE, limit=1):
             return _say("deploy in flight")
-        labels = _pair_labels(profile, sha, direction_sha)
         waiting = await _read_secrets_last_waited_for(profile, labels)
         run = await _submit(_deploy.DEPLOY_PAIR, labels=labels, sha=sha, direction_sha=direction_sha)
         # Still an attempt: it deploys as soon as the owner has created what the last one named.
@@ -580,6 +961,11 @@ async def run_once(
         return _say(f"submitted {shown}: {run.name}{note}")
     except _DEPLOY_ERRORS as exc:  # task boundary redacts remote errors
         raise _deploy.DeployError(_deploy.redact(str(exc))) from None
+
+
+def _describe_refusal(refused: str) -> str:
+    # `_unhealthy` already says a pending commit is retried next tick; saying it twice reads as two retries.
+    return refused if refused.endswith("retrying next tick") else f"{refused}; leaving it for the next tick"
 
 
 async def run_pair(
@@ -620,6 +1006,8 @@ async def run_pair(
             # Older releases did not record slots; the pod profile is their deployed configuration.
             previous_slots = set(previous.get("slots", previous_slots))
         output: DeployOutput = {"deployed": False}
+        # Before any slot is deployed, and once per run: it launches a pod.
+        push, isolation = await asyncio.to_thread(_push_mode, profile)
         for deploy in range(MAX_DEPLOYS_PER_RUN):
             # Every deploy, the first included, is judged on CI as it is now: the tick that queued this
             # run may have seen green minutes ago (lock wait, queue time).
@@ -633,14 +1021,21 @@ async def run_pair(
                 # Moved while waiting for the lock; the next tick judges the new heads.
                 _say(f"{shown} is no longer the head; leaving it for the next tick")
                 break
-            refused = await _not_deployable(profile, app, heads, release and release[0])
+            refused, _ = await _not_deployable(profile, app, heads, release and release[0])
             if refused:
-                _say(f"{refused}; leaving it for the next tick")
+                _say(_describe_refusal(refused))
+                if not output["deployed"]:  # the run succeeds: its report is where the reason is read
+                    output = {**output, "refused": refused}
                 break
             try:
-                envs, deployed_profile, standards = await asyncio.to_thread(
-                    _deploy_sha, profile, app, repo, sha, direction_sha
+                envs, deployed_profile, standards, resolved = await asyncio.to_thread(
+                    _deploy_sha, profile, app, repo, sha, direction_sha, push, isolation
                 )
+            except _MoveNotReady as exc:
+                # The run succeeds, so the refusal goes in its output as well as its log: nothing else has it.
+                _say(_describe_refusal(str(exc)))
+                output = {**output, "refused": str(exc)}
+                break
             except _deploy.MissingSecrets as exc:
                 # Nothing was deployed and the release is fine: not a failed attempt (which counts against
                 # MAX_ATTEMPTS) and not a release. The next tick resubmits, and deploys once they exist.
@@ -650,6 +1045,10 @@ async def run_pair(
             if slots != previous_slots:
                 await _wake_dispatch(deployed_profile)
             previous_slots = slots
+            moved = resolved is not None and bool(resolved.moved_from)
+            if moved:
+                direction_sha = cast(_ResolvedDirection, resolved).sha
+                shown = _shown(sha, direction_sha)
             _say(f"deployed {shown}: {', '.join(envs)}")
             output = {
                 "deployed": True,
@@ -658,7 +1057,17 @@ async def run_pair(
                 "sha": sha,
                 "direction_sha": direction_sha,
                 "standards": standards,
+                "github_push": push,
+                "isolation": isolation,
             }
+            if moved:
+                _say(
+                    f"direction moved: {cast(_ResolvedDirection, resolved).moved_from} -> "
+                    f"{cast(_ResolvedDirection, resolved).repo} at {direction_sha}"
+                )
+                # The redeployed deployer reads the new repo, where this is its direction head. Following
+                # the heads with this (old) profile would resolve the old repo's head and deploy it again.
+                break
         return output
     except _DEPLOY_ERRORS as exc:  # task boundary redacts remote errors
         raise _deploy.DeployError(f"deploy {shown} failed: {_deploy.redact(str(exc))}") from None
@@ -676,11 +1085,20 @@ def _report_html(message: str) -> str:
 
 
 def _describe_outcome(output: DeployOutput) -> str:
-    """Describe an attempt for its report: what it deployed, or which secrets it is waiting for."""
+    """Describe an attempt for its report: what it deployed, why not, or which secrets it is waiting for."""
     deployed = f"deployed {', '.join(output['envs'])}" if output.get("deployed") else "nothing deployed"
     warning = output.get("standards", {}).get("warning")
     if warning:
         deployed += f"; {warning}"
+    if "github_push" in output:
+        deployed += "; " + _github_mode.describe(
+            PROFILE,
+            {_github_mode.PUSH_ENV_VAR: output["github_push"]},
+            "; ".join(output.get("isolation", [])),
+        )
+    refused = output.get("refused")
+    if refused:
+        deployed += f"; {_describe_refusal(refused)}"
     waiting = output.get("waiting_for_secrets")
     if not waiting:
         return deployed
@@ -697,12 +1115,17 @@ async def deploy_pair(sha: str, direction_sha: str) -> dict[str, Any]:
     # existing untyped STRUCT wire format here; run_pair carries the precise shape internally.
     # Remote tasks always have a run name.
     try:
+        _union_identity.establish()
         output = await run_pair(PROFILE, _app(), cast(str, flyte.ctx().action.run_name), sha, direction_sha)
     except Exception as exc:
         await flyte.report.replace.aio(_report_html(f"failed: {_deploy.redact(str(exc))}"), do_flush=True)
         raise
-    await flyte.report.replace.aio(_report_html(_describe_outcome(output)), do_flush=True)
-    return cast(dict[str, Any], output)
+    who = identities(PROFILE)
+    shown = ", ".join(f"{i['tier']}: {i['secret']} ({i['client_id']})" for i in who)
+    await flyte.report.replace.aio(
+        _report_html(f"{_describe_outcome(output)}; identities {shown}"), do_flush=True
+    )
+    return {**cast(dict[str, Any], output), "identities": who}
 
 
 @env.task(
@@ -716,6 +1139,7 @@ async def deploy_if_changed() -> str:
     # This task only runs within a named remote action.
     run_name = cast(str, flyte.ctx().action.run_name)
     try:
+        _union_identity.establish()
         app = None
         if PROFILE.deploy.auto:
             app = _app()

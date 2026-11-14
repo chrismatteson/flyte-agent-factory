@@ -29,24 +29,26 @@ import os
 import flyte
 
 from browser_probe import MCP
-from flyte_agent_factory import _profile
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._bridge import redact
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._images import agent_image
 from flyte_agent_factory.browser import browser_endpoint
 
+PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="demo-chain-probe",
     image=agent_image().with_pip_packages("httpx>=0.27"),
-    env_vars=_profile.pod_env(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="2Gi"),
 )
 
-PROFILE = _profile.require()
 CONSOLE = f"{PROFILE.console_base}/runs"
 
-# Names the Flyte runtime uses for the in-pod API key, in precedence order.
-_KEY_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY", "FLYTE_API_KEY", "UNION_API_KEY")
+# The pod's key, as the factory mounts it (`_union_identity`).
+_KEY_VARS = (_union_identity.KEY_ENV, "FLYTE_API_KEY", "UNION_API_KEY")
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
 <style>body{{font:16px/1.6 system-ui;margin:0;padding:48px;background:#0f1115;color:#e6e6e6}}
@@ -62,6 +64,7 @@ def _data_url(title: str, sub: str, body: str) -> str:
 @env.task(report=True)
 async def probe() -> str:
     """Run the record-a-video chain against the browser app and return the findings."""
+    _union_identity.establish()
     import httpx
 
     base = browser_endpoint()

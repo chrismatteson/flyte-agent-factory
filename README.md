@@ -60,11 +60,12 @@ Setup, the full split of who can do what, and what to ask: [docs/chat-operator.m
   ([compatibility audit](docs/oss-flyte-compat.md)).
 - A Claude `setup-token` as a Flyte secret; a personal Claude Pro or Max plan works. Optionally, for Codex, a
   ChatGPT login from a personal Plus or Pro plan, or a Codex access token from a Business or Enterprise workspace.
-- A private GitHub repository of your own, the workspace, with a write deploy key. Sessions push there. Optionally
-  (and by default in guided setup) your own GitHub App for draft pull requests, verifier statuses and auto-deploy
-  ([docs/github-app.md](docs/github-app.md)). Work on another repository, the engine included, is imported into a
-  workspace project and promoted back as a pull request ([promotion](docs/architecture-repos.md#promotion));
-  sessions hold no credential for it.
+- A private GitHub repository of your own, the workspace, with a write deploy key. Sessions push there. Your own GitHub App is the guided-setup default
+  (read-only on code; pushes stay on deploy keys until the isolation canary reports `isolated`) for CI visibility, draft pull requests, verifier statuses and auto-deploy;
+  deploy-key-only mode has no CI visibility ([docs/github-app.md](docs/github-app.md)). Work on another repository,
+  the engine included, is imported into a workspace project and promoted back as a pull request
+  ([promotion](docs/architecture-repos.md#promotion)); sessions push no code to it, and reach it only if the App is
+  installed on it or the profile lists a deploy key for it in `[repo_keys]`.
 - For the operator: Claude Code, or claude.ai where your organization has its request-header connectors (a beta),
   and a GitHub OAuth App or token for its GitHub connector.
 - A deployment profile naming all of it: `profile.toml` at the root of your workspace. It holds every

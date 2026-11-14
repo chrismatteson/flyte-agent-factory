@@ -58,7 +58,7 @@ def test_the_walkthrough_hands_over_one_command_and_the_skill_does_too():
             if "ops/bootstrap.py --endpoint" in block
         ]
         # The first-run one-liner, and the redeploy and key ones, which are that same line plus a flag.
-        keys = ("--chat-key", "--deploy-key")
+        keys = ("--chat-key", "--union-keys")
         first = [c for c in commands if "--redeploy" not in c and not c.strip().endswith(keys)]
         assert len(first) == 1, f"{path}: expected exactly one bootstrap one-liner"
         [command] = first
@@ -106,7 +106,9 @@ def test_github_app_page_lists_the_permissions_and_what_it_enables():
     assert (
         "the only GitHub credential setup requires" in flat and "everything the App adds is optional" in flat
     )
-    assert "assumes" in flat and "still open" in flat and "#179 decides" in flat
+    assert "The App is the guided-setup default, read-only on code" in flat
+    assert "Two GitHub credentials remain for now" in flat and "reports `isolated`" in flat
+    assert "#179" not in flat and "still open" not in flat
     assert "the only GitHub credential setup requires" in " ".join(read(QUICKSTART).split())
     assert "](github-app.md)" in read("docs/README.md")
 
@@ -179,7 +181,7 @@ def test_the_documented_key_commands_are_the_ones_the_bootstrap_prints():
     )
     docs = {
         "--chat-key": (SKILL_SETUP, "docs/chat-operator.md", "docs/factory-mcp-setup.md"),
-        "--deploy-key": (SKILL_SETUP, QUICKSTART),
+        "--union-keys": (SKILL_SETUP, QUICKSTART),
     }
     for flag, paths in docs.items():
         for path in paths:

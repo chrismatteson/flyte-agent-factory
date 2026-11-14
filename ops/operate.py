@@ -32,8 +32,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import flyte
 from flyte import remote
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flyte_agent_factory import _profile
 
@@ -47,6 +50,7 @@ from flyte_agent_factory import (  # noqa: E402 -- must follow select_from_argv(
     _factory_policy,
     _meter,
     _queue,
+    _union_identity,
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
@@ -63,7 +67,7 @@ LAUNCH_HINT = "PYTHONPATH=src uv run python ops/operate.py launch <brief> --name
 
 
 def _init() -> None:
-    flyte.init_from_api_key(api_key=os.environ["_UNION_EAGER_API_KEY"], project=PROJECT, domain=DOMAIN)
+    _union_identity.init_for_script(_factory_base.PROFILE)
 
 
 _phase = _factory_base._phase

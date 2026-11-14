@@ -26,7 +26,7 @@ from mcp.server.fastmcp import (
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
 
-from . import _factory, _grant_page, _profile
+from . import _factory, _grant_page, _profile, _union_identity
 from ._bridge import _ENDED_PHASES, _ended_on_server
 from ._bridge_common import parse_approval
 from ._errors import REMOTE_ERRORS
@@ -212,6 +212,7 @@ _FETCH_DOCS = (
     f"&& rm -rf /tmp/flyte-sdk /tmp/unionai-examples && chmod -R a+rX {DOCS_DIR}"
 )
 
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 app = FlyteMCPAppEnvironment(
     name="factory-mcp",
     image=agent_image()
@@ -223,7 +224,8 @@ app = FlyteMCPAppEnvironment(
     instructions=INSTRUCTIONS,
     allowed_hosts=[urlparse(_public_url).netloc] if _public_url else None,
     allowed_origins=[_public_url] if _public_url else None,
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env()},
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     scaling=flyte.app.Scaling(replicas=1),
     sdk_examples_path=f"{DOCS_DIR}/flyte-sdk/examples",
     docs_examples_path=f"{DOCS_DIR}/unionai-examples/v2",
