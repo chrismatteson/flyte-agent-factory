@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import Any
 
 from flyte import remote
@@ -63,6 +64,12 @@ def queue_root() -> str:
 def run_labels(run: remote.Run) -> dict[str, str]:
     """Return a run's labels. `flyte.remote.Run` has no `.labels`; they are on its protobuf."""
     return dict(run.pb2.labels)
+
+
+def map_live_projects(runs: Sequence[remote.Run]) -> dict[str, str]:
+    """Return the project name of each of `runs` that the queue started, with its run name."""
+    labelled = ((run_labels(r).get(LABEL_PROJECT), r.name) for r in runs)
+    return {project: run for project, run in labelled if project}
 
 
 def _labelled_runs(name: str, gen: int | None = None, **kwargs: Any) -> list[remote.Run]:

@@ -18,6 +18,10 @@ which the caller records (`limited_until`) or passes in (`exclude`). Rules, in o
 4. Otherwise the caller's preferred engine wins. Headroom only breaks a tie when there is no
    preference, and only between engines that are both measured.
 5. With every engine exhausted the call is deferred, with the earliest time one reopens.
+6. A remembered refusal is a hint too: `LIMIT_PROBE_S` after it was noted, the engine takes one call as a
+   probe (ranked after engines that are available, unless it is the preferred one). Until then a waiter
+   asks again at the probe time (`Decision.probe_at`) if that is before the reset (`retry_at`), which is
+   never replaced by it.
 """
 
 from __future__ import annotations
@@ -30,9 +34,9 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 # The runtime import is absolute (see `_webhook` for why); mypy resolves `flyte_agent_factory` to the install,
 # which has no py.typed marker, so it checks against the relative import instead.
 if TYPE_CHECKING:
-    from ._meter import MIN_INTERVAL_S, ROUTE_AT_PCT, Meter
+    from ._meter import LIMIT_PROBE_S, MIN_INTERVAL_S, ROUTE_AT_PCT, Meter
 else:
-    from flyte_agent_factory._meter import MIN_INTERVAL_S, ROUTE_AT_PCT, Meter
+    from flyte_agent_factory._meter import LIMIT_PROBE_S, MIN_INTERVAL_S, ROUTE_AT_PCT, Meter
 
 #: A reading older than this says nothing about now. The supervisor re-reads every
 #: `MIN_INTERVAL_S` (`_usage._METER_EVERY_S`), so this is two of its intervals.
@@ -42,11 +46,16 @@ DEFAULT_RETRY_S = 300.0
 
 
 class RouterDeferred(RuntimeError):
-    """Every engine is exhausted; the call was not made. `retry_at` is when to ask again, if known."""
+    """Every engine is exhausted; the call was not made. `retry_at` is when to ask again, if known.
 
-    def __init__(self, message: str, retry_at: float | None = None) -> None:
+    `probe_at` is the earlier time a remembered limit is due a re-check (`LIMIT_PROBE_S`), if one is; a waiter
+    asks again at the earlier of the two, and the router then lets one call through.
+    """
+
+    def __init__(self, message: str, retry_at: float | None = None, probe_at: float | None = None) -> None:
         super().__init__(message)
         self.retry_at = retry_at
+        self.probe_at = probe_at
 
 
 @dataclass(frozen=True)
@@ -54,13 +63,17 @@ class Candidate:
     """One engine as the meters see it at decision time."""
 
     engine: str
-    #: usable (headroom known), exhausted, unknown (no fresh reading) or unavailable (no login)
+    #: usable (headroom known), exhausted, probe (a remembered limit due a re-check), unknown (no fresh
+    #: reading) or unavailable (no login)
     state: str
     headroom: float | None = None
     five_hour_pct: float | None = None
     weekly_pct: float | None = None
     #: When an exhausted engine reopens; None if a blocking window has no known reset.
     usable_at: float | None = None
+    #: When the router lets one call through to find out whether the remembered limit is over; None when
+    #: it will not (a rejected login, a limit with no noted time). `usable_at` stays the remembered reset.
+    probe_at: float | None = None
     #: Where the reading came from, how old it was, and the (non-secret) login name; None with no meter.
     source: str | None = None
     age_s: float | None = None
@@ -73,6 +86,8 @@ class Candidate:
             return f"{self.engine} not configured"
         if self.state == "unknown":
             return f"{self.engine} meter unavailable"
+        if self.state == "probe":
+            return f"{self.engine} limit due a re-check"
         if self.state == "exhausted" and self.five_hour_pct is None and self.weekly_pct is None:
             return f"{self.engine} at its limit"
         parts = [f"{self.engine} 5h {self.five_hour_pct:.0f}%"] if self.five_hour_pct is not None else []
@@ -88,6 +103,7 @@ class Candidate:
             "five_hour_pct": self.five_hour_pct,
             "weekly_pct": self.weekly_pct,
             "usable_at": self.usable_at,
+            "probe_at": self.probe_at,
             "source": self.source,
             "age_s": self.age_s,
             "login": self.login,
@@ -103,6 +119,9 @@ class Decision:
     at: float
     pinned: bool = False
     retry_at: float | None = None
+    #: Earliest `probe_at` among the engines this deferral waits on; the wait ends at the earlier of it and
+    #: `retry_at`. None when no remembered limit is due a re-check before then.
+    probe_at: float | None = None
     builders: tuple[str, ...] = ()
     candidates: tuple[Candidate, ...] = ()
     #: What the caller resolved for the chosen engine; the router itself holds no model names.
@@ -110,6 +129,8 @@ class Decision:
     effort: str = ""
     #: The engine a hard pin waits for; "" when the deferral is not a pin's.
     pin: str = ""
+    #: The engine was chosen to find out whether its remembered limit is over (`LIMIT_PROBE_S`).
+    probe: bool = False
 
     @property
     def deferred(self) -> bool:
@@ -123,6 +144,7 @@ class Decision:
         reason = self.reason
         if self.retry_at is not None:
             reason += f"; retry at {datetime.fromtimestamp(self.retry_at, timezone.utc):%H:%M} UTC"
+        reason += format_recheck(self.probe_at, self.retry_at)
         return f"router: {self.role} -> {target} ({meters}{reason})"
 
     def record(self) -> dict[str, Any]:
@@ -135,11 +157,30 @@ class Decision:
             "pinned": self.pinned,
             "reason": self.reason,
             "retry_at": self.retry_at,
+            "probe_at": self.probe_at,
+            "probe": self.probe,
             "builders": list(self.builders),
             "candidates": [c.record() for c in self.candidates],
             "model": self.model,
             "effort": self.effort,
         }
+
+
+def pick_wake_time(retry_at: float | None, probe_at: float | None) -> float | None:
+    """Return when a waiter asks the router again: the earlier of the reset and the re-check, if known."""
+    return min((t for t in (retry_at, probe_at) if t is not None), default=None)
+
+
+def pick_recheck(probe_at: float | None, retry_at: float | None) -> float | None:
+    """Return `probe_at` only when it comes before `retry_at`: a re-check after the reset is no re-check."""
+    return probe_at if probe_at is not None and (retry_at is None or probe_at < retry_at) else None
+
+
+def format_recheck(probe_at: float | None, retry_at: float | None) -> str:
+    """Return `; re-check at HH:MM UTC` when the re-check comes before the reset, else nothing."""
+    if (recheck := pick_recheck(probe_at, retry_at)) is None:
+        return ""
+    return f"; re-check at {datetime.fromtimestamp(recheck, timezone.utc):%H:%M} UTC"
 
 
 def _window(pct: float | None, resets_at: float | None, now: float) -> tuple[float | None, float | None]:
@@ -167,7 +208,13 @@ def _candidate(engine: str, meter: Meter | None, available: bool, now: float) ->
     # Only a refusal puts an engine out. A full window is a hint that it may refuse, so it ranks
     # last on headroom but is still tried: the meter can be wrong, and the refusal is what counts.
     if meter.limited_until is not None and meter.limited_until > now:
-        return Candidate(engine, "exhausted", 0.0, five, week, meter.limited_until, **seen)
+        # A rejected login stays out until a person replaces it: probing it only burns a call.
+        probe_at = (
+            None if meter.limit_noted_at is None or meter.rejected else meter.limit_noted_at + LIMIT_PROBE_S
+        )
+        if probe_at is not None and probe_at <= now:
+            return Candidate(engine, "probe", 0.0, five, week, **seen)
+        return Candidate(engine, "exhausted", 0.0, five, week, meter.limited_until, probe_at, **seen)
     # A full window stays full until its reset, however old the reading; anything else is only
     # evidence while it is recent.
     fresh = now - meter.observed_at <= STALE_AFTER_S
@@ -223,7 +270,12 @@ def route(
     builders = tuple(builders)
 
     def decide(engine: str | None, reason: str, **extra: Any) -> Decision:
-        return Decision(role, engine, reason, now, builders=builders, candidates=candidates, **extra)
+        probe = engine is not None and states[engine].state == "probe"
+        if probe:
+            reason = "; ".join(filter(None, [reason, f"{engine} remembered limit re-checked"]))
+        return Decision(
+            role, engine, reason, now, builders=builders, candidates=candidates, probe=probe, **extra
+        )
 
     notes: list[str] = []
     named: set[str] = set()  # engines a note already says are out, so the reason says it once
@@ -245,7 +297,8 @@ def route(
 
     if hard_pin and pin in order:
         retry_at = states[pin].usable_at or now + retry_s
-        return decide(None, "; ".join(notes), pinned=True, retry_at=retry_at, pin=pin)
+        probe_at = pick_recheck(states[pin].probe_at, retry_at)
+        return decide(None, "; ".join(notes), pinned=True, retry_at=retry_at, probe_at=probe_at, pin=pin)
 
     if not order:
         return decide(None, "no engines configured", retry_at=now + retry_s)
@@ -264,7 +317,13 @@ def route(
             notes.extend(f"{e} exhausted" for e in order if e not in refused)
         else:
             notes.append("both engines exhausted" if len(order) > 1 else f"{next(iter(order))} exhausted")
-        return decide(None, "; ".join(notes), retry_at=retry_at)
+        probes = [c.probe_at for c in candidates if c.engine in order and c.probe_at is not None]
+        return decide(
+            None,
+            "; ".join(notes),
+            retry_at=retry_at,
+            probe_at=pick_recheck(min(probes, default=None), retry_at),
+        )
 
     # A single builder asks for a cross-check. It is preferred, not required: when the other engine
     # is out the review runs on the builder's engine instead of stalling.
@@ -282,13 +341,13 @@ def route(
             named.add(c.engine)
 
     if other and len(usable) > 1:
-        unverified = [c for c in other if c.state != "usable"]
+        unverified = [c for c in other if c.state == "unknown"]
         notes.extend(f"{c.engine} meter unknown" for c in unverified)
         notes.append(f"QA differs from builder {'+'.join(builders)}")
         return _best(decide, other, preferred, order, notes)
     if builders and not cross_check:
         notes.append("builders mixed")
-    if not any(c.state == "usable" for c in usable):
+    if not any(c.state in ("usable", "probe") for c in usable):
         # Nothing measured: the choice is the policy's alone, which it is anyway unless there is a tie.
         return _best(decide, usable, preferred, order, [*notes, "meters unavailable, static choice"])
     if len(usable) == 1:
@@ -310,6 +369,8 @@ def _best(
     """
     if any(c.engine == preferred for c in pool):
         return decide(preferred, "; ".join(notes) or f"preferred {preferred}")
+    # A probe is a question, not capacity: it goes first only when nothing else can take the call.
+    pool = [c for c in pool if c.state != "probe"] or pool
     if len(pool) > 1 and all(c.state == "usable" for c in pool):
         best = min(pool, key=lambda c: (-(c.headroom or 0.0), order[c.engine]))
         return decide(best.engine, "; ".join(notes) or "most headroom")
@@ -325,18 +386,23 @@ class Paused:
     engine: str
     #: Epoch seconds: the earliest known reset among the permitted engines. None when none is known.
     until: float | None
+    #: When a remembered limit is due a re-check (`Decision.probe_at`), if before `until`.
+    probe_at: float | None
     #: Each other engine and why it is not used, e.g. "pinned to claude (ENGINE_FALLBACK unset)".
     others: dict[str, str]
     #: "" unless no permitted engine can run without someone acting; then what to do, engine by engine.
     needs_human: str
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        record: dict[str, object] = {
             "engine": self.engine,
             "until": self.until,
             "others": self.others,
             "needs_human": self.needs_human,
         }
+        if self.probe_at is not None:
+            record["probe_at"] = self.probe_at
+        return record
 
 
 #: Where each engine's credential is given, for the text that says how to unblock it.
@@ -408,7 +474,9 @@ def paused(
             for c in cands.values()
             if c.state != "usable" or (pin and c.engine != pin)
         )
-    return Paused(awaited.engine if awaited else "", until, others, needs_human)
+    # The decision's own re-check, which is when its waiters wake; it may be another engine's.
+    probe_at = pick_recheck(decision.probe_at, until)
+    return Paused(awaited.engine if awaited else "", until, probe_at, others, needs_human)
 
 
 def _unblock(c: Candidate, pin: str, cands: Mapping[str, Candidate], pin_fix: str) -> str:

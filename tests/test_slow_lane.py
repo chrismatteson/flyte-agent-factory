@@ -19,7 +19,7 @@ import flyte.errors
 import pytest
 from flyte.extras import ContainerTask
 
-from flyte_agent_factory import _images, _scanners, _slow_lane
+from flyte_agent_factory import _images, _scanners, _slow_lane, child
 
 
 def _fake_project(tmp_path: Path, exit_code: int = 0) -> Path:
@@ -49,6 +49,33 @@ def no_run(monkeypatch):
         raise RuntimeError("no run context")
 
     monkeypatch.setattr(_slow_lane, "_attach", refuse)
+
+
+def test_the_run_context_is_found_at_the_workspace_root_above_the_project(tmp_path, monkeypatch):
+    """The checks run in `projects/<name>/`; the supervisor writes the run context at the workspace root."""
+    project = tmp_path / "projects" / "one"
+    project.mkdir(parents=True)
+    (tmp_path / ".flyte").mkdir()
+    (tmp_path / ".flyte" / "run_context.json").write_text("{}")
+    monkeypatch.delenv("AGENT_FACTORY_WORKSPACE", raising=False)
+    seen: list[Any] = []
+    monkeypatch.setattr(child, "attach", seen.append)
+    monkeypatch.chdir(project)
+    _slow_lane._attach()
+    assert seen == [tmp_path]
+
+
+def test_the_run_context_is_found_through_the_workspace_variable(tmp_path, monkeypatch):
+    workspace, elsewhere = tmp_path / "ws", tmp_path / "elsewhere"
+    (workspace / ".flyte").mkdir(parents=True)
+    (workspace / ".flyte" / "run_context.json").write_text("{}")
+    elsewhere.mkdir()
+    monkeypatch.setenv("AGENT_FACTORY_WORKSPACE", str(workspace))
+    assert _slow_lane._run_context_dir(elsewhere) == workspace
+    monkeypatch.delenv("AGENT_FACTORY_WORKSPACE")
+    assert _slow_lane._run_context_dir(elsewhere) is None, (
+        "with no context anywhere, attach() decides as before"
+    )
 
 
 def test_runs_locally_without_the_env_var(tmp_path, monkeypatch, capfd):

@@ -1321,3 +1321,112 @@ def test_a_stale_notice_time_does_not_replace_the_header_reset(monkeypatch, tmp_
     monkeypatch.setattr(_usage, "_meters", store)
     _usage._note_engine_limit("claude", str(refused.value))
     assert [m.limited_until for m in store.latest.values()] == [weekly]
+
+
+@pytest.mark.asyncio
+async def test_the_author_handed_to_a_probed_engine_clears_its_limit_once_it_answers(tmp_path, monkeypatch):
+    """Codex is remembered limited 5 days ahead, due its re-check: the handover is its probe (#195)."""
+    now = _clock(monkeypatch, WALL0)
+    rig = _rig(tmp_path, monkeypatch, engine="claude", store=True)
+    meters = _usage._meters
+    assert meters is not None
+    meters.note_limit("codex", CODEX_WEEKLY, "")
+    now["t"] += _meter.LIMIT_PROBE_S + 5
+    stop, pump = await _start_pump(rig)
+    await rig.session.submit(FINDINGS)
+    now["t"] += 33
+    rig.refuse(CLAUDE_NOTICE)
+    rig.proc.last_output = now["t"] - 120
+    with pytest.raises(_author.AuthorHandoffRestart):
+        await asyncio.wait_for(pump, timeout=30)
+    (record,) = rig.records()
+    assert (record["from"], record["to"]) == ("claude", "codex")
+
+    # The next pod: the same meters and state on disk, the author now on Codex.
+    handover_at = record["at"]
+    monkeypatch.setattr(_usage, "_author_engine", "codex")
+    store = _meter.MeterStore(tmp_path / "meters", clock=lambda: _agent_time().time())
+    monkeypatch.setattr(_usage, "_meters", store)
+    engine = _Stoppable()
+    session = _Session(engine, tmp_path / "author-pending-2.json")
+    stop2 = asyncio.Event()
+    pump2 = asyncio.create_task(_supervise._pump(_Queue(), session, rig.timeline, stop2))  # type: ignore[arg-type]
+    await tick(0.05)
+    assert store.latest["codex"].limited_until == CODEX_WEEKLY, "nothing has answered yet"
+    await session.submit("the handoff briefing")
+    engine.output_count = _session_config.LIMIT_RESUMED_CHARS + 1  # the new session works
+    now["t"] += 61
+    await wait_for(lambda: store.latest["codex"].limited_until is None)
+    assert not _usage._route("planner", None).deferred, "the session runs on codex: calls are not deferred"
+    assert handover_at <= _agent_time().time()
+    await finish(stop2, pump2)
+
+
+@pytest.mark.asyncio
+async def test_a_handed_over_session_s_output_before_its_answer_does_not_clear_the_limit(
+    tmp_path, monkeypatch
+):
+    """A startup screen, a resumed transcript or redraws before a refusal shows are not the probe's answer."""
+    now = _clock(monkeypatch, WALL0)
+    rig = _rig(tmp_path, monkeypatch, engine="claude", store=True)
+    meters = _usage._meters
+    assert meters is not None
+    meters.note_limit("codex", CODEX_WEEKLY, "")
+    now["t"] += _meter.LIMIT_PROBE_S + 5
+    stop, pump = await _start_pump(rig)
+    await rig.session.submit(FINDINGS)
+    now["t"] += 33
+    rig.refuse(CLAUDE_NOTICE)
+    rig.proc.last_output = now["t"] - 120
+    with pytest.raises(_author.AuthorHandoffRestart):
+        await asyncio.wait_for(pump, timeout=30)
+    monkeypatch.setattr(_usage, "_author_engine", "codex")
+    store = _meter.MeterStore(tmp_path / "meters", clock=lambda: _agent_time().time())
+    monkeypatch.setattr(_usage, "_meters", store)
+    engine = _Stoppable()
+    session = _Session(engine, tmp_path / "author-pending-2.json")
+    stop2 = asyncio.Event()
+    pump2 = asyncio.create_task(_supervise._pump(_Queue(), session, rig.timeline, stop2))  # type: ignore[arg-type]
+    engine.output_count = 3 * _session_config.LIMIT_RESUMED_CHARS  # printed before anything was asked
+    now["t"] += 61
+    await tick(0.1)
+    assert store.latest["codex"].limited_until == CODEX_WEEKLY, "no submission has been answered"
+    await session.submit("the handoff briefing")
+    engine.output_count += _session_config.LIMIT_RESUMED_CHARS + 1  # redraws while it is asked
+    now["t"] += 30
+    await tick(0.1)
+    assert store.latest["codex"].limited_until == CODEX_WEEKLY, "the refusal may still be coming"
+    now["t"] += 31
+    await wait_for(lambda: store.latest["codex"].limited_until is None)
+    await finish(stop2, pump2)
+
+
+@pytest.mark.asyncio
+async def test_a_handover_to_an_engine_that_refuses_again_keeps_its_limit(tmp_path, monkeypatch):
+    now = _clock(monkeypatch, WALL0)
+    rig = _rig(tmp_path, monkeypatch, engine="claude", store=True)
+    meters = _usage._meters
+    assert meters is not None
+    meters.note_limit("codex", CODEX_WEEKLY, "")
+    now["t"] += _meter.LIMIT_PROBE_S + 5
+    stop, pump = await _start_pump(rig)
+    await rig.session.submit(FINDINGS)
+    now["t"] += 33
+    rig.refuse(CLAUDE_NOTICE)
+    rig.proc.last_output = now["t"] - 120
+    with pytest.raises(_author.AuthorHandoffRestart):
+        await asyncio.wait_for(pump, timeout=30)
+    monkeypatch.setattr(_usage, "_author_engine", "codex")
+    store = _meter.MeterStore(tmp_path / "meters", clock=lambda: _agent_time().time())
+    monkeypatch.setattr(_usage, "_meters", store)
+    now["t"] += 30
+    store.note_limit("codex", CODEX_WEEKLY, "")  # the new session was refused too
+    engine = _Stoppable()
+    session = _Session(engine, tmp_path / "author-pending-2.json")
+    stop2 = asyncio.Event()
+    pump2 = asyncio.create_task(_supervise._pump(_Queue(), session, rig.timeline, stop2))  # type: ignore[arg-type]
+    engine.output_count = _session_config.LIMIT_RESUMED_CHARS + 1
+    now["t"] += 61
+    await tick(0.1)
+    assert store.latest["codex"].limited_until == CODEX_WEEKLY
+    await finish(stop2, pump2)

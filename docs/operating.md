@@ -148,7 +148,8 @@ lift that and when the other engine is itself limited until); the backed-off ret
 saved reset still holds, so a restart does not bring back half-hourly retries of a pinned engine's weekly limit.
 
 The review can wait on a limit too. When a reviewer is deferred by a usage limit after DONE, the phase
-reads `limited until 06:02 UTC` (the router's retry time plus two minutes, at least ten from now), the
+reads `limited until 06:02 UTC` (the router's retry time, the same time its `router:` row shows; with no
+router time, the account's reset plus two minutes, at least ten from now), the
 activity line reads `review waiting on the usage limit -- re-runs automatically at 06:02 UTC`, and a
 `review waiting: ...` row names the limit. Nothing needs doing: at that time the review runs again by
 itself, for the judges still missing, and the phase returns to `review round N`. It does not use a review
@@ -162,10 +163,57 @@ What you can send to the `direct-` condition while it waits:
 | --- | --- |
 | `/stop` | ends the project at once, as when it is running; it does not wait for the reset |
 | `/engine claude`, `/resume [on] claude`, `resume [now] on claude`, `switch to claude` (or `codex`) | the project switches to that engine now, through the handoff, if it can run; otherwise the timeline says when that engine resets and the project waits for it. The engine becomes a hard pin for the rest of the run |
+| `/clear-limit`, `/clear-limit codex` | forgets the remembered usage limit of that engine (Claude by default) in this project and, with `[state] uri` set, for every other project's pod (without it only this pod), then the waiting review, the paused session and a waiting delegation try again at once ([remembered limits](#remembered-usage-limits)) |
 | anything else | kept, and delivered once to the session when it resumes |
 
 An engine direction counts only as the whole message, in any case and with an optional final `.` or `!`:
-`please resume on claude when you can` is ordinary direction, delivered on resume.
+`please resume on claude when you can` is ordinary direction, delivered on resume. `/clear-limit` is matched
+the same way: `please /clear-limit` or `/clear-limit foo` is delivered as ordinary direction.
+
+### Remembered usage limits
+
+A refusal's reset time is remembered so that later calls route around the limit, but it is only a hint: the
+account may have been reset by hand, or another pod may have found it open. Three things keep a hint from
+outliving the limit:
+
+- **Probe.** `LIMIT_PROBE_S` (thirty minutes) after a limit was last noted, one call is let through to find
+  out. The router ranks that engine after the ones that are available (unless it is the preferred one) and
+  the row says `remembered limit re-checked`. A refusal notes the limit again, which starts the thirty minutes
+  over. The remembered reset is never replaced by that time: a deferral's row keeps `retry at <reset>` and
+  adds `; re-check at <time>` when the probe comes first, and so do the waiting rows, the status phase and
+  the dashboard. Every waiter (the review, the paused session, a pinned delegation) wakes at the earlier of
+  the two, or when the limit is cleared, and asks the router again; the router then lets one call through.
+  A QA cross-check takes the other engine's re-check when it is due: a refused probe falls back to the
+  builder's engine through the retry.
+  A rejected login is not probed: it waits for a replaced token. A limit saved before probing existed counts as
+  noted when it was last read. The call the router lets through is the call that is made: a delegation chosen as
+  the probe runs on that engine and is not deferred by its own claim, and an author handed over to an engine as
+  its probe clears that engine's limit once the new session has answered: output grown after a submission to
+  it, a minute on with no notice (startup output or a resumed transcript does not count).
+- **Clear on success.** Any call that is answered on an account (a judge, a delegate, the session itself once
+  it runs again after a limit) drops a limit noted before the call began, whatever reset time was remembered;
+  a refusal noted after it stands. A reading older than the clear does not bring it back.
+- **Shared.** With `[state] uri` set, a pod writes the limit it noted for an account to `limits/` under it
+  (a hash of the account, the engine and times; never a token or a secret name; a Codex limit is kept per
+  login, so one slot's success never clears another's), and writes `cleared_at` there when a call on that
+  account succeeds while a limit is on record (no write per call). A pod that still remembers a limit reads
+  those files every `LIMIT_SHARE_POLL_S` (one minute) and drops a limit noted before `cleared_at`; a pod with
+  no limit reads nothing. The waiting review, the paused session (including the 30-minute wait after a reset
+  nobody could read, and with either engine configured) and a delegation waiting for an engine resume at the
+  next tick after a limit is cleared. A read or write the store refuses, or a record whose times are not
+  numbers (read as absent; a `null` is absent without a log line), is logged at most once a minute (a record
+  not written yet is no failure) and never fails or defers a call; without a state uri limits stay in
+  their pod.
+
+To clear by hand, for example after resetting the weekly limit yourself, send `/clear-limit [engine]` to one
+project's `direct-` condition (it clears that pod at once and, with `[state] uri` set, writes the engine-wide
+record; the timeline row says when that write failed and the other pods were not told), or run
+`factory.clear_limit` from chat (`engine` defaults to `claude`, any case): every pod, and the dashboard's
+meters, drop what they remember about that engine within a minute. An engine-wide clear affects only limits
+noted before it. `factory.clear_limit` answers `{"engine": ..., "status": "cleared"}`; when the state store
+cannot be written no pod was told, and it answers `"status": "not cleared"` with an `error` saying so: retry
+once the store is reachable. Without `[state] uri` in the deployment profile the task fails with an error
+saying so (there is nowhere to tell the pods), and so does an engine other than `claude` or `codex`.
 
 ## How it asks you things
 

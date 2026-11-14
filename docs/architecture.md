@@ -136,6 +136,7 @@ started directly it skips validation and the queue. After a failed deploy, chat 
 | `factory.queue_cancel` | removes a waiting launch |
 | `factory.set_reserve` | sets an account's usage reserve (`k`; 0 removes it) |
 | `factory.get_reserve` | reads every account's reserve |
+| `factory.clear_limit` | tells every pod an engine's usage limit was reset by hand (`engine`, default `claude`); each drops the limit it remembers within a minute, or the reply says `not cleared` ([remembered limits](operating.md#remembered-usage-limits)) |
 | `factory.rotate_token` | after the token secret is replaced: sends `/stop` to every live project and queues one resume of each (reason `token rotated`), which starts on a new pod once the old run has ended |
 | `factory.browser_link` | returns `{identity, url}`: a one-time (ten minutes, single use) sign-in/view link for a configured browser identity |
 | `factory.credential_link` | returns `{project, credential, hours, url, paste_to}` for a live project: the link where the owner seals a credential for it, and its `direct-` condition to signal the sealed text to; no credential passes through it ([credential grants](credential-grants.md)) |

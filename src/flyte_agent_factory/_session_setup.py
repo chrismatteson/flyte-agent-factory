@@ -738,6 +738,12 @@ def _delegate_reattach(timeline: _timeline._Timeline) -> Reattach:
             raise RuntimeError(f"worker action {name} ended {details.phase.value}: {error}")
         summary, output = await details.outputs()
         await output.download(str(target / "result"))
-        return _usage._ingest_subagent_usage(summary, "delegate", _usage._metering_round, timeline)
+        return _usage._ingest_subagent_usage(
+            summary,
+            "delegate",
+            _usage._metering_round,
+            timeline,
+            action_started_at=_usage.read_action_start(action),
+        )
 
     return reattach

@@ -447,8 +447,12 @@ def s3_uri(tmp_path, monkeypatch) -> str:
     """A `[state] uri` on a fresh, empty fake object store; see `ObjectStoreFS`."""
     # A scheme-less path reaches the local filesystem, relative to the working directory: not the repo.
     monkeypatch.chdir(tmp_path)
-    ObjectStoreFS.store.clear()
-    ObjectStoreFS.pseudo_dirs[:] = [""]
+    # A test module that imports `tests.conftest` loads this file a second time, and that copy's class is
+    # the one fsspec now serves the protocol with: empty the store fsspec really uses, or a test sees the
+    # last one's.
+    for fs_class in {ObjectStoreFS, fsspec.get_filesystem_class(ObjectStoreFS.protocol)}:
+        fs_class.store.clear()
+        fs_class.pseudo_dirs[:] = [""]
     return f"{ObjectStoreFS.protocol}://bucket/state"
 
 

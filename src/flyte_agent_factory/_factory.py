@@ -461,7 +461,7 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
     live = [r for r in all_live if r.name != exclude_run]
     # `exclude_run` frees its slot for other projects only: for its own project it is still running and
     # has not published the workspace a resume starts from.
-    running = _live_projects(all_live)
+    running = _factory_base.map_live_projects(all_live)
     kept_for: list[remote.Run] = []  # the run handing over its slot, which its resume gets before `low` work
     busy = {_factory_base._task_name(r) for r in live}
     demand = any("factory-loop" not in _factory_base.run_labels(r) for r in live)
@@ -612,17 +612,6 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
     return started
 
 
-def _live_projects(runs: Sequence[remote.Run]) -> dict[str, str]:
-    """Return the project name of each of `runs` that the queue started, with its run name."""
-    labelled = ((_factory_base.run_labels(r).get(_factory_base.LABEL_PROJECT), r.name) for r in runs)
-    return {project: run for project, run in labelled if project}
-
-
-def _position(queue: str, name: str, gen: int) -> int:
-    readable = [e for e in _queue.pending(queue) if e.request is not None]
-    return next(i for i, e in enumerate(readable, 1) if (e.name, e.gen) == (name, gen))
-
-
 class LaunchPlan(NamedTuple):
     request: _queue.Request
     replaces_waiting: bool  # the name was already waiting; `request` keeps its place
@@ -746,7 +735,9 @@ def launch_project(
         error = _queue.marker(queue, name, request.gen, closed).get("error", closed)
         raise ValueError(f"launch of {name} did not start: {error}")
     else:
-        result.update(status="updated" if old else "queued", position=_position(queue, name, request.gen))
+        result.update(
+            status="updated" if old else "queued", position=_queue.find_position(queue, name, request.gen)
+        )
     if note:
         result["note"] = note
     return result
@@ -861,7 +852,7 @@ def queue_view(now: float | None = None) -> dict[str, Any]:
         }
         for r in live
     ]
-    rows = waiting_rows(queue, now, _live_projects(live))
+    rows = waiting_rows(queue, now, _factory_base.map_live_projects(live))
     closed = [e for e in _queue.entries(queue) if e.closed]
     recent = []
     for entry in sorted(closed, key=lambda e: e.modified, reverse=True)[:RECENT]:
@@ -1256,6 +1247,12 @@ async def set_reserve(account: str, k: float) -> str:
         raise ValueError("the reserve needs [state] uri in the deployment profile")
     await asyncio.to_thread(_queue.put_reserve, state, account, k)
     return json.dumps({"account": account, "k": k})
+
+
+@env.task
+async def clear_limit(engine: str = "claude") -> str:
+    """Tell every pod `engine`'s usage limit was reset by hand; each drops it within a minute."""
+    return json.dumps(await asyncio.to_thread(_factory_meters.clear_limit, engine))
 
 
 @env.task

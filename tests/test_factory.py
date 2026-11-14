@@ -133,6 +133,7 @@ def test_factory_env_holds_the_queue_tasks_and_the_meter_task():
         "factory.status",
         "factory.set_reserve",
         "factory.get_reserve",
+        "factory.clear_limit",
         "factory.rotate_token",
         "factory.sweep",
         "factory.read_login_meter",

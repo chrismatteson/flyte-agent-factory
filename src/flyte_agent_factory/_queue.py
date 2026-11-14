@@ -301,6 +301,12 @@ def pending(queue: str, name: str | None = None) -> list[Entry]:
     )
 
 
+def find_position(queue: str, name: str, gen: int) -> int:
+    """Return the 1-based place of request `name` generation `gen` among the readable waiting launches."""
+    readable = [e for e in pending(queue) if e.request is not None]
+    return next(i for i, e in enumerate(readable, 1) if (e.name, e.gen) == (name, gen))
+
+
 def next_gen(found: list[Entry]) -> int:
     """Return the generation a new launch of these entries' name takes."""
     return max((e.gen for e in found), default=0) + 1
@@ -367,9 +373,22 @@ def release_lease(queue: str, holder: str) -> None:
 def read_json(path: str) -> dict[str, Any]:
     """Return the JSON object at `path`, or {} where it is absent, unreadable or not an object."""
     try:
-        value = json.loads(_fs(path).cat_file(path))
+        return read_json_or_raise(path)
     except (OSError, ValueError):
         return {}
+
+
+def read_json_or_raise(path: str) -> dict[str, Any]:
+    """Return the JSON object at `path`, {} where it is absent or not an object; raise if it cannot be read.
+
+    For a caller that reports a store it cannot reach (`OSError`) or a broken file (`ValueError`) rather than
+    taking either for "nothing there".
+    """
+    try:
+        raw = _fs(path).cat_file(path)
+    except FileNotFoundError:
+        return {}
+    value = json.loads(raw)
     return value if isinstance(value, dict) else {}
 
 

@@ -23,7 +23,6 @@ from flyte_agent_factory import (
     _review_wait,
     _reviewer,
     _session_config,
-    _session_setup,
     _supervise_support,
     _timeline,
     _usage,
@@ -38,7 +37,6 @@ from flyte_agent_factory._bridge import (
 from flyte_agent_factory._delegation import (
     Delegations,
 )
-from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._process import ClaudeProcess
 
 #: The longest wait between a finished session's capped rounds of resumes. Each round doubles it from
@@ -106,41 +104,13 @@ async def _pump(
     qa_round = 0
     # Restored after a pod restart. Quiet time starts over from here (conservative), and
     # `declared_done` follows from the pass so the session is not nudged for finished work.
-    restored = _session_config._load_pass_record()
+    restored = await _supervise_support._restore_review(timeline, workspace)
     passed_round: int | None = restored["round"] if restored and restored["passed"] else None
     declared_done = passed_round is not None
     if restored:
-        timeline.review_passed = restored["passed"]
-        if restored["passed"]:
-            timeline.phase("done")  # what the dashboard showed before the restart, not "building"
         qa_round = restored["round"]  # the verdict comment and the round ceiling carry on from here
-        # A pass in a granted round means those grants were used: without them the restored round sits at
-        # the ceiling and every /review-again is spent raising it back to where it already was.
-        _session_config._granted_rounds = max(
-            _session_config._granted_rounds,
-            min(_session_config._MAX_GRANTED_ROUNDS, qa_round - _session_config._QA_MAX_ROUNDS),
-        )
-        timeline.pr_url = timeline.pr_url or restored["pr_url"]
-        timeline.verdicts = restored["verdicts"]
-        timeline.pr_at = restored["pr_at"]
-        timeline.review_round = restored["review_round"]
-        timeline.review_started_at = restored["review_started_at"]
-        if restored["in_review"]:
-            timeline.phase("review", round_=timeline.review_round)
-            timeline._phase["since"] = timeline.review_started_at
-        if restored["passed"] and not restored["verdict_posted"] and _session_setup._pr is not None:
-            # The pod died between saving the pass and posting it: the PR is still a draft with no status.
-            try:
-                # The one caller of `_pump` always passes WORKSPACE.
-                await _supervise_support._post_verdict(
-                    cast(Path, workspace), timeline, restored["sha"], restored["round"]
-                )
-            except REMOTE_ERRORS as e:  # best effort at startup; a crash here would recur on every restart
-                timeline.row("⚠️", f"could not post the saved verdict: {type(e).__name__}: {e}"[:300])
-            _inbox._save_pass(
-                restored["round"], restored["sha"], timeline.pr_url, verdict_posted=True, timeline=timeline
-            )
     review_sha = ""  # the commit the review in flight is judging
+    handover_probe = _supervise_support.HandoverProbe()  # the author was handed to its engine as a probe
     started_at = time.time()
     qa_task: asyncio.Task[tuple[bool, str, bool | None, str]] | None = None
     compact_task = None
@@ -160,6 +130,14 @@ async def _pump(
     output_at_resume = 0
     retries = 0  # "carry on" sent in this limit episode
     reset_at: float | None = None  # wall time the limit resets, when the notice says
+    # When the router lets one call through to the limited engine, if before `reset_at` (`LIMIT_PROBE_S`).
+    probe_at: float | None = None
+    probed = False  # the resume of this episode was a probe, so it need not wait for `reset_at`
+    clears_seen = 0  # `_usage.wake_count()` when the episode began or last acted on a wake
+
+    def show_limit(paused: dict[str, Any] | None) -> None:
+        timeline.phase("limited", limited_until=reset_at, probe_at=probe_at, paused=paused)
+
     ended_at: float | None = None
     ended_limit_text = ""  # the notice of the episode that last ended: a redraw of it is stale
     review_wait = _review_wait.ReviewWait.restore_from(restored, workspace)  # a review that re-runs by itself
@@ -205,6 +183,8 @@ async def _pump(
 
     try:
         while not stop.is_set():
+            _usage.poll_limit_share()  # another pod's or a person's clear of a limit this pod remembers
+            handover_probe.check(proc)
             notes = bridge.drain_notes()
             if isinstance(proc, AuthorSession):
                 proc.declared_done = declared_done  # the handoff's briefing says whether the work was done
@@ -215,6 +195,8 @@ async def _pump(
                 submission = getattr(proc, "last_submission", None)
                 notice_reset = _usage._reset_at(text_now)
                 same_notice = _usage._same_limit_notice(text_now, ended_limit_text)
+                # A refusal inside the episode: a resume was refused.
+                refused_again = limited_since is not None
                 if (
                     limited_since is None
                     and ended_at is not None
@@ -229,19 +211,12 @@ async def _pump(
                     # A recent redraw is ambiguous; a later refused direction is a new episode.
                     pass
                 elif limited_since is None:
-                    interrupted_message = ""
-                    if (
-                        submission
-                        and submission != last_noted_submission
-                        and submission != resume_submission
-                        and getattr(proc, "output_count", 0) - submission[2]
-                        < _session_config.LIMIT_RESUMED_CHARS
-                        and not submission[0].startswith("Your usage limit")
-                        and "Reply with just: ok" not in submission[0]
-                        and _supervise_support._NUDGE not in submission[0]
-                    ):
-                        interrupted_message = submission[0]
+                    interrupted_message = _supervise_support._interrupted_message(
+                        proc, submission, last_noted_submission, resume_submission
+                    )
                     limited_since = time.monotonic()
+                    clears_seen = _usage.wake_count()
+                    probe_at, probed = None, False
                     last_resume = time.monotonic()
                     output_at_resume = getattr(proc, "output_count", 0)
                     retries = 0
@@ -260,12 +235,10 @@ async def _pump(
                     if not from_restart:
                         # Only a reset still ahead is recorded: a clock time already past is stale, and
                         # recording it would mark the engine usable at once (#125).
-                        fresh = _usage._refusal_until(
-                            getattr(proc, "limit_text", ""), getattr(proc, "limit_seen_wall", None)
-                        )
-                        _usage._note_session_limit(
-                            fresh, timeline, getattr(proc, "meter", None), getattr(proc, "limit_text", "")
-                        )
+                        # The status shows the router's next try, which is what the review wait shows too.
+                        limit_reset, probe_at = _usage.note_session_refusal(proc, timeline)
+                        if limit_reset:
+                            timeline.phase("limited", limited_until=limit_reset, probe_at=probe_at)
                     reset = getattr(proc, "limit_text", "") or "reset time not shown"
                     timeline.row(
                         "🚨",
@@ -274,19 +247,20 @@ async def _pump(
                     )
                 elif submission and submission != resume_submission and submission[1] <= hit:
                     # A direction refused during the pause supersedes the original findings.
-                    interrupted_message = (
-                        submission[0]
-                        if submission != last_noted_submission
-                        and getattr(proc, "output_count", 0) - submission[2]
-                        < _session_config.LIMIT_RESUMED_CHARS
-                        and not submission[0].startswith("Your usage limit")
-                        and "Reply with just: ok" not in submission[0]
-                        and _supervise_support._NUDGE not in submission[0]
-                        else ""
+                    interrupted_message = _supervise_support._interrupted_message(
+                        proc, submission, last_noted_submission, resume_submission
                     )
                 if limited_since is not None and retries:
                     # Ignore the refusal's echo, but allow subsequent work to end the pause.
                     output_at_resume = getattr(proc, "output_count", 0)
+                if refused_again:
+                    # The probe or carry-on was refused: only the reset ends the pause now, so redraws must
+                    # not read as work. A plain process notes the refusal here (`AuthorSession.on_limit`
+                    # does for two engines), which restarts the 30 minutes before the next re-check.
+                    probed = False
+                    if not isinstance(proc, AuthorSession):
+                        _, probe_at = _usage.note_session_refusal(proc, timeline)
+                        show_limit(None)
             if (
                 limited_since is not None
                 and isinstance(proc, AuthorSession)
@@ -329,12 +303,10 @@ async def _pump(
                         timeline.phase("done" if declared_done else "building")
                     else:
                         interrupted_message = ""
-                        reset_at = proc.retry_at
+                        reset_at, probe_at = proc.retry_at, getattr(proc, "probe_at", None)
                         if fresh is not None:
                             cap_rounds = unknown_rounds = 0  # a real reset to wait for: no backoff needed
-                        timeline.phase(
-                            "limited", limited_until=reset_at, paused=timeline._phase.get("paused")
-                        )
+                        show_limit(timeline._phase.get("paused"))
             if limited_since is not None:
                 # A small redraw after a refusal is not evidence of progress. A later
                 # unrefused submission can still receive a short, valid answer.
@@ -351,7 +323,7 @@ async def _pump(
                 # when the latest submission followed that notice.
                 # Never before the stated reset: a past run read a carry-on at 23:09 as a resume
                 # when the limit lifted at 1:50am, and stopped retrying.
-                after_reset = reset_at is None or time.time() >= reset_at
+                after_reset = probed or reset_at is None or time.time() >= reset_at
                 limit_seen_at = cast(float, seen_limit)  # set by the same pass that set `limited_since`
                 answered = (
                     grown > 0
@@ -380,6 +352,7 @@ async def _pump(
                     limited_since = None
                     proc._submitted_since_limit = True  # re-arm: the next notice is a new episode
                     timeline.row("✅", "the session is running again after the usage limit")
+                    _usage.note_success(_usage._author_engine, _supervise_support._wall_time_of(last_resume))
                     timeline.phase("done" if declared_done else "building")
                     if isinstance(proc, AuthorSession):
                         # The pause outlives the notice it came from; without this every later
@@ -483,12 +456,18 @@ async def _pump(
                             capped = False
                             routed_at_cap = True
                             if deferred:
-                                reset_at = proc.retry_at
-                                timeline.phase("limited", limited_until=reset_at, paused=paused)
+                                reset_at, probe_at = proc.retry_at, getattr(proc, "probe_at", None)
+                                show_limit(paused)
                 # A direction to resume on another engine re-routes now, not at the next reset.
                 reroute = isinstance(proc, AuthorSession) and getattr(proc, "reroute_requested", False)
+                # A limit cleared meanwhile (a call succeeded, another pod or a person said so) ends the wait.
+                cleared = _usage.wake_count() > clears_seen
+                # A remembered limit is due a re-check: ask the router again; it lets one call through.
+                probe_due = probe_at is not None and time.time() >= probe_at
                 due = (
                     reroute
+                    or cleared
+                    or probe_due
                     or routed_at_cap
                     or time.monotonic() - last_resume >= _session_config.LIMIT_RETRY_S
                     or (reset_at is not None and time.time() >= reset_at + 60 and retries == 0)
@@ -498,7 +477,7 @@ async def _pump(
                     and not notes
                     and terminal_quiet
                     and not capped
-                    and (reroute or reset_at is None or time.time() >= reset_at + 60)
+                    and (reroute or cleared or probe_due or reset_at is None or time.time() >= reset_at + 60)
                 )
                 if resume_now:
                     if isinstance(proc, AuthorSession) and not routed_at_cap:
@@ -516,14 +495,17 @@ async def _pump(
                             timeline.phase("done" if declared_done else "building")
                             resume_now = False
                         elif (proc.retry_at or 0) > time.time():
-                            reset_at = proc.retry_at
-                            # Keep the pause the handoff recorded: a phase without it clears it.
-                            timeline.phase(
-                                "limited", limited_until=reset_at, paused=timeline._phase.get("paused")
-                            )
+                            reset_at, probe_at = proc.retry_at, getattr(proc, "probe_at", None)
+                            clears_seen = _usage.wake_count()  # acted on: not a re-route on every tick
+                            show_limit(timeline._phase.get("paused"))  # keep the pause the handoff recorded
                             resume_now = False
+                if resume_now and (probe_due or cleared):
+                    probed = True  # a re-check or a clear needs no reset: the answer ends the episode
                 if resume_now:
                     retries += 1
+                    probe_at = None  # taken: the next re-check is the router's, after this call's outcome
+                    show_limit(timeline._phase.get("paused"))  # no re-check time that has passed
+                    clears_seen = _usage.wake_count()
                     last_resume = time.monotonic()
                     output_at_resume = getattr(proc, "output_count", 0)
                     timeline.row("🔁", "trying to resume after the usage limit")
@@ -541,6 +523,9 @@ async def _pump(
                         resumed_after_reset = refused_reset is None or time.time() >= refused_reset
                         await proc.resume(message, label="Usage limit reset: resuming")
                     else:
+                        if probe_due:
+                            # The pod's one probe, as `on_limit` does.
+                            _usage.claim_probe(_usage._author_engine)
                         await proc.submit(message, label="Usage limit reset: resuming")
                     resume_submission = getattr(proc, "last_submission", None)
             if _supervise_support._preflight_resumes != seen_preflight_resumes:
@@ -577,6 +562,7 @@ async def _pump(
                     if hasattr(proc, "_submitted_since_limit"):
                         proc._submitted_since_limit = True  # re-arm: the next notice is a new episode
                     timeline.row("✅", "the session is running again after the usage limit")
+                    _usage.note_success(_usage._author_engine, _supervise_support._wall_time_of(last_resume))
                     timeline.phase("building")
                     ended_at = time.monotonic()
                     ended_limit_text = getattr(proc, "limit_text", "")
@@ -764,7 +750,7 @@ async def _pump(
             if review_wait.at is not None and _supervise_support._escalated:
                 review_wait.at = None
                 review_wait.save(qa_round, timeline)
-            if review_wait.at is not None and qa_task is None and workspace and time.time() >= review_wait.at:
+            if review_wait.is_due() and qa_task is None and workspace:
                 review_wait.at = None
                 qa_round += 1
                 timeline.phase("review", round_=qa_round)

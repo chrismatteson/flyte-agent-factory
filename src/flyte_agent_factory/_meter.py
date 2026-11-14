@@ -30,7 +30,7 @@ import httpx
 from typing_extensions import Required
 
 if TYPE_CHECKING:
-    from . import _codex_auth, _secret_env
+    from . import _codex_auth, _limit_share, _secret_env
     from ._bridge import _write_atomic
 else:
     from flyte_agent_factory import _codex_auth, _secret_env
@@ -43,6 +43,9 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 FINGERPRINT_SEP = "#"
 #: Never read an account more often than this, however many callers ask.
 MIN_INTERVAL_S = 300.0
+#: A remembered limit is only a hint: this long after it was last noted (or probed) the router lets one call
+#: through to find out whether it is still real. A refusal re-arms it; a success clears the limit.
+LIMIT_PROBE_S = 1800.0
 #: A current window at or above this share is full. No reserve: the owner wants all of it. The router takes a
 #: full window as a hint only; a benchmark login, which cannot fail over, waits it out (`full_windows`).
 ROUTE_AT_PCT = 100.0
@@ -80,6 +83,7 @@ class _MeterFields(TypedDict, total=False):
     weekly_pct: float | None
     weekly_resets_at: float | None
     limited_until: float | None
+    limit_noted_at: float | None
     error: str
 
 
@@ -138,11 +142,21 @@ class Meter:
     scoped: list[Scoped] = field(default_factory=list)
     #: Set from a refusal ("usage limit ... resets 1:50am"): no capacity until then.
     limited_until: float | None = None
+    #: When `limited_until` was last noted or probed (the router's probe clock). None: never probed.
+    limit_noted_at: float | None = None
     error: str = ""
 
     @property
     def engine(self) -> str:
         return self.account.split()[0]
+
+    @property
+    def rejected(self) -> bool:
+        """Whether the login itself was refused (a token to replace), not just full or its meter unreadable.
+
+        A failed meter read also sets `error` (`MeterStore.note_failure`) but says nothing about the login.
+        """
+        return bool(self.error) and self.source != "refresh-failed"
 
     def to_dict(self) -> MeterData:
         # asdict recursively serializes Scoped using the same fields as _ScopedData.
@@ -266,6 +280,7 @@ def from_claude_events(
                 retry = float(headers.get("retry-after", 0))  # type: ignore[arg-type]  # Caught below.
             except (TypeError, ValueError):
                 retry = 0
+            reading.limit_noted_at = now
             reading.limited_until = max(
                 blocking_resets,
                 default=now + (retry if math.isfinite(retry) and retry > 0 else 300),
@@ -695,8 +710,16 @@ class MeterStore:
     already given, so a supervisor restart neither forgets a limit nor repeats a warning.
     """
 
-    def __init__(self, root: Path, clock: Callable[[], float] = time.time) -> None:
-        self.root, self.clock = root, clock
+    def __init__(
+        self, root: Path, clock: Callable[[], float] = time.time, share: _limit_share.LimitShare | None = None
+    ) -> None:
+        self.root, self.clock, self.share = root, clock, share
+        #: When each account's limit was last cleared; a reading older than that cannot bring the limit back.
+        self.cleared_at: dict[str, float] = {}
+        #: A wake generation per engine, in this process: `wake()` bumps it although nothing was cleared.
+        #: It is what a waiting call re-checks.
+        self.wakes: dict[str, int] = {}
+        self._polled = float("-inf")
         self.readings: dict[str, Meter] = {}
         # Supervisor callers have one mounted login per engine; retain their engine view.
         self.latest: dict[str, Meter] = {}
@@ -710,10 +733,14 @@ class MeterStore:
                 meter = Meter.from_dict(value)
                 self.readings[meter.account] = meter
                 self.latest[meter.engine] = meter
+                # Saved before probing existed: noted when last read, so it is re-checked an interval later.
+                if meter.limited_until is not None and meter.limit_noted_at is None and not meter.rejected:
+                    meter.limit_noted_at = meter.observed_at
             self.warned = list(saved.get("warned", []))
             self.attempts = saved.get("attempts", {})
             self.failures = saved.get("failures", {})
             self.last_attempt = saved.get("last_attempt", 0.0)
+            self.cleared_at = saved.get("cleared_at", {})
 
     @property
     def history(self) -> Path:
@@ -745,6 +772,7 @@ class MeterStore:
                 "attempts": self.attempts,
                 "failures": self.failures,
                 "last_attempt": self.last_attempt,
+                "cleared_at": self.cleared_at,
             },
         )
 
@@ -754,9 +782,18 @@ class MeterStore:
         if previous is None and meter.account != meter.engine:
             # Engine-only records predate login identities; bind them on the first mounted reading.
             previous = self.readings.pop(meter.engine, None)
+        # A reading taken before the limit was cleared (a sub-agent's, ingested late) does not bring it back.
+        if meter.limited_until is not None and (
+            meter.limit_noted_at or meter.observed_at
+        ) < self.cleared_at.get(meter.account, 0.0):
+            meter.limited_until = meter.limit_noted_at = None
         # A refusal's reset time outlives a reading that does not know about it.
         if previous and meter.limited_until is None and (previous.limited_until or 0) > self.clock():
-            meter.limited_until = previous.limited_until
+            meter.limited_until, meter.limit_noted_at = previous.limited_until, previous.limit_noted_at
+            if previous.rejected:
+                # Only a replaced token mends a rejected login, so a later reading (a sub-agent's late report)
+                # or a failed read must not make it look probe-able.
+                meter.error, meter.source = previous.error, previous.source
         self.readings[meter.account] = meter
         self.latest[meter.engine] = meter
         self.attempts[meter.account] = max(self.attempts.get(meter.account, 0), meter.observed_at)
@@ -800,19 +837,104 @@ class MeterStore:
         `limited_until` is never shortened: a repeat refusal that carries a guess (or a stale time) must not
         make a weekly limit look over (#125).
         """
-        if account:
-            meter = self.readings.get(account) or Meter(account, "limit-text", self.clock())
-        else:
-            meter = (
-                self.readings.get(engine)
-                or self.latest.get(engine)
-                or Meter(engine, "limit-text", self.clock())
-            )
+        meter = self._limit_meter(engine, account) or Meter(account or engine, "limit-text", self.clock())
         known = meter.limited_until or 0.0
         meter.limited_until = max(until, known) if known > self.clock() else until
+        meter.limit_noted_at = self.clock()
         if error:
             meter.error = error
         self.update(meter)
+        if self.share:
+            self.share.publish(meter.engine, meter.account, meter.limited_until, meter.limit_noted_at)
+
+    def _limit_meter(self, engine: str, account: str = "") -> Meter | None:
+        """Return the reading a limit of `engine` (or of `account`) is remembered on, if there is one.
+
+        Without an account it is the engine's latest reading, whose account may be the engine's name or the
+        credential its usage was recorded under (Codex): `note_limit` and `succeeded` must agree on it, as the
+        shared record is keyed by that account.
+        """
+        if account:
+            return self.readings.get(account)
+        return self.readings.get(engine) or self.latest.get(engine)
+
+    def claim_probe(self, account: str) -> None:
+        """Re-arm `account`'s probe clock: the caller is about to probe it, so concurrent calls need not."""
+        # Read the shared clears first: re-dating the limit would make a clear written since the last poll
+        # look older than the limit, and this pod would never apply it.
+        self.poll_shared(force=True)
+        if (meter := self.readings.get(account)) and meter.limited_until is not None:
+            meter.limit_noted_at = self.clock()
+            self._save()
+
+    def clear_limit(self, engine: str, account: str = "", at: float | None = None) -> bool:
+        """Drop the limit of `account` (every account of `engine` without one) noted at or before `at`.
+
+        For a call that succeeded after the limit was noted, or a person's reset: it overrides the
+        never-shorten rule of `note_limit`, and `update` will not bring the limit back from an older reading.
+        A limit noted after `at` is a newer refusal and stays. Returns whether anything was cleared.
+        """
+        at = self.clock() if at is None else at
+        targets = [m for m in self.readings.values() if m.engine == engine and account in ("", m.account)]
+        cleared = [m for m in targets if m.limited_until is not None and (m.limit_noted_at or 0.0) <= at]
+        for meter in cleared:
+            meter.limited_until = meter.limit_noted_at = None
+            meter.error = ""
+            self.cleared_at[meter.account] = max(at, self.cleared_at.get(meter.account, 0.0))
+        if cleared:
+            self.wakes[engine] = self.wakes.get(engine, 0) + 1
+            self._save()
+        return bool(cleared)
+
+    def cleared_since(self, engine: str, account: str = "", at: float | None = None) -> bool:
+        """Return whether a limit of `account` (any account of `engine` without one) was cleared since `at`.
+
+        For a report that says when its call ran: one from before the clear is stale. Without a time every
+        clear counts.
+        """
+        return any(
+            cleared and cleared >= (at if at is not None else 0.0)
+            for acct, cleared in self.cleared_at.items()
+            if (acct == account if account else acct.split()[0] == engine)
+        )
+
+    def wake(self, engine: str) -> None:
+        """Wake the calls waiting on `engine` although no limit was remembered here (a person's reset)."""
+        self.wakes[engine] = self.wakes.get(engine, 0) + 1
+
+    def wake_count(self) -> int:
+        """Return the wake generation (clears plus `wake()` calls): a waiting call is woken when it grows."""
+        return sum(self.wakes.values())
+
+    def succeeded(self, engine: str, account: str = "", at: float | None = None) -> None:
+        """Record that a call begun at `at` was answered: its account is not limited, whatever was remembered.
+
+        Clears the local limit and, if the shared record shows a limit that call proves over, tells the
+        other pods (`_limit_share`). No write when there is nothing to clear. Without `account` the shared
+        record is the one `note_limit` publishes for the engine (`_limit_meter`).
+        """
+        at = self.clock() if at is None else at
+        shared = account or ((meter := self._limit_meter(engine)) and meter.account) or engine
+        self.clear_limit(engine, account, at)
+        if self.share:
+            self.share.succeeded(engine, shared, at)
+
+    def poll_shared(self, *, force: bool = False) -> bool:
+        """Apply clears other pods (or a person) published to the limits remembered here; True if any applied.
+
+        At most once per `LIMIT_SHARE_POLL_S` unless `force`; nothing is read while no limit is remembered.
+        """
+        now = self.clock()
+        limited = [m for m in self.readings.values() if m.limited_until is not None and m.limited_until > now]
+        if not self.share or not limited or (not force and now - self._polled < self.share.poll_s):
+            return False
+        self._polled = now
+        cleared = False
+        for meter in limited:
+            at = self.share.read_cleared_at(meter.engine, meter.account)
+            if at:
+                cleared = self.clear_limit(meter.engine, meter.account, at) or cleared
+        return cleared
 
     def warnings(self, meter: Meter) -> list[str]:
         """Warnings this reading earns, each once per window."""

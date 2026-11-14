@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from flyte import remote
 
-from flyte_agent_factory import _factory_base, _meter, _profile, _queue, _router
+from flyte_agent_factory import _factory_base, _limit_share, _meter, _profile, _queue, _router
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 if TYPE_CHECKING:
@@ -41,6 +41,37 @@ def slot_meters(slots: Sequence[str]) -> dict[str, list[_meter.Meter]]:
     return found
 
 
+def clear_limit(engine: str) -> dict[str, str]:
+    """Publish a person's reset of `engine`'s usage limit to every pod (`_limit_share`)."""
+    engine = engine.strip().lower()  # `/clear-limit` ignores case too
+    if engine not in ("claude", "codex"):
+        raise ValueError(f"unknown engine {engine!r}; the engines are claude, codex")
+    uri = _factory_base.PROFILE.state.uri
+    if not uri:
+        raise ValueError("clearing a limit for every pod needs [state] uri in the deployment profile")
+    if not _limit_share.LimitShare(uri).clear_engine(engine):
+        return {
+            "engine": engine,
+            "status": "not cleared",
+            "error": "the state store could not be written, so no pod was told; check [state] uri and retry",
+        }
+    return {"engine": engine, "status": "cleared"}
+
+
+def _apply_shared_clears(found: dict[str, _meter.Meter], now: float) -> None:
+    """Drop the limit of each meter that another pod or a person has since cleared, as the pods do."""
+    uri = _factory_base.PROFILE.state.uri
+    if not uri:
+        return
+    share = _limit_share.LimitShare(uri)
+    for meter in found.values():
+        if (meter.limited_until or 0) > now and share.read_cleared_at(meter.engine, meter.account) >= (
+            meter.limit_noted_at or meter.observed_at
+        ):
+            meter.limited_until = meter.limit_noted_at = None
+            meter.error = ""
+
+
 def login_meters(
     slots: Sequence[str] | None = None,
     *,
@@ -65,10 +96,11 @@ def login_meters(
         previous = found.get(meter.account)
         if previous is None or meter.observed_at > previous.observed_at:
             if previous and (previous.limited_until or 0) > (meter.limited_until or 0):
-                meter.limited_until = previous.limited_until
+                # With when it was noted: a clear is judged against that, not the newer reading's age.
+                meter.limited_until, meter.limit_noted_at = previous.limited_until, previous.limit_noted_at
             found[meter.account] = meter
         elif (meter.limited_until or 0) > (previous.limited_until or 0):
-            previous.limited_until = meter.limited_until
+            previous.limited_until, previous.limit_noted_at = meter.limited_until, meter.limit_noted_at
 
     # `reports`: the caller's own `slot_meters` result, so the slots are not listed twice.
     by_task = {slot.task: slot for slot in _factory_base.PROFILE.slots}
@@ -101,6 +133,7 @@ def login_meters(
                     continue
         except REMOTE_ERRORS:
             pass
+    _apply_shared_clears(found, now)
     if raw:
         return found
     return {account: _meter.capacity_meter(meter, now) for account, meter in found.items()}

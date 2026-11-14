@@ -7,10 +7,18 @@ status shows the real next try while it lasts.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from flyte_agent_factory import _inbox, _reviewer, _session_config, _supervise_support, _timeline, _usage
+from flyte_agent_factory import (
+    _inbox,
+    _reviewer,
+    _router,
+    _session_config,
+    _supervise_support,
+    _timeline,
+    _usage,
+)
 
 #: What a review waits on when the usage limit deferred it; the only wait the status shows as `limited`.
 LIMIT = "the usage limit"
@@ -29,6 +37,19 @@ class ReviewWait:
     at: float | None = None
     why: str = ""
     incomplete_reruns: int = 0
+    #: What the status shows while `at` waits on the limit: the router's reset and its earlier re-check.
+    #: `at` is the earlier of the two; without them (a restored wait, a reset read from text) the status
+    #: shows `at` itself.
+    reset_at: float | None = None
+    probe_at: float | None = None
+    #: `_usage.wake_count()` when the wait began: a limit cleared since then ends a wait on the limit.
+    clears: int = field(default_factory=lambda: _usage.wake_count())
+
+    def is_due(self) -> bool:
+        """Return whether the review re-runs now: its time has come, or the limit it waits on was cleared."""
+        if self.at is None:
+            return False
+        return time.time() >= self.at or (self.why == LIMIT and _usage.wake_count() > self.clears)
 
     @classmethod
     def restore_from(cls, record: dict[str, Any] | None, workspace: object) -> ReviewWait:
@@ -52,18 +73,37 @@ class ReviewWait:
         # or a stale notice time) must not re-run three refused reviewers on every poll (qa: 84/s).
         # Past is not unknown: only a notice with no time waits LIMIT_RETRY_S (#194).
         said = _usage._reset_at(e.reset_text)
-        lifts = (
-            e.retry_at
-            or _supervise_support._parse_router_retry_at(e.reset_text, now)
-            or (now + _session_config.LIMIT_RETRY_S if said is None else said)
+        lifts = _supervise_support._parse_router_retry_at(e.reset_text, now) or (
+            now + _session_config.LIMIT_RETRY_S if said is None else said
         )
-        self.at = max(
+        # The router's own times are exact and are what the row shows, so the wait ends at the earlier of
+        # them (the status and the wait cannot disagree, #195); it asks again then, when the engine is open
+        # or a probe is due. The slack and the minimum are for the estimates only.
+        self.reset_at, self.probe_at = e.retry_at, e.probe_at
+        self.at = _router.pick_wake_time(e.retry_at, e.probe_at) or max(
             lifts + _supervise_support._REVIEW_RETRY_SLACK_S, now + _supervise_support._REVIEW_RETRY_MIN_S
         )
         self.why = LIMIT
+        # As the round began, not now: a judge's probe may have cleared the limit while the others ran, and
+        # the deferral they came back with still carries a re-check half an hour out.
+        self.clears = _usage.wake_count() if timeline.review_clears is None else timeline.review_clears
         timeline.row("⏸️", f"review waiting: {e}; it re-runs automatically after the reset")
-        timeline.phase("limited", limited_until=self.at)
+        self._show_phase(timeline)
         self.save(round_, timeline)
+
+    def read_shown_times(self) -> tuple[float | None, float | None]:
+        """Return the (reset, re-check) the status shows for a wait on the limit."""
+        if self.reset_at is None:
+            return self.at, None
+        return self.reset_at, _router.pick_recheck(self.probe_at, self.reset_at)
+
+    def _show_phase(self, timeline: _timeline._Timeline) -> None:
+        reset, probe = self.read_shown_times()
+        # `probe_at` only when there is one: most waits have none, and the phase clears it by default.
+        if probe:
+            timeline.phase("limited", limited_until=reset, probe_at=probe)
+        else:
+            timeline.phase("limited", limited_until=reset)
 
     def schedule_incomplete_rerun(
         self, e: _reviewer.ReviewUnavailable, round_: int, timeline: _timeline._Timeline
@@ -102,8 +142,10 @@ class ReviewWait:
         time, never hidden.
         """
         if self.why == LIMIT and self.at is not None and self.at > time.time():
-            if (timeline._phase["kind"], timeline._phase["limited_until"]) != ("limited", self.at):
-                timeline.phase("limited", limited_until=self.at)
+            reset, probe = self.read_shown_times()
+            phase = timeline._phase
+            if (phase["kind"], phase["limited_until"], phase.get("probe_at")) != ("limited", reset, probe):
+                self._show_phase(timeline)
 
     def describe_activity(self) -> str:
         """Return the activity line while the review waits: on what, and when it re-runs (UTC)."""

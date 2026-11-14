@@ -506,20 +506,24 @@ class _DelegationResult(TypedDict):
     plan: NotRequired[str]
     engine: NotRequired[str]
     until: NotRequired[float]  # Unix seconds, UTC (the same clock as factory.status's paused.until)
+    probe_at: NotRequired[float]  # when the wait ends early to re-check a remembered limit, before `until`
 
 
 def _format_status_line(job_id: str, result: _DelegationResult, now: float) -> str:
     """One `delegate status` line: `<id> <state>`.
 
     A waiting job names its engine and reset: `<id> waiting for <engine> until HH:MM UTC`, or
-    `... until YYYY-MM-DD HH:MM UTC` when the reset is not today (UTC, judged at `now`).
+    `... until YYYY-MM-DD HH:MM UTC` when the reset is not today (UTC, judged at `now`). An earlier
+    re-check of a remembered limit follows as `; re-check at HH:MM UTC`.
     """
     if result["state"] != "waiting" or "engine" not in result or "until" not in result:
         return f"{job_id} {result['state']}"
     until = datetime.fromtimestamp(result["until"], timezone.utc)
     today = datetime.fromtimestamp(now, timezone.utc).date()
     when = f"{until:%H:%M}" if until.date() == today else f"{until:%Y-%m-%d %H:%M}"
-    return f"{job_id} waiting for {result['engine']} until {when} UTC"
+    recheck = result.get("probe_at")
+    again = f"; re-check at {datetime.fromtimestamp(recheck, timezone.utc):%H:%M} UTC" if recheck else ""
+    return f"{job_id} waiting for {result['engine']} until {when} UTC{again}"
 
 
 def delegate_cli(argv: list[str] | None = None) -> int:

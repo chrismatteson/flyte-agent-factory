@@ -7,7 +7,7 @@ import asyncio
 import flyte
 import pytest
 
-from flyte_agent_factory import _session_config, _supervise_support, _timeline, _usage
+from flyte_agent_factory import _meter, _session_config, _supervise_support, _timeline, _usage
 from tests._wait import wait_for
 from tests.test_limit_resume import FINDINGS, WALL0, _clock, finish, rows, start, tick
 from tests.test_nudge import _Proc, _pump, _Queue
@@ -420,3 +420,88 @@ async def test_new_apparent_episode_clears_on_autonomous_output(monkeypatch):
     await tick()
     await finish(stop, pump)
     assert proc.submitted == [FINDINGS]
+
+
+# --- a single-engine session's probe (#195): no AuthorSession, so the pump itself is the router ------------
+
+MULTI_DAY = "resets Oct 22, 9am (UTC)"  # two days ahead of WALL0: the probe, not the reset, ends the wait
+PROBE_S = _meter.LIMIT_PROBE_S
+
+
+@pytest.fixture
+def store(tmp_path, monkeypatch):
+    """The pod's meters, on the fake wall clock `_clock` installs; a Claude setup-token is configured."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-test")
+    monkeypatch.setattr(_session_config, "_token_meter_account", "")
+    meters = _meter.MeterStore(tmp_path / "meters", clock=lambda: vars(_usage)["time"].time())
+    monkeypatch.setattr(_usage, "_meters", meters)
+    return meters
+
+
+async def limited_single_engine_session(monkeypatch, store):
+    """Run a plain-process session into a two-day limit; return its pieces and the meter's account."""
+    now = _clock(monkeypatch, WALL0)
+    proc = _LimitProc()
+    bridge, tl, stop, pump = await start(proc)
+    await proc.submit(FINDINGS)
+    now["t"] += 33
+    proc.notice(MULTI_DAY, now["t"])
+    proc.last_output = now["t"] - 120
+    await wait_for(lambda: rows(tl, "usage limit reached"))
+    return now, proc, tl, stop, pump, _usage._limit_account("claude")
+
+
+async def refuse_the_probe(now, proc, tl, store, account):
+    """Let the pump resume as the probe at noted + 30 min, then refuse that carry-on."""
+    noted = store.readings[account].limit_noted_at
+    now["t"] += PROBE_S + 1
+    await wait_for(lambda: len(proc.submitted) == 2, what="the probe's resume")
+    now["t"] += 1
+    proc.notice(MULTI_DAY, now["t"])  # the carry-on is refused: a new hit, the same notice
+    proc.last_output = now["t"]
+    await tick(0.1)
+    return noted
+
+
+@pytest.mark.asyncio
+async def test_a_single_engine_session_claims_the_probe_and_re_arms_it_when_refused(monkeypatch, store):
+    now, proc, tl, stop, pump, account = await limited_single_engine_session(monkeypatch, store)
+    noted = store.readings[account].limit_noted_at
+    assert tl._phase["probe_at"] == noted + PROBE_S
+
+    now["t"] += PROBE_S + 1
+    await wait_for(lambda: len(proc.submitted) == 2, what="the probe's resume")
+    # The resume is the pod's one probe: another caller (a judge, a delegate) is no longer sent as one.
+    assert store.readings[account].limit_noted_at > noted
+    assert _usage.read_limit_times("claude")[1] is not None, (
+        "the limit is waiting again, not due a second probe"
+    )
+    wall = vars(_usage)["time"].time()
+    assert tl._phase["probe_at"] is None or tl._phase["probe_at"] > wall, "no re-check time in the past"
+
+    now["t"] += 1
+    proc.notice(MULTI_DAY, now["t"])
+    proc.last_output = now["t"]
+    await tick(0.1)
+    renoted = store.readings[account].limit_noted_at
+    assert renoted == vars(_usage)["time"].time() or renoted > noted, "the refusal re-notes the limit"
+    assert tl._phase["probe_at"] == renoted + PROBE_S, "and the session re-checks 30 minutes after it"
+
+    now["t"] += PROBE_S + 1
+    await wait_for(lambda: len(proc.submitted) == 3, what="the second probe, long before the reset")
+    await finish(stop, pump)
+
+
+@pytest.mark.asyncio
+async def test_redraws_after_a_refused_probe_do_not_clear_the_limit(monkeypatch, store):
+    now, proc, tl, stop, pump, account = await limited_single_engine_session(monkeypatch, store)
+    await refuse_the_probe(now, proc, tl, store, account)
+    for _ in range(8):  # the TUI redrawing, as `test_live_timeline` has it: nothing ends the pause
+        now["t"] += 120
+        proc.output_count += 5000
+        proc.last_output = now["t"]
+        await tick()
+    assert not rows(tl, "running again")
+    assert store.readings[account].limited_until is not None
+    assert store.wake_count() == 0
+    await finish(stop, pump)

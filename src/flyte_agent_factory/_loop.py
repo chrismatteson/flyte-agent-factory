@@ -350,7 +350,7 @@ def budget(
         return Budget("wait", "cap-weekly", max(resets))
     decision = _router.route("loop", meters, available=tuple(meters), now=now)
     if decision.deferred:
-        return Budget("wait", "router-deferred", decision.retry_at)
+        return Budget("wait", "router-deferred", _router.pick_wake_time(decision.retry_at, decision.probe_at))
     if owner_demand:
         usable = [c for c in decision.candidates if c.engine in meters and c.state != "exhausted"]
         if not any(c.headroom is not None and c.headroom > owner_floor_pct for c in usable):
