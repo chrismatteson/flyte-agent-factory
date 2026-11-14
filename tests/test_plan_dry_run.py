@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import flyte
+
 from flyte_agent_factory import _meter, _planner
 
 OPS = Path(__file__).resolve().parents[1] / "ops"
@@ -15,7 +17,6 @@ spec = importlib.util.spec_from_file_location("ops_plan_dry_run", OPS / "plan_dr
 assert spec is not None and spec.loader is not None
 plan_dry_run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plan_dry_run)
-_factory = plan_dry_run._factory
 _factory_base = plan_dry_run._factory_base
 
 NOW = 1_800_000_000.0
@@ -63,7 +64,7 @@ def test_the_dry_run_prints_the_proposal_as_json_and_submits_nothing(monkeypatch
         capacity=(_planner.Capacity("claude", "login"), _planner.Capacity("gemini", "odd")),
         now=NOW,
     )
-    monkeypatch.setattr(_factory.flyte, "with_runcontext", lambda **kw: 1 / 0)  # any submission fails
+    monkeypatch.setattr(flyte, "with_runcontext", lambda **kw: 1 / 0)  # any submission fails
     plan_dry_run.main([], read=lambda profile: facts)
     out = json.loads(capsys.readouterr().out)
     assert [(x["item"], x["engine"], x["predicted_files"]) for x in out["launches"]] == [

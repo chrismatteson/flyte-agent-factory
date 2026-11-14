@@ -405,7 +405,10 @@ def test_sync_environment_only_mounts_pat(tmp_path):
     code = """
 from flyte_agent_factory import _reconcile
 assert _reconcile.env.name == "factory-reconcile"
-assert [(s.key, s.as_env_var) for s in _reconcile.env.secrets] == [("github_board_pat", "GITHUB_BOARD_PAT")]
+assert [(s.key, s.as_env_var) for s in _reconcile.env.secrets] == [
+    ("github_board_pat", "GITHUB_BOARD_PAT"),
+    ("factory-project-key", "AGENT_FACTORY_UNION_KEY"),
+]
 assert _reconcile.env.interruptible is True
 (trigger,) = _reconcile.reconcile.triggers
 assert trigger.automation.interval_minutes == 60
@@ -743,7 +746,7 @@ def test_write_denied_or_failing_is_retried_not_dropped(mocked_board, monkeypatc
 
 FACTORY_CHILD_STUB = """
 import atexit, json, flyte
-flyte.init_from_api_key = lambda **kwargs: None
+flyte.init_from_config = lambda *args, **kwargs: None
 names = []
 
 
@@ -788,7 +791,7 @@ def test_factory_child_deploys_the_optional_envs(tmp_path, webhook, maintainers,
     profile = _profile.parse(text, "work+deployer")
     src = Path(_deploy.__file__).resolve().parents[1]
     env = _profile.child_env(profile, dict(os.environ))
-    env.update(PYTHONPATH=str(src), _UNION_EAGER_API_KEY="unused")
+    env.update(PYTHONPATH=str(src))
     result = subprocess.run(
         [sys.executable, "-c", FACTORY_CHILD_STUB + _deploy.FACTORY_CHILD, str(src), "1", "p", "d"],
         env=env,

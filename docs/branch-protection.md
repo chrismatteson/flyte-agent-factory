@@ -49,7 +49,9 @@ answers 403. Pick one:
 3. Bypass list: leave it empty (strict) or add only the people allowed to merge without a verdict.
 4. Target branches → Add target → **Include default branch**.
 5. Enable **Require status checks to pass**. Add the check `factory/verifier` and set its source to the factory's
-   App, not "any source"; anyone with write access can otherwise post a passing status by hand.
+   App, not "any source"; anyone with write access can otherwise post a passing status by hand. Even so the
+   status is **advisory until the isolation canary reports `isolated`** ([github-app.md](github-app.md)): while
+   a session can reach the App key it could post the status itself, so the human merge remains the gate.
 6. Leave "Require branches to be up to date before merging" off. With it on, every passed pull request blocks as
    soon as the default branch moves: updating the branch makes a new head commit the factory has not reviewed, and
    it is reviewed again only on the project's next DONE. The cost of leaving it off is that the merge result itself

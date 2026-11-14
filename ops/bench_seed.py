@@ -9,8 +9,13 @@ from __future__ import annotations
 import argparse
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import in
+# main fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 #: Each task's start directory under tests/fixtures/bench/, by task id.
 STARTS = {

@@ -25,6 +25,7 @@ class App:
         self.files = [{"filename": "src/flyte_agent_factory/_dashboard.py"}]
         self.review = "success"
         self.health = "ok"
+        self.scopes = []  # the permissions each `_app` was made with
 
     def app_login(self):
         return "factory[bot]"
@@ -60,6 +61,7 @@ class App:
         next(comment for comment in self.posted if comment["id"] == comment_id)["body"] = body
 
     def merge_pull(self, repo, number, sha):
+        assert self.scopes[-1].get("contents") == "write", "a merge needs a contents: write token"
         self.merges.append(sha)
         self.state = "closed"
         return {"merged": True}
@@ -80,7 +82,12 @@ def world(monkeypatch):
         loop=_profile.Loop(enabled=True, repo="acme/factory", merge="on"),
     )
     monkeypatch.setattr(_loop_flow, "PROFILE", profile)
-    monkeypatch.setattr(_loop_flow, "_app", lambda: app)
+
+    def make_app(permissions):
+        app.scopes.append(dict(permissions))
+        return app
+
+    monkeypatch.setattr(_loop_flow, "_app", make_app)
     monkeypatch.setattr(_loop, "killed", lambda *args: False)
     monkeypatch.setattr(_loop, "loop_pull", lambda *args: True)
     monkeypatch.setattr(_loop_flow, "_admission", lambda app: _loop.Budget("run"))
@@ -110,6 +117,26 @@ def test_merge_and_repeat(world):
     assert run() == "merge"
     run()
     assert len(app.posted) == len(app.merges) == len(calls) == 1
+
+
+def test_only_the_merge_asks_for_contents_write(world, monkeypatch):
+    app, _ = world
+    assert run() == "merge"
+    review, merge = app.scopes
+    assert review == {
+        "pull_requests": "write",
+        "issues": "write",
+        "contents": "read",
+        "statuses": "read",
+        "checks": "read",
+    }
+    assert merge == {"contents": "write", "pull_requests": "write"}  # no workflows unless the profile says so
+    monkeypatch.setattr(
+        _loop_flow,
+        "PROFILE",
+        replace(_loop_flow.PROFILE, github=replace(_loop_flow.PROFILE.github, workflows=True)),
+    )
+    assert _loop_flow._merge_scope_for_pr()["workflows"] == "write"
 
 
 @pytest.mark.parametrize("changed", ["head", "main"])
@@ -483,7 +510,9 @@ def test_an_inconclusive_head_is_not_benchmarked_again(world, monkeypatch):
 
 async def test_backlog_disabled_never_reads_sources(monkeypatch):
     monkeypatch.setattr(_loop_flow, "PROFILE", replace(_loop_flow.PROFILE, loop=_profile.Loop()))
-    monkeypatch.setattr(_loop_flow, "_app", lambda: pytest.fail("disabled loop must not read credentials"))
+    monkeypatch.setattr(
+        _loop_flow, "_app", lambda permissions: pytest.fail("disabled loop must not read credentials")
+    )
     assert await _loop_flow.generate_backlog.func() == "skip"
 
 

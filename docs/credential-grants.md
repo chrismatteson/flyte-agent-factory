@@ -24,7 +24,7 @@ use is AWS access for installing and testing a Marketplace offering in your own 
 | give one it did not ask for, or refresh one | `factory.credential_link(name=<project>, credential=<name>, hours=<n>)`, open the link, paste the sealed text into the project's `direct-` inbox |
 | revoke | send `/revoke-credential <name>` (or `/revoke-credential` for all) to the project's `direct-` inbox |
 | see who holds what, until when | `factory.credentials` (every live project) or `factory.status` (one) |
-| seal without a browser | `python -m flyte_agent_factory._grants seal --link '<link>'` (reads the credential without echo) |
+| seal without a browser | `PYTHONPATH=src uv run python -m flyte_agent_factory._grants seal --link '<link>'` in the engine checkout (reads the credential without echo) |
 
 ## Which credential to give (blast radius)
 

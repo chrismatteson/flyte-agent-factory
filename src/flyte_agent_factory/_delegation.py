@@ -18,7 +18,7 @@ from typing import Any, Protocol, TypedDict, cast
 
 import flyte
 
-from . import _pins, _policy, _secret_env, _session_config, _usage, child
+from . import _pins, _policy, _secret_env, _session_config, _union_identity, _usage, child
 from ._bridge import ANSWERS, REQUESTS, _write_atomic, redact_tokens
 from ._bridge import PARTIAL_PATCH as PARTIAL_PATCH  # re-exported: workers and agent read it here
 from ._bridge import PLAN as PLAN
@@ -512,7 +512,10 @@ class Delegations:
                         job / "action.json", {"name": name, "run_name": _run_name(), "engine": engine}
                     )
 
-                with child.track_submissions(record_action):
+                with (
+                    _union_identity.denied("submitting a delegated worker"),
+                    child.track_submissions(record_action),
+                ):
                     summary = await (
                         self.worker(target, brief, engine, answer_only=True, on_engine=on_engine)
                         if answer_only

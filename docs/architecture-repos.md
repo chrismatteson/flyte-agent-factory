@@ -46,9 +46,10 @@ The scope check judges writes against the project's directory. The code and the 
 ### Credentials
 
 `[secrets] deploy_key` is the deploy key of the `[repo] project` repository. `[repo_keys]` adds one deploy key per
-further `[repo]` entry. Every slot mounts all of them, but a session installs only the key of the repository it was
-launched on and the rest are dropped from its environment, so a session holds one key and can push only to that
-repository.
+further `[repo]` entry where the GitHub App is not installed. A repository the App is installed on is read with a
+contents-read installation token the supervisor mints, so no key is made by hand. Every slot mounts all of them, but
+a session installs only the key of the repository it was launched on and the rest are dropped from its environment,
+so a session holds one key and can push only to that repository.
 
 A session's checkout also carries a `pre-push` hook (`_push_guard.install`) that refuses a push to any URL other than
 the launch repository's. It checks the URL only, not the branch. The key is the limit; the hook catches mistakes

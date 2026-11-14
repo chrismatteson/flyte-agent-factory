@@ -144,7 +144,8 @@ def test_child_deploys_only_factory_and_prints_public_endpoint(monkeypatch, caps
 
     root = Path(__file__).resolve().parents[1] / "src"
     got: dict[str, Any] = {}
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "operator-key")
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kw: got.update(init=kw))
     handle = SimpleNamespace(watch=lambda **kw: SimpleNamespace(endpoint="https://public.example"))
     deployed = SimpleNamespace(get_name=lambda: "factory-mcp", deployed_app=handle)
@@ -224,7 +225,8 @@ def test_child_includes_configured_webhook(monkeypatch, capsys):
     monkeypatch.setattr(_profile, "require", lambda: profile)
     monkeypatch.setattr(_deployer, "PROFILE", profile)
     root = Path(__file__).resolve().parents[1] / "src"
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "operator-key")
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kwargs: None)
     got = {}
 
@@ -255,7 +257,8 @@ def test_child_prints_the_webhook_url_without_waiting_for_the_app(monkeypatch, c
     monkeypatch.setattr(_profile, "require", lambda: profile)
     monkeypatch.setattr(_deployer, "PROFILE", profile)
     root = Path(__file__).resolve().parents[1] / "src"
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "operator-key")
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kwargs: None)
     # Waiting for activation could hang the deploy on an app whose secret does not exist yet.
     app = SimpleNamespace(endpoint=endpoint, watch=lambda **kw: pytest.fail("must not wait for the webhook"))
@@ -290,7 +293,8 @@ def test_loop_environment_is_registered_only_when_enabled(monkeypatch, enabled):
     monkeypatch.setattr(_deployer, "PROFILE", profile)
     monkeypatch.setattr(_profile, "require", lambda: profile)
     names: set[str] = set()
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "operator-key")
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kwargs: None)
 
     def deploy_envs(*envs, **kwargs):
@@ -312,3 +316,15 @@ def test_planner_deploy_is_blocked_before_any_child_runs(monkeypatch):
     monkeypatch.setattr(_deploy, "_run_child", lambda *a, **kw: pytest.fail("cutover must be refused"))
     with pytest.raises(_deploy.Refused, match="stop-before-start"):
         _deploy.deploy_factory(profile, Path("."), project="test", domain="test", env={})
+
+
+@pytest.mark.parametrize("script", ["SLOTS_CHILD", "FACTORY_CHILD", "APPS_CHILD"])
+def test_deploy_child_scripts_use_init_for_script_and_never_name_the_injected_key(script):
+    from flyte_agent_factory import _deploy
+
+    text = getattr(_deploy, script)
+    assert "EAGER" not in text and "init_from_api_key" not in text
+    assert (
+        'init_for_script(_profile.require(), key_env=os.environ.get("AGENT_FACTORY_DEPLOY_KEY_ENV", "")'
+        in text
+    )

@@ -13,8 +13,13 @@ import asyncio
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from flyte_agent_factory import _meter
 

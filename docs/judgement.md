@@ -132,7 +132,7 @@ user's answer verbatim.
 To check the judge against questions seen in practice, record each as a fixture and replay it:
 
 ```bash
-python -m flyte_agent_factory._judgement replay <fixture.json> [...] [--model M] [--engine claude|delegate]
+PYTHONPATH=src uv run python -m flyte_agent_factory._judgement replay <fixture.json> [...] [--model M] [--engine claude|delegate]
 ```
 
 ```json

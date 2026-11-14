@@ -403,10 +403,11 @@ The profile lives in the workspace repo as `profile.toml`. The deployer validate
 the running deployer and the engine version being deployed. So a new key goes in only after the engine pull request
 adding it is deployed, and a retired key leaves the profile first. After any merge or profile edit, check the newest
 `factory-deployer.deploy_if_changed` run and its logs. A push to the direction repo triggers a tick through the
-webhook. The deployer refuses to change its own `[direction]`, so moving onto it or changing it needs one local deploy
-run with the bootstrap's `--redeploy` command ([references/setup.md](references/setup.md), First deploy), never
-through the factory. Run it yourself on the person's word where you have a shell holding their deploy credentials;
-otherwise say that, and give them the command with their values filled in.
+webhook. Moving onto `[direction]` needs one local deploy run with the bootstrap's `--redeploy` command
+([references/setup.md](references/setup.md), First deploy), never through the factory. Run it yourself on the person's
+word where you have a shell holding their deploy credentials; otherwise say that, and give them the command with their
+values filled in. Moving `[direction]` to another repository is a commit: first commit the new location to the new
+repo's profile (naming itself), then change `[direction]` in the old repo's profile; the deployer verifies both and moves.
 
 ## Related commands
 

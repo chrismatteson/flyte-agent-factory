@@ -42,10 +42,10 @@ from typing import TYPE_CHECKING
 
 # Keep runtime imports usable when deployment tools load this file by path.
 if TYPE_CHECKING:
-    from . import _profile, _standards
+    from . import _profile, _standards, _union_identity
     from ._errors import REMOTE_ERRORS
 else:
-    from flyte_agent_factory import _profile, _standards
+    from flyte_agent_factory import _profile, _standards, _union_identity
     from flyte_agent_factory._errors import REMOTE_ERRORS
 
 if TYPE_CHECKING:
@@ -123,11 +123,13 @@ DEPLOY_REPORT_ENV = "AGENT_FACTORY_DEPLOY_REPORT"
 STANDARDS_REPORT_ENV = "AGENT_FACTORY_STANDARDS_REPORT"
 
 # The start of each child below. Each child refuses to deploy a copy of the package from anywhere but
-# `root`, with an explicit check: an assert would vanish under PYTHONOPTIMIZE.
+# `root`, with an explicit check: an assert would vanish under PYTHONOPTIMIZE. `root` is resolved because
+# the child runs from it (`_run_child`'s cwd), so its modules carry the resolved path (`getcwd()`); a root
+# spelt through a symlink (macOS's /var -> /private/var) fails the code bundler's `relative_to`.
 _CHILD_START = f"""
 import os, sys, flyte
 from pathlib import Path
-root = Path(sys.argv[1])
+root = Path(sys.argv[1]).resolve()
 dry = sys.argv[2] == "1"
 report = os.environ.get("{DEPLOY_REPORT_ENV}")
 
@@ -144,13 +146,53 @@ def record(deployments):
                 out.writelines(f"{{deployed.get_name()}}\\n" for deployed in deployment.envs.values())
 """
 
+#: Names the variable a deploy child reads its key from (`_union_identity.init_for_script`'s `key_env`). The
+#: deployer sets it to `_union_identity.KEY_ENV`; on a laptop it is unset, and the child uses the person's
+#: CLI login. Defined here, not there: the slot bundle carries only what the agent imports.
+DEPLOY_KEY_ENV = "AGENT_FACTORY_DEPLOY_KEY_ENV"
+
+
+def strip_hand_deploy_keys(base: Mapping[str, str]) -> dict[str, str]:
+    """Return `base` for a deploy a person runs (the ops scripts, the guided setup): no key in it is used.
+
+    Such a deploy acts as the person's own CLI login (`_INIT` without `DEPLOY_KEY_ENV`). A shell that
+    carries a stray `DEPLOY_KEY_ENV` would point it at a key variable that is not set (`IdentityMissing`),
+    and the key Union injects into pods (`_union_identity.INJECTED_VARS`) is never anyone's login, so
+    both are left out. The deployer sets `DEPLOY_KEY_ENV` on purpose and does not come through here.
+    """
+    dropped = (*_union_identity.INJECTED_VARS, DEPLOY_KEY_ENV)
+    return {k: v for k, v in base.items() if k not in dropped}
+
+
+#: How `_run_child` hands a deploy child its `deployer_env` (JSON). `_run_child` always replaces it, so a
+#: value a shell happens to carry never reaches `_profile.pod_env`.
+DEPLOYER_ENV = "AGENT_FACTORY_DEPLOYER_ENV"
+# Before any environment is defined: `_profile.pod_env` adds these to every one.
+_TAKE_DEPLOYER_ENV = f"""
+import json
+from flyte_agent_factory import _profile
+_profile.set_deployer_env(json.loads(os.environ.pop("{DEPLOYER_ENV}", "{{}}")))
+"""
+
+# Every child initialises the SDK the same way: as the deployer's key inside the deployer (which sets
+# `DEPLOY_KEY_ENV`), as the user's CLI login on a laptop. Never the key Union injects into the pod.
+_INIT = (
+    _TAKE_DEPLOYER_ENV
+    + f"""
+from flyte_agent_factory._union_identity import init_for_script
+init_for_script(_profile.require(), key_env=os.environ.get("{DEPLOY_KEY_ENV}", ""),
+    project=sys.argv[3], domain=sys.argv[4], root_dir=root, image_builder="remote")
+"""
+)
+
 # Runs in a subprocess so the recipe's env vars are set before `agent` is imported
 # (TaskEnvironments read them at import) and never leak into this process.
 SLOTS_CHILD = (
     _CHILD_START
     + """
-flyte.init_from_api_key(api_key=os.environ["_UNION_EAGER_API_KEY"], project=sys.argv[3],
-                        domain=sys.argv[4], root_dir=root, image_builder="remote")
+"""
+    + _INIT
+    + """
 import subprocess
 # The code bundle omits .git. Capture provenance from the pinned checkout before deployment.
 revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -171,8 +213,9 @@ record(deployments)
 FACTORY_CHILD = (
     _CHILD_START
     + """
-flyte.init_from_api_key(api_key=os.environ["_UNION_EAGER_API_KEY"], project=sys.argv[3],
-                        domain=sys.argv[4], root_dir=root, image_builder="remote")
+"""
+    + _INIT
+    + """
 from flyte_agent_factory._deploy import check_environments
 from flyte_agent_factory import _deployer, _factory, _factory_mcp
 for module in (_factory, _factory_mcp, _deployer):
@@ -243,8 +286,9 @@ if enabled:
             "this deployer's image lacks the kubernetes package, which serializing the personal browser "
             "needs; the deployer deployed by this release carries it and will retry"
         )
-flyte.init_from_api_key(api_key=os.environ["_UNION_EAGER_API_KEY"], project=sys.argv[3],
-                        domain=sys.argv[4], root_dir=root, image_builder="remote")
+"""
+    + _INIT
+    + """
 from flyte_agent_factory import _deploy_apps
 from_root(_deploy_apps)
 # A known app the profile does not enable is stopped, not deleted: its archive stays for a re-enable. Before
@@ -437,15 +481,20 @@ def _run_child(
     *args: str,
     dry_run: bool,
     stderr_tail: list[str] | None = None,
+    deployer_env: Mapping[str, str] | None = None,
 ) -> int:
     """Run a deploy child script; its exit code. Its stdout goes to ours.
 
     Its stderr is passed through to ours as it is written, and its last `STDERR_TAIL_LINES` lines are
-    added to `stderr_tail`: the exit code alone says "failed", the tail says why.
+    added to `stderr_tail`: the exit code alone says "failed", the tail says why. `deployer_env` is what
+    the deployed environments get of `_profile.DEPLOYER_ONLY_ENV`; only the deployer's path passes it.
     """
     # The tree has no `profiles/` of its own (real profiles are untracked), so the child gets the text.
     env = _profile.child_env(profile, env)
     env["PYTHONPATH"] = str(src)
+    env.pop(DEPLOYER_ENV, None)
+    if deployer_env:
+        env[DEPLOYER_ENV] = json.dumps(dict(deployer_env))
     tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
     read_fd, write_fd = os.pipe()
 
@@ -671,6 +720,7 @@ def deploy_slots(
     dry_run: bool = False,
     base_env: Mapping[str, str] | None = None,
     stderr_tail: list[str] | None = None,
+    deployer_env: Mapping[str, str] | None = None,
 ) -> int:
     """Deploy each slot and its sub-agent env from `src`; the first non-zero exit code, else 0.
 
@@ -685,7 +735,16 @@ def deploy_slots(
         names = ",".join(sorted({slot, slot_table(profile)[slot], SETUP_ENV}))
         print(f"deploying {slot} from {ref}{' [dry run]' if dry_run else ''}", flush=True)
         code = _run_child(
-            profile, SLOTS_CHILD, src, env, project, domain, names, dry_run=dry_run, stderr_tail=stderr_tail
+            profile,
+            SLOTS_CHILD,
+            src,
+            env,
+            project,
+            domain,
+            names,
+            dry_run=dry_run,
+            stderr_tail=stderr_tail,
+            deployer_env=deployer_env,
         )
         rc = rc or code
     return rc
@@ -700,6 +759,7 @@ def deploy_factory(
     env: dict[str, str],
     dry_run: bool = False,
     stderr_tail: list[str] | None = None,
+    deployer_env: Mapping[str, str] | None = None,
 ) -> int:
     """Deploy the profile's `factory_envs` from `src`; the child's exit code."""
     try:
@@ -707,7 +767,15 @@ def deploy_factory(
     except _profile.ProfileError as exc:
         raise Refused(str(exc)) from exc
     return _run_child(
-        profile, FACTORY_CHILD, src, env, project, domain, dry_run=dry_run, stderr_tail=stderr_tail
+        profile,
+        FACTORY_CHILD,
+        src,
+        env,
+        project,
+        domain,
+        dry_run=dry_run,
+        stderr_tail=stderr_tail,
+        deployer_env=deployer_env,
     )
 
 
@@ -720,6 +788,7 @@ def deploy_apps(
     env: dict[str, str],
     dry_run: bool = False,
     stderr_tail: list[str] | None = None,
+    deployer_env: Mapping[str, str] | None = None,
 ) -> int:
     """Deploy the apps the profile enables and stop the known ones it does not; the child's exit code.
 
@@ -727,7 +796,15 @@ def deploy_apps(
     for an earlier profile is stopped there.
     """
     return _run_child(
-        profile, APPS_CHILD, src, env, project, domain, dry_run=dry_run, stderr_tail=stderr_tail
+        profile,
+        APPS_CHILD,
+        src,
+        env,
+        project,
+        domain,
+        dry_run=dry_run,
+        stderr_tail=stderr_tail,
+        deployer_env=deployer_env,
     )
 
 
@@ -735,7 +812,8 @@ def deploy_apps(
 def worktree(repo: Path, sha: str, prefix: str) -> Iterator[Path]:
     """Return a detached worktree of `repo` at `sha`, removed afterwards; local edits never ship."""
     with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
-        tree = Path(tmp) / "tree"
+        # Resolved: the deploy child imports from it by its resolved path (see `_CHILD_START`).
+        tree = Path(tmp).resolve() / "tree"
         subprocess.run(
             ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(tree), sha], check=True
         )
@@ -770,7 +848,7 @@ def fetched_tree(url: str, sha: str) -> Iterator[Path]:
     nowhere in the error raised, which is redacted.
     """
     with tempfile.TemporaryDirectory(prefix="deploy-fetch-") as tmp:
-        tree = Path(tmp) / "tree"
+        tree = Path(tmp).resolve() / "tree"  # as in `worktree`
         tree.mkdir()
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         for argv in (

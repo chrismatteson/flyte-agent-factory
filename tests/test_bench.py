@@ -38,6 +38,10 @@ endpoint = "union.example.org"
 project = "proj"
 domain = "development"
 
+[union]
+project_key = "factory-project-key"
+deployer_key = "factory-deployer-key"
+
 [repo]
 project = "git@github.com:example-org/sandbox.git"
 factory = "git@github.com:example-org/factory.git"

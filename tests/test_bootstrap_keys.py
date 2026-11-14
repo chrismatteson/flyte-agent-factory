@@ -1,4 +1,4 @@
-"""`--chat-key` and `--deploy-key`, against fakes: the grant, the hand-over, and that no secret is printed."""
+"""`--chat-key` and `--union-keys`, against fakes: the grant, the hand-over, and that no secret is printed."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from connectrpc.errors import ConnectError
 
 from flyte_agent_factory import _bootstrap, _bootstrap_flyte
 from flyte_agent_factory._bootstrap_base import (
-    API_KEY_REQUIREMENT,
+    KEY_PLUGIN_REQUIREMENT,
     AccessDenied,
     BootstrapError,
     KeyExists,
@@ -94,21 +94,70 @@ def test_an_existing_chat_key_is_never_deleted_silently(world, capsys):
     assert world.union_keys == {"factory-chat": "client-old"} and world.assignments == []
 
 
-def test_deploy_key_is_written_to_the_terminal_only(world, capsys):
-    code, out = key_run(world, "--deploy-key", capsys)
+PROJECT_SECRET, DEPLOYER_SECRET = "agent_factory_union_project_key", "agent_factory_union_deployer_key"
+GRANTED_BINDING = [("contributor", "my-agents", "staging")]
+
+
+def test_union_keys_stores_each_key_as_a_secret_and_prints_only_client_ids(world, capsys):
+    code, out = key_run(world, "--union-keys", capsys)
     assert code == 0, out
-    assert world.policies == {"factory-deploy": [("contributor", "my-agents", "staging")]}
-    assert world.assignments == [("client-factory-deploy", "factory-deploy")]
-    [shown] = world.tty
-    assert KEY_SECRET in shown and "password manager" in shown and "_UNION_EAGER_API_KEY" in shown
-    assert world.commands == []
+    assert world.secrets == {PROJECT_SECRET: KEY_SECRET, DEPLOYER_SECRET: KEY_SECRET}
+    assert world.policies == {"factory-project": GRANTED_BINDING, "factory-deployer": GRANTED_BINDING}
+    assert sorted(world.assignments) == [
+        ("client-factory-deployer", "factory-deployer"),
+        ("client-factory-project", "factory-project"),
+    ]
+    assert world.tty == [] and world.commands == [], "the key goes to the secret store, nowhere else"
+    [line] = out
+    assert line.startswith("[done] union-keys") and "client client-factory-project" in line
+    assert PROJECT_SECRET in line and DEPLOYER_SECRET in line
 
 
-def test_a_key_that_cannot_be_shown_is_deleted_rather_than_lost(world, capsys):
-    world.tty = None
-    code, out = key_run(world, "--deploy-key", capsys)
-    assert code == 3 and "no terminal" in out[0]
-    assert world.union_keys == {}
+def test_union_keys_runs_only_its_own_step_after_the_sign_in(world, capsys):
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 0 and [line.split(":")[0] for line in out] == ["[done] union-keys"]
+    assert world.events[:2] == ["create_config", "sign_in"] or "sign_in" in world.events
+    assert not any(e.startswith(("create_project", "create_repo", "deploy")) for e in world.events)
+
+
+def test_a_rerun_of_union_keys_makes_no_second_key(world, capsys):
+    assert key_run(world, "--union-keys", capsys)[0] == 0
+    before = list(world.events)
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 0 and world.events == before and out[0].startswith("[skip] union-keys")
+
+
+def test_union_keys_status_changes_nothing(world, capsys):
+    world.signed_in = True
+    code, out = key_run(world, "--union-keys", capsys, extra=["--status"])
+    assert code == 3 and out[0].startswith("[todo] union-keys") and world.events == []
+
+
+def test_a_key_that_cannot_be_stored_is_deleted_rather_than_lost(world, capsys):
+    world.secret_error = PROJECT_SECRET
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 3 and out[0].startswith("[blocked] union-keys") and "creating secret" in out[0]
+    assert world.union_keys == {} and world.secrets == {}
+
+
+def test_a_profile_that_names_other_secrets_has_its_names_used(world, capsys):
+    clone = world.root / "clone"
+    clone.mkdir()
+    (clone / "profile.toml").write_text(
+        '[union]\nproject_key = "my-project-key"\ndeployer_key = "my-deploy-key"\n'
+    )
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 0, out
+    assert set(world.secrets) == {"my-project-key", "my-deploy-key"}
+
+
+def test_one_secret_for_both_tiers_makes_one_key(world, capsys):
+    clone = world.root / "clone"
+    clone.mkdir()
+    (clone / "profile.toml").write_text('[union]\nproject_key = "shared-key"\ndeployer_key = "shared-key"\n')
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 0, out
+    assert set(world.secrets) == {"shared-key"} and list(world.union_keys) == ["factory-project"]
 
 
 def test_a_failed_assignment_deletes_the_unused_key(world, capsys):
@@ -135,14 +184,46 @@ def assert_one_grant_command(out, policy, client_id):
     assert out[-1].endswith(grant)
 
 
+def test_a_refused_assignment_keeps_the_stored_keys_and_prints_the_admins_grant_commands(world, capsys):
+    world.assign_denied = True
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 3 and out[0].startswith("[todo] union-keys"), out
+    assert world.secrets == {PROJECT_SECRET: KEY_SECRET, DEPLOYER_SECRET: KEY_SECRET}, "the keys are stored"
+    assert world.assignments == []
+    text = "\n".join(out)
+    for policy in ("factory-project", "factory-deployer"):
+        grant = build_command(RUN_SETTINGS, f"--grant {policy} client-{policy}")
+        assert text.count(grant) == 2, "once in the step's line and once in `next:`"
+        assert_filled_in(grant)
+
+
+def test_deploy_key_is_written_to_the_terminal_only(world, capsys):
+    """The deploy key's successor, the deployer tier key, goes to its named secret and nowhere else.
+
+    It needs no terminal: with none, `--union-keys` still stores both keys and prints only client ids.
+    """
+    world.tty = None
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 0, out
+    assert world.secrets[DEPLOYER_SECRET] == KEY_SECRET and world.commands == []
+    assert "_UNION_EAGER_API_KEY" not in "\n".join(out)
+
+
+def test_a_key_that_cannot_be_shown_is_deleted_rather_than_lost(world, capsys):
+    world.tty = None
+    code, out = key_run(world, "--chat-key", capsys, claude=False)
+    assert code == 3 and "no terminal" in out[0]
+    assert world.union_keys == {}, "the key no one could see is deleted"
+
+
 def test_a_refused_assignment_keeps_the_shown_key_and_prints_the_admins_grant_command(world, capsys):
     world.assign_denied = True
-    code, out = key_run(world, "--deploy-key", capsys)
-    assert code == 3 and out[0].startswith("[todo] deploy-key"), out
+    code, out = key_run(world, "--chat-key", capsys, claude=False)
+    assert code == 3 and out[0].startswith("[todo] chat-key"), out
     [shown] = world.tty
     assert KEY_SECRET in shown, "the person holds the key; only its grant is left to the admin"
-    assert world.union_keys == {"factory-deploy": "client-factory-deploy"} and world.assignments == []
-    assert_one_grant_command(out, "factory-deploy", "client-factory-deploy")
+    assert world.union_keys == {"factory-chat": "client-factory-chat"} and world.assignments == []
+    assert_one_grant_command(out, "factory-chat", "client-factory-chat")
 
 
 def test_a_refused_policy_still_connects_the_key_and_prints_the_admins_grant_command(world, capsys):
@@ -158,26 +239,26 @@ def test_a_refused_policy_still_connects_the_key_and_prints_the_admins_grant_com
 
 def test_a_refused_grant_with_no_terminal_deletes_the_key_and_prints_no_grant_command(world, capsys):
     world.policy_denied, world.tty = True, None
-    code, out = key_run(world, "--deploy-key", capsys)
+    code, out = key_run(world, "--chat-key", capsys, claude=False)
     assert code == 3 and "no terminal" in out[0]
     assert world.union_keys == {} and "--grant" not in "\n".join(out)
 
 
 def test_the_admins_grant_command_grants_that_key_and_makes_none(world, capsys):
     out: list[str] = []
-    argv = [*ARGS, "--grant", "factory-deploy", "client-factory-deploy"]
+    argv = [*ARGS, "--grant", "factory-deployer", "client-factory-deployer"]
     code = _bootstrap.main(argv, make_context=lambda settings: make_context(world, settings, out))
     assert code == 0, out
-    assert out[0].startswith("[done] grant") and "client-factory-deploy" in out[0]
-    assert world.policies == {"factory-deploy": [("contributor", "my-agents", "staging")]}
-    assert world.assignments == [("client-factory-deploy", "factory-deploy")]
+    assert out[0].startswith("[done] grant") and "client-factory-deployer" in out[0]
+    assert world.policies == {"factory-deployer": GRANTED_BINDING}
+    assert world.assignments == [("client-factory-deployer", "factory-deployer")]
     assert world.union_keys == {} and world.tty == [] and world.commands == []
 
 
 def test_the_grant_takes_only_the_factorys_policies_and_no_other_mode(capsys):
     for bad in (
         ["--grant", "contributor", "client-1"],
-        ["--grant", "factory-chat", "client-1", "--deploy-key"],
+        ["--grant", "factory-chat", "client-1", "--union-keys"],
         ["--grant", "factory-chat", "client-1", "--dry-run"],
     ):
         with pytest.raises(SystemExit):
@@ -244,10 +325,12 @@ def test_a_refused_grant_of_the_chat_key_shown_on_the_terminal_prints_the_admins
 
 
 def test_an_existing_deploy_key_is_never_deleted_silently(world, capsys):
-    world.union_keys["factory-deploy"] = "client-old"
-    code, out = key_run(world, "--deploy-key", capsys)
-    assert code == 3 and out[0].startswith("[blocked] deploy-key") and "already exists" in out[0]
-    assert world.union_keys == {"factory-deploy": "client-old"} and world.tty == []
+    """The deploy key's successor, the deployer tier key: an existing one blocks the run, untouched."""
+    world.union_keys["factory-deployer"] = "client-old"
+    code, out = key_run(world, "--union-keys", capsys)
+    assert code == 3 and out[0].startswith("[blocked] union-keys") and "already exists" in out[0]
+    assert world.union_keys["factory-deployer"] == "client-old" and world.tty == []
+    assert not [e for e in world.events if e.startswith("delete_api_key")]
 
 
 def test_an_unexpected_failure_while_assigning_deletes_the_key_and_propagates(world, capsys, monkeypatch):
@@ -288,15 +371,15 @@ def test_a_broader_existing_policy_stops_before_a_key_is_made(world, capsys):
     assert world.union_keys == {}
 
 
-@pytest.mark.parametrize("flag", [["--chat-key"], ["--deploy-key"], ["--grant", "factory-chat", "u"]])
+@pytest.mark.parametrize("flag", [["--chat-key"], ["--grant", "factory-chat", "u"]])
 def test_without_flyteplugins_union_it_says_why_and_changes_nothing(world, capsys, flag):
     world.can_manage_keys = False
     code, out = key_run(world, flag[0], capsys, extra=flag[1:])
-    assert code == 3 and API_KEY_REQUIREMENT in out[0] and "Linux x86_64" in out[0]
+    assert code == 3 and KEY_PLUGIN_REQUIREMENT in out[0] and "Linux x86_64" in out[0]
     assert world.events == []
 
 
-@pytest.mark.parametrize("flag", [["--grant", "factory-chat", "client-1"], ["--deploy-key"], ["--chat-key"]])
+@pytest.mark.parametrize("flag", [["--grant", "factory-chat", "client-1"], ["--union-keys"], ["--chat-key"]])
 def test_a_key_mode_refuses_a_config_for_another_endpoint_before_any_union_call(world, capsys, flag):
     (world.root / "flyte-config.yaml").write_text("admin:\n  endpoint: dns:///other-org.example.org\n")
     code, out = key_run(world, flag[0], capsys, extra=flag[1:])
@@ -304,7 +387,7 @@ def test_a_key_mode_refuses_a_config_for_another_endpoint_before_any_union_call(
     assert world.events == [] and world.policies == {} and world.union_keys == {}
 
 
-@pytest.mark.parametrize("flag", [["--grant", "factory-chat", "client-1"], ["--deploy-key"], ["--chat-key"]])
+@pytest.mark.parametrize("flag", [["--grant", "factory-chat", "client-1"], ["--union-keys"], ["--chat-key"]])
 def test_a_key_mode_without_a_flyte_config_signs_in_then_goes_on(world, capsys, flag):
     (world.root / "flyte-config.yaml").unlink()
     code, out = key_run(world, flag[0], capsys, extra=flag[1:])
@@ -317,13 +400,18 @@ def test_the_key_modes_are_listed_in_help_and_exclude_each_other(capsys):
     with pytest.raises(SystemExit):
         _bootstrap.main(["--help"])
     help_text = capsys.readouterr().out
-    assert "--chat-key" in help_text and "--deploy-key" in help_text
-    for bad in (["--chat-key", "--deploy-key"], ["--chat-key", "--dry-run"], ["--deploy-key", "--status"]):
+    assert "--chat-key" in help_text and "--union-keys" in help_text and "--deploy-key" not in help_text
+    for bad in (
+        ["--chat-key", "--union-keys"],
+        ["--chat-key", "--dry-run"],
+        ["--union-keys", "--grant", "factory-chat", "u"],
+        ["--grant", "factory-chat", "u", "--status"],
+    ):
         with pytest.raises(SystemExit):
             _bootstrap.main([*ARGS, *bad])
 
 
-@pytest.mark.parametrize("flag", [["--chat-key"], ["--deploy-key"], ["--grant", "factory-chat", "u"]])
+@pytest.mark.parametrize("flag", [["--chat-key"], ["--union-keys"], ["--grant", "factory-chat", "u"]])
 def test_the_key_modes_refuse_an_oss_backend(capsys, flag):
     # Keys and policies are Union's; on OSS Flyte the MCP is authenticated another way (oss-flyte-compat.md).
     with pytest.raises(SystemExit) as exc:
@@ -353,11 +441,6 @@ def assert_filled_in(command):
 def test_the_printed_commands_carry_the_runs_own_values_and_no_placeholders(world):
     from tests.test_bootstrap import run as full_run
 
-    world.api_key = False
-    code, out = full_run(world, "--domain", "staging")
-    assert code == 3
-    assert_filled_in(command_in(out, "--deploy-key"))
-    world.api_key = True
     code, out = full_run(world, "--domain", "staging")
     assert code == 0, out
     chat = command_in(out, "--chat-key")

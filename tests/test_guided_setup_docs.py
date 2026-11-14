@@ -31,21 +31,21 @@ def test_queue_state_requirement_reaches_both_personal_profile_users():
     assert "storage" in read("skills/agent-factory/references/setup.md").lower()
 
 
-def test_deploy_environment_bootstrap_is_documented_before_deployment():
-    source = read("src/flyte_agent_factory/_deploy.py")
-    required = set(re.findall(r'os\.environ\["(_UNION_\w+)"\]', source))
-    assert required
+def test_deploy_environment_needs_no_injected_key_and_the_guides_never_ask_for_one():
+    """The deploy children act as the deployer's key or the CLI login; nothing exports Union's pod key."""
+    for module in ("_deploy.py", "_deploy_child.py", "_bootstrap_flyte.py", "_bootstrap_keys.py"):
+        assert "_UNION_EAGER" not in read(f"src/flyte_agent_factory/{module}"), module
     guide = read("docs/quickstart.md")
-    for variable in required:
-        assert guide.index(f"export {variable}") < guide.index("python ops/deploy_work.py")
-        assert f"unset {variable}" in guide
+    assert "export _UNION_EAGER_API_KEY" not in guide and "unset _UNION_EAGER_API_KEY" not in guide
+    assert "python ops/deploy_work.py" in guide
     assert "endpoint:client_id:client_secret:org" in guide
     assert "create api-key" in guide
     # Retired: the setup-only and per-profile skill packages. One public skill is downloaded, not built.
     assert "package_skill.py --setup" not in guide and "--profile mine" not in guide
     assert "ops/bootstrap.py" in guide
     reference = read("skills/agent-factory/references/setup.md")
-    assert "_UNION_EAGER_API_KEY" in reference and "[state]" in reference
+    assert "_UNION_EAGER_API_KEY" not in reference and "[state]" in reference
+    assert "--union-keys" in reference and "--union-keys" in guide
 
 
 def inner_script(block):
@@ -189,11 +189,12 @@ def test_the_documented_admin_grant_is_the_command_the_bootstrap_prints():
         workspace="you/agent-workspace",
         state_uri="s3://my-agent-state/factory/mine",
     )
-    grant = build_command(example, "--grant factory-deploy factory-deploy")
+    grant = build_command(example, "--grant factory-deployer factory-deployer")
     section = read("docs/factory-mcp-setup.md").split("### Grant the key a role", 1)[1]
     assert f"```bash\n{grant}\n```" in section
     skill = read("skills/agent-factory/references/setup.md")
-    assert "`--grant factory-deploy`" in skill and "`--grant factory-chat`" in skill
+    for policy in ("factory-deployer", "factory-project", "factory-chat"):
+        assert f"`--grant {policy}`" in skill
 
 
 def test_the_docs_say_the_bootstrap_and_skill_links_need_the_engine_on_its_public_main():
@@ -239,6 +240,7 @@ BOOTSTRAP_STEPS = [
     "profile",
     "signin",
     "project",
+    "union-keys",
     "deploy-key",
     "github-app",
     "ruleset",
@@ -557,7 +559,7 @@ def test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them(
                     "## What the bootstrap sets up, in the command's order",
                     ("profile.toml", "[repo] project", "[direction]", "never overwritten"),
                 ),
-                "Deploy": ("## Hand over one copy-paste command", ("factory-deploy", "client_id")),
+                "Deploy": ("## Hand over one copy-paste command", ("factory-deployer", "client_id")),
                 "Factory MCP": (
                     "## Connect the factory MCP, then verify",
                     ("grant", "client_id", "factory-chat", "one copy-paste command"),
@@ -584,7 +586,7 @@ def test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them(
                 section = text.split(start, 1)[1].split(end, 1)[0]
                 for value in required_by_heading[heading]:
                     assert value in section, f"{path}: {heading} handoff missing {value}"
-        assert "factory-deploy" in text and "client_id" in text
+        assert "factory-deployer" in text and "client_id" in text
 
 
 def test_install_audit_classifies_every_step_and_keeps_external_work_not_run():
@@ -799,3 +801,18 @@ def test_setup_reference_does_not_ask_for_the_endpoint_twice():
     reference = read("skills/agent-factory/references/setup.md")
     assert "the backend endpoint is that URL's host" in reference
     assert "the backend endpoint, project" not in reference
+
+
+def test_deploy_environment_bootstrap_is_documented_before_deployment():
+    """The Union keys are set up before the first deploy, and no guide has anyone export the injected key."""
+    guide = read("docs/quickstart.md")
+    deploy = guide.index("python ops/deploy_work.py")
+    assert guide.index("`union-keys`") < deploy
+    assert guide.index("create api-key --name factory-project") < deploy, "the manual path, also first"
+    assert "export _UNION_EAGER_API_KEY" not in guide
+    assert "ops/bootstrap.py" in guide and "--union-keys" in guide
+    # Retired: the setup-only and per-profile skill packages. One public skill is downloaded, not built.
+    assert "package_skill.py --setup" not in guide and "--profile mine" not in guide
+    reference = read("skills/agent-factory/references/setup.md")
+    assert "union-keys" in reference and "[state]" in reference
+    assert "export _UNION_EAGER_API_KEY" not in reference

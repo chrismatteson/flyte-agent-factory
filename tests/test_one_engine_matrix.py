@@ -36,6 +36,7 @@ from flyte_agent_factory import (
     _demo_checks,
     _factory,
     _factory_base,
+    _github,
     _inbox,
     _local_browser,
     _meter,
@@ -47,6 +48,7 @@ from flyte_agent_factory import (
     _state,
     _supervise_support,
     _timeline,
+    _union_identity,
     _usage,
     agent,
 )
@@ -74,8 +76,11 @@ def git(work, *args):
 @pytest.fixture(params=["claude", "codex"])
 def single_engine(request, tmp_path, monkeypatch):
     engine = request.param
+    # Every pod holds its tier's Union key (conftest's `_a_pod_with_its_tier_key`); the rest is engine state.
+    identity = (_union_identity.KEY_ENV, _union_identity.TIER_ENV, _union_identity.SECRET_ENV)
+    keep = {"AGENT_FACTORY_PROFILE", *identity}
     for key in list(os.environ):
-        if key.startswith(("AGENT_FACTORY_", "AGENT_FACTORY_", "FAKE_")) and key != "AGENT_FACTORY_PROFILE":
+        if key.startswith(("AGENT_FACTORY_", "AGENT_FACTORY_", "FAKE_")) and key not in keep:
             monkeypatch.delenv(key)
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", _session_config.CODEX_TOKEN_ENV_VAR):
         monkeypatch.delenv(key, raising=False)
@@ -531,7 +536,7 @@ async def test_pull_request(single_engine, monkeypatch):
     with httpx.Client(
         transport=httpx.MockTransport(fake.handler), base_url="https://api.github.com"
     ) as client:
-        app = RealGithubApp("12345", PRIVATE_PEM, client=client)
+        app = RealGithubApp("12345", PRIVATE_PEM, client=client, permissions=_github.PR_WRITE)
         prs = _pull_requests.PullRequests(app, REPO, "matrix", RUN_URL, rig.timeline.row)
         monkeypatch.setattr(_session_setup, "_pr", prs)
         await _supervise_support._publish_pull_request(rig.work, BRIEF, rig.timeline)

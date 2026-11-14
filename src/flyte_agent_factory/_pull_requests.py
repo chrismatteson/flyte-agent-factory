@@ -122,8 +122,12 @@ class PullRequests:
         run_url: str,
         emit: Callable[[str, str], None],
         issue: str = "",
+        status_app: _github.GithubApp | None = None,
     ) -> None:
         self.app, self.repo, self.run_url, self.emit = app, repo, run_url, emit
+        # `factory/verifier` needs `statuses: write` and PR work does not: given `status_app`, the verdict
+        # status mints its own token instead of the pull-request one.
+        self._verifier = status_app or app
         self.issue = issue
         self.branch = branch_name(project)
         self.url = ""
@@ -220,7 +224,9 @@ class PullRequests:
             return
         self._guard(
             f"{STATUS_CONTEXT} status",
-            lambda: self.app.set_status(self.repo, sha, STATUS_CONTEXT, state, description, self.run_url),
+            lambda: self._verifier.set_status(
+                self.repo, sha, STATUS_CONTEXT, state, description, self.run_url
+            ),
         )
 
 

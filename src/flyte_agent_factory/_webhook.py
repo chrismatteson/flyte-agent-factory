@@ -14,9 +14,10 @@ import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import flyte
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         _loop,
         _profile,
         _pull_requests,
+        _union_identity,
     )
     from ._errors import REMOTE_ERRORS
     from ._images import agent_image
@@ -61,6 +63,7 @@ else:
         _loop,
         _profile,
         _pull_requests,
+        _union_identity,
     )
     from flyte_agent_factory._errors import REMOTE_ERRORS
     from flyte_agent_factory._images import agent_image
@@ -110,6 +113,7 @@ _completion_tasks: set[asyncio.Task[None]] = set()
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _union_identity.establish()
     global _consumer, _reconcile_dirty
     if PROFILE.planner.admission == "planner" and os.environ.get("WEB_CONCURRENCY", "1") != "1":
         raise RuntimeError("planner admission requires one ASGI worker")
@@ -253,6 +257,7 @@ def _outcome_event(kind: str, event: dict[str, Any]) -> bool:
 
 # The intake tasks import this module, so they need the app's packages too.
 _image = agent_image().with_pip_packages("fastapi>=0.115,<1", "uvicorn")
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 #: Issue intake and the closed-PR milestone. It holds the App key; the public app never does.
 issues_env = flyte.TaskEnvironment(
     name="factory-issues",
@@ -265,8 +270,9 @@ issues_env = flyte.TaskEnvironment(
             else []
         ),
         *([flyte.Secret(key=PROFILE.board.pat_secret, as_env_var=_board.TOKEN_ENV)] if PROFILE.board else []),
+        *_QUEUE_SECRETS,
     ],
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env()},
+    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
 )
 # A public, unauthenticated endpoint: nothing but /github is served, not even the generated docs.
 app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -287,8 +293,9 @@ env = flyte.app.AppEnvironment(
             if PROFILE.planner.admission == "planner"
             else []
         ),
+        *_QUEUE_SECRETS,
     ],
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env()},
+    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     depends_on=[
         *([_factory.env] if PROFILE.planner.admission == "planner" else []),
         *(
@@ -305,9 +312,14 @@ env = flyte.app.AppEnvironment(
 @env.server
 async def serve() -> None:
     """Serve the signed public endpoint with the app's own Flyte identity."""
+    _union_identity.establish()
     import uvicorn
 
     await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8080, workers=1)).serve()
+
+
+_PROCESS_SCOPE: Mapping[str, str] = MappingProxyType({"contents": "read", "issues": "write"})
+_WAKE_SCOPE: Mapping[str, str] = MappingProxyType({"pull_requests": "read", "issues": "read"})
 
 
 @issues_env.task(
@@ -319,8 +331,14 @@ async def serve() -> None:
 )
 async def process(event: str, payload: str) -> str:
     """Launch, direct or report on the project an accepted issue event is about."""
+    _union_identity.establish()
     key = _pull_requests.take_app_key(PROFILE.github.private_key_secret)
-    app = _github.GithubApp(PROFILE.github.app_id, key) if PROFILE.github.configured and key else None
+    # Board events read the board repo's issues and commits and close issues; milestones comment on issues.
+    app = (
+        _github.GithubApp(PROFILE.github.app_id, key, permissions=_PROCESS_SCOPE)
+        if PROFILE.github.configured and key
+        else None
+    )
     data = json.loads(payload)
     if _board_events.eligible(PROFILE, event, data):
         # `eligible` is False without a [board].
@@ -341,10 +359,12 @@ async def process(event: str, payload: str) -> str:
 )
 async def wake_loop(sha: str) -> None:
     """Resolve reviewed PR heads privately; retries adopt the same run for each PR and head."""
+    _union_identity.establish()
     if not PROFILE.loop.enabled:
         return
     key = _pull_requests.take_app_key(PROFILE.github.private_key_secret)
-    github = _github.GithubApp(PROFILE.github.app_id, key)
+    # Lists the open PRs and reads the loop's own issues (`_loop.loop_pull`).
+    github = _github.GithubApp(PROFILE.github.app_id, key, permissions=_WAKE_SCOPE)
     repo = PROFILE.loop.repo
     pulls = await asyncio.to_thread(github._get_pages, repo, f"/repos/{repo}/pulls", state="open")
     for pull in pulls:

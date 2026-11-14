@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, TypeVar
 from urllib.parse import quote
 
@@ -21,6 +22,7 @@ API = "https://api.github.com"
 #: the fields the code relies on are checked where they are read (`_field`).
 Json = dict[str, Any]
 _T = TypeVar("_T")
+_TokenKey = tuple[str, frozenset[tuple[str, str]]]
 #: Refresh a cached installation token this long before GitHub says it expires.
 TOKEN_MARGIN = 5 * 60
 #: GitHub allows an App JWT up to 10 minutes; `iat` is set back a minute for clock skew.
@@ -34,6 +36,25 @@ _NO_PERMISSION = "Resource not accessible by integration"
 # will not on its own: pending, not failing.
 _FAILING_CHECK = {"failure", "timed_out", "cancelled", "action_required"}
 PER_PAGE = 100
+
+# Installation-token scopes: each caller mints the least it needs, always for one repository. GitHub adds
+# `metadata: read` itself. There is no token with everything the installation was granted (#179):
+# `installation_token` refuses missing or empty permissions, and an app made without them can call nothing.
+CI_READ: Mapping[str, str] = MappingProxyType({"checks": "read", "statuses": "read", "actions": "read"})
+#: Only proves the App is installed on a repository; every installation holds it.
+METADATA_READ: Mapping[str, str] = MappingProxyType({"metadata": "read"})
+CONTENTS_READ: Mapping[str, str] = MappingProxyType({"contents": "read"})
+#: A git push, or a git ref or commit written through the API.
+CONTENTS_WRITE: Mapping[str, str] = MappingProxyType({"contents": "write"})
+ISSUES_READ: Mapping[str, str] = MappingProxyType({"issues": "read"})
+ISSUES_WRITE: Mapping[str, str] = MappingProxyType({"issues": "write"})
+PR_WRITE: Mapping[str, str] = MappingProxyType({"pull_requests": "write", "contents": "read"})
+VERIFIER: Mapping[str, str] = MappingProxyType({"statuses": "write"})
+
+
+def session_push_scope(workflows: bool) -> Mapping[str, str]:
+    """Return what a session's push token may do; `workflows: write` only when `[github] workflows` is set."""
+    return MappingProxyType({"contents": "write", **({"workflows": "write"} if workflows else {})})
 
 
 def _running(suite: Json) -> bool:
@@ -278,13 +299,18 @@ class PublicGithub(_GithubReader):
 
 
 class GithubApp(_GithubReader):
-    """One GitHub App's identity, with an installation token cached per repo."""
+    """One GitHub App's identity, with an installation token cached per repo and permission set.
+
+    Every call it makes as the installation uses a token limited to `permissions` and to the one repository.
+    Without `permissions` only `installation_token` (which names its own) and `scoped` views can reach GitHub.
+    """
 
     def __init__(
         self,
         app_id: str,
         private_key: str,
         *,
+        permissions: Mapping[str, str] | None = None,
         client: httpx.Client | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -292,7 +318,10 @@ class GithubApp(_GithubReader):
         self._key = private_key
         super().__init__(client)
         self._clock = clock
-        self._tokens: dict[str, tuple[str, float]] = {}  # repo -> (token, expiry epoch)
+        #: (repo, permissions) -> (token, expiry epoch). Shared with every `scoped` view of this app.
+        self._tokens: dict[_TokenKey, tuple[str, float]] = {}
+        #: What `_token` asks for; `scoped` views set their own, so every call through one mints that scope.
+        self._permissions: Mapping[str, str] | None = permissions
         #: URL with its query -> (ETag, the body it tagged), for conditional GETs (`issue_comments_since`).
         self._etags: dict[str, tuple[str, list[Json]]] = {}
 
@@ -315,9 +344,32 @@ class GithubApp(_GithubReader):
             text = text.replace(token, "***")
         return text
 
-    def installation_token(self, repo: str) -> str:
-        cached = self._tokens.get(repo)
-        if cached and self._clock() < cached[1] - TOKEN_MARGIN:
+    def scoped(self, permissions: Mapping[str, str]) -> GithubApp:
+        """Return a view of this app whose every call uses a token limited to `permissions` (and to the repo).
+
+        The view reads all its state (HTTP client, key, token cache) live from this app, so `redact` knows
+        every token and nothing drifts if the app's client is replaced.
+        """
+        return _ScopedApp(self, permissions)
+
+    def _token(self, repo: str) -> str:
+        if self._permissions is None:
+            raise ValueError(
+                "this GithubApp names no permissions: make it with `permissions=` or use `scoped`"
+            )
+        return self.installation_token(repo, self._permissions)
+
+    def installation_token(self, repo: str, permissions: Mapping[str, str], *, fresh: bool = False) -> str:
+        """Return a token for `repo` alone, limited to `permissions`, which must name at least one.
+
+        `fresh` skips the cache: the push-token refresh must replace a token that is still valid.
+        """
+        if not permissions:
+            # GitHub reads a request without `permissions` as "everything the installation has" (#179).
+            raise ValueError(f"an installation token for {repo} must name its permissions")
+        key = (repo, frozenset(permissions.items()))
+        cached = self._tokens.get(key)
+        if cached and not fresh and self._clock() < cached[1] - TOKEN_MARGIN:
             return cached[0]
         app = self.app_jwt()
         try:
@@ -329,7 +381,8 @@ class GithubApp(_GithubReader):
                 ) from exc
             raise
         installation_id = _field(installation, "id", int, f"installation of {repo}")
-        issued = self._request("POST", f"/app/installations/{installation_id}/access_tokens", app)
+        scope: Json = {"repositories": [repo.split("/", 1)[-1]], "permissions": dict(permissions)}
+        issued = self._request("POST", f"/app/installations/{installation_id}/access_tokens", app, json=scope)
         what = "issued an unusable installation token"
         token = _field(issued, "token", str, what)
         expires_at = _field(issued, "expires_at", str, what)
@@ -340,7 +393,7 @@ class GithubApp(_GithubReader):
             raise GithubError(
                 f"github {what}: `expires_at` is not a timestamp ({type(exc).__name__})"
             ) from exc
-        self._tokens[repo] = (token, expires)
+        self._tokens[key] = (token, expires)
         return token
 
     def _call(self, repo: str, method: str, path: str, **kwargs: Any) -> Any:
@@ -350,12 +403,15 @@ class GithubApp(_GithubReader):
         fresh one.
         """
         try:
-            return self._request(method, path, self.installation_token(repo), **kwargs)
+            return self._request(method, path, self._token(repo), **kwargs)
         except GithubError as exc:
             if exc.status != 401:
                 raise
-        self._tokens.pop(repo, None)
-        return self._request(method, path, self.installation_token(repo), **kwargs)
+        self._forget(repo)
+        return self._request(method, path, self._token(repo), **kwargs)
+
+    def _forget(self, repo: str) -> None:
+        self._tokens.pop((repo, frozenset((self._permissions or {}).items())), None)
 
     def workflow_runs(self, repo: str, sha: str, limit: int = 20) -> list[Json]:
         """Return the newest GitHub Actions runs on commit `sha` (needs "Actions: read")."""
@@ -373,7 +429,7 @@ class GithubApp(_GithubReader):
         Authorization header on the cross-host hop.
         """
         path = f"/repos/{repo}/actions/jobs/{job_id}/logs"
-        return self._response("GET", path, self.installation_token(repo)).text
+        return self._response("GET", path, self._token(repo)).text
 
     # --- pull requests --------------------------------------------------------------------------
 
@@ -461,10 +517,11 @@ class GithubApp(_GithubReader):
                 raise GithubError("issue marker search exceeds GitHub's result limit")
             page += 1
 
-    def read_file(self, repo: str, path: str) -> str:
+    def read_file(self, repo: str, path: str, ref: str = "") -> str:
+        """Return the text of `path` in `repo` on its default branch, or at `ref` (a commit or branch)."""
         import base64
 
-        body = self._get(repo, f"/repos/{repo}/contents/{path}")
+        body = self._get(repo, f"/repos/{repo}/contents/{path}", **({"params": {"ref": ref}} if ref else {}))
         if body.get("encoding") != "base64":
             raise GithubError("repository text file is not base64 encoded")
         return base64.b64decode(body["content"]).decode("utf-8")
@@ -616,16 +673,14 @@ class GithubApp(_GithubReader):
 
             def get(etag: str = etag, params: dict[str, Any] = params) -> httpx.Response:
                 headers = {"If-None-Match": etag} if etag else {}
-                return self._response(
-                    "GET", path, self.installation_token(repo), headers=headers, params=params
-                )
+                return self._response("GET", path, self._token(repo), headers=headers, params=params)
 
             try:
                 response = get()
             except GithubError as exc:  # as `_call`: a revoked or early-expired token is retried once
                 if exc.status != 401:
                     raise
-                self._tokens.pop(repo, None)
+                self._forget(repo)
                 response = get()
             if response.status_code == 304:
                 found = cached
@@ -652,6 +707,17 @@ class GithubApp(_GithubReader):
         if target_url:
             payload["target_url"] = target_url
         self._send(repo, "POST", f"/repos/{repo}/statuses/{sha}", json=payload)
+
+
+class _ScopedApp(GithubApp):
+    """`GithubApp` for one permission set. Skips `__init__`: every attribute it lacks comes from `parent`."""
+
+    def __init__(self, parent: GithubApp, permissions: Mapping[str, str]) -> None:
+        self._parent = parent
+        self._permissions = permissions
+
+    def __getattr__(self, name: str) -> Any:  # only reached for state this view does not hold itself
+        return getattr(self._parent, name)
 
 
 def _status_health(statuses: list[Json]) -> tuple[str, str]:

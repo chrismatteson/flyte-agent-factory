@@ -27,11 +27,18 @@ from pathlib import Path
 
 import flyte
 
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._images import agent_image
 
+PROFILE = _profile.require()
+# The tier key, as every factory environment mounts it: without it the subprocess's controller would
+# have only the key Union injects into every pod, which is another identity (#183).
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="native-child-probe",
     image=agent_image(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=1, memory="2Gi"),
 )
 
@@ -65,8 +72,11 @@ try:
         get_controller()
         result["controller"] = "already present"
     except RuntimeError:
-        create_controller("rust")
-        result["controller"] = "created (rust)"
+        # The remote controller, as this pod's tier key: the rust one acts as the key Union injects (#183).
+        from flyte_agent_factory import _union_identity
+
+        create_controller("remote", **_union_identity.controller_kwargs())
+        result["controller"] = "created (remote)"
 except Exception as e:
     result["setup_error"] = f"{type(e).__name__}: {e}"
     result["traceback"] = traceback.format_exc()[-1200:]
@@ -119,6 +129,7 @@ print("PROBE_RESULT " + json.dumps(result))
 @env.task(report=True)
 async def probe() -> str:
     """Write the run-context file, then try to launch a child action from a subprocess."""
+    _union_identity.establish()
     from flyte._interactive_run_context import write_interactive_run_context
 
     ctx = flyte.ctx()

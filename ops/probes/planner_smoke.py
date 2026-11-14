@@ -2,8 +2,8 @@
 
 Use a dedicated scratch profile with one slot, planner admission, and no other Ready
 items or active projects. Configure [direction], [board], the GitHub App and webhook,
-then deploy that profile. Supply GITHUB_APP_PRIVATE_KEY, GITHUB_BOARD_PAT and
-_UNION_EAGER_API_KEY in the environment using the normal secret tooling.
+then deploy that profile. Supply GITHUB_APP_PRIVATE_KEY and GITHUB_BOARD_PAT
+in the environment using the normal secret tooling; Flyte access is your own CLI login.
 
     uv run python ops/probes/planner_smoke.py --profile SCRATCH --repo OWNER/REPO --nonce UNIQUE
 
@@ -20,19 +20,32 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import TypeVar
 
-import flyte
 from flyte import remote
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from flyte_agent_factory import _profile
 
 _profile.select_from_argv()
 
-from flyte_agent_factory import _board, _factory, _factory_base, _github, _issues, _planner_runtime  # noqa: E402 -- after the profile
+from flyte_agent_factory import (  # noqa: E402 -- after the profile
+    _board,
+    _factory,
+    _factory_base,
+    _github,
+    _issues,
+    _planner_runtime,
+    _union_identity,
+)
 
 _T = TypeVar("_T")
 
@@ -79,13 +92,9 @@ def main() -> None:
         parser.error("use a dedicated one-slot scratch profile in planner mode")
     if args.repo.lower() not in _issues.repo_targets(profile):
         parser.error("scratch repository must be configured in the profile")
-    flyte.init_from_api_key(
-        api_key=os.environ["_UNION_EAGER_API_KEY"],
-        project=_factory.PROJECT,
-        domain=_factory.DOMAIN,
-    )
+    _union_identity.init_for_script(_factory_base.PROFILE)
     key = os.environ["GITHUB_APP_PRIVATE_KEY"]
-    app = _github.GithubApp(profile.github.app_id, key)
+    app = _github.GithubApp(profile.github.app_id, key, permissions=_github.ISSUES_WRITE)
     board = _board.BoardClient(os.environ[_board.TOKEN_ENV])
     assert profile.board is not None
     board.bootstrap(profile.board.owner, profile.board.owner_type, profile.board.number, create=False)

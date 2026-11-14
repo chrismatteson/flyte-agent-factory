@@ -12,9 +12,10 @@ import json
 import logging
 import os
 import secrets
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 from functools import partial
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import flyte
@@ -35,6 +36,7 @@ from . import (
     _names,
     _planner,
     _queue,
+    _union_identity,
 )
 
 if TYPE_CHECKING:
@@ -71,8 +73,13 @@ class Intent(TypedDict, total=False):
     run: str
 
 
+#: The planner's one App view: it writes its records and lock as git refs in the direction repo, reads the
+#: target repos' default-branch heads and the loop's kill-switch issues. Every token is for one repository.
+_SCOPE: Mapping[str, str] = MappingProxyType({"contents": "write", "issues": "read"})
+
+
 def connection(profile: Profile) -> tuple[_github.GithubApp, str, str]:
-    app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
+    app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV], permissions=_SCOPE)
     # Planner admission is only configured with a [direction] repository (a profile without one fails here).
     direction = cast("Direction", profile.direction)
     repo = _github.parse_repo(direction.repo)
@@ -107,29 +114,31 @@ class Backend:
         labels = planner_labels(self.profile)
         if correlation:
             labels[CORRELATION] = correlation
-        runs = [
-            run
-            async for run in remote.Run.listall.aio(
-                task_name=TASK,
-                project=_factory.PROJECT,
-                domain=_factory.DOMAIN,
-                with_labels=labels,
-                limit=1000000,
-                **({} if correlation else {"in_phase": _deploy.LIVE_PHASES}),
-            )
-        ]
+        with _union_identity.denied("listing planner runs"):
+            runs = [
+                run
+                async for run in remote.Run.listall.aio(
+                    task_name=TASK,
+                    project=_factory.PROJECT,
+                    domain=_factory.DOMAIN,
+                    with_labels=labels,
+                    limit=1000000,
+                    **({} if correlation else {"in_phase": _deploy.LIVE_PHASES}),
+                )
+            ]
         return [SimpleNamespace(name=r.name, correlation=r.pb2.labels[CORRELATION], run=r) for r in runs]
 
     async def submit(self, correlation: str) -> SimpleNamespace:
-        task = remote.Task.get(
-            name=TASK, auto_version="latest", project=_factory.PROJECT, domain=_factory.DOMAIN
-        )
-        run = await flyte.with_runcontext(
-            mode="remote",
-            project=_factory.PROJECT,
-            domain=_factory.DOMAIN,
-            labels={**planner_labels(self.profile), CORRELATION: correlation},
-        ).run.aio(task)
+        with _union_identity.denied("launching the planner"):
+            task = remote.Task.get(
+                name=TASK, auto_version="latest", project=_factory.PROJECT, domain=_factory.DOMAIN
+            )
+            run = await flyte.with_runcontext(
+                mode="remote",
+                project=_factory.PROJECT,
+                domain=_factory.DOMAIN,
+                labels={**planner_labels(self.profile), CORRELATION: correlation},
+            ).run.aio(task)
         return SimpleNamespace(name=run.name, correlation=correlation, run=run)
 
     async def wait(self, run: SimpleNamespace) -> None:
@@ -157,14 +166,15 @@ def _intents(app: _github.GithubApp, repo: str, base: str) -> list[tuple[_admiss
 
 
 def _matches(correlation: str) -> list[remote.Run]:
-    return list(
-        remote.Run.listall(
-            project=_factory.PROJECT,
-            domain=_factory.DOMAIN,
-            with_labels={CORRELATION: correlation},
-            limit=1000000,
+    with _union_identity.denied("listing runs of a launch intent"):
+        return list(
+            remote.Run.listall(
+                project=_factory.PROJECT,
+                domain=_factory.DOMAIN,
+                with_labels={CORRELATION: correlation},
+                limit=1000000,
+            )
         )
-    )
 
 
 def reconcile(
@@ -381,7 +391,9 @@ def execute(
             continue
         # Terminal runs remain the durable generation history after intent cleanup.
         identity = hashlib.sha256(f"{node}:{gen}".encode()).hexdigest()[:32]
-        if list(remote.Run.listall(with_labels={"factory-work": identity}, limit=1)):
+        with _union_identity.denied("listing runs of a generation"):
+            started = list(remote.Run.listall(with_labels={"factory-work": identity}, limit=1))
+        if started:
             continue
         slot = next(
             c.slot
@@ -464,17 +476,19 @@ def notify(profile: Profile, key: str, run_name: str = "") -> None:
     import httpx
 
     if profile.planner.admission != "planner":
-        task = remote.Task.get(
-            name=_deploy.RECONCILE_TASK,
-            auto_version="latest",
-            project=_factory.PROJECT,
-            domain=_factory.DOMAIN,
-        )
-        flyte.with_runcontext(mode="remote", project=_factory.PROJECT, domain=_factory.DOMAIN).run(
-            task, completion_run=run_name
-        )
+        with _union_identity.denied("launching outcome repair"):
+            task = remote.Task.get(
+                name=_deploy.RECONCILE_TASK,
+                auto_version="latest",
+                project=_factory.PROJECT,
+                domain=_factory.DOMAIN,
+            )
+            flyte.with_runcontext(mode="remote", project=_factory.PROJECT, domain=_factory.DOMAIN).run(
+                task, completion_run=run_name
+            )
         return
-    app = remote.App.get(name="factory-webhook", project=_factory.PROJECT, domain=_factory.DOMAIN)
+    with _union_identity.denied("finding the webhook app"):
+        app = remote.App.get(name="factory-webhook", project=_factory.PROJECT, domain=_factory.DOMAIN)
     body = json.dumps({"run": run_name}).encode() if run_name else b""
     signature = hmac.new(key.encode(), b"factory-planner-wakeup" + body, hashlib.sha256).hexdigest()
     response = httpx.post(

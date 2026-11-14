@@ -25,6 +25,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 from flyte_agent_factory import _workspace
 
 #: The engine checkout this script ships in; its `briefs/` are the product briefs that are not carried over.

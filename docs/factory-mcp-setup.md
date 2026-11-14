@@ -35,8 +35,8 @@ Set `[mcp] public_url` in your profile and deploy with
 Use the HTTPS URL `<public_url>/flyte-mcp/mcp` (`Connector URL:` in the deployment output).
 
 On a Linux x86_64 machine, one bootstrap command does the key, the grant and the connector for the chat key; the
-bootstrap's `connect` step prints it with your values filled in (here the example values, and `--deploy-key` in its
-place makes the deployment key, shown once on your terminal only):
+bootstrap's `connect` step prints it with your values filled in (here the example values, and `--union-keys` in its
+place makes the factory's project and deployer keys, stored as Flyte secrets):
 
 ```bash
 d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --chat-key
@@ -55,14 +55,14 @@ Send the header `Authorization: Bearer <credential>`, where the credential is ei
   `flyte delete assignment --creds-subject <name> --policy contributor` before granting the scoped one.
 - a Union sign-in access token.
 
-The bootstrap says: the deploy makes its one-off Union API key with flyteplugins-union, which installs on Linux x86_64 only. The key and policy commands come from `flyteplugins-union`, which this project installs only on Linux; its
+The bootstrap says: making a Union API key from the command line needs flyteplugins-union, which installs on Linux x86_64 only. The key and policy commands come from `flyteplugins-union`, which this project installs only on Linux; its
 pinned release (0.15.5) ships a Linux x86_64 wheel and nothing for macOS or Linux on ARM. On macOS, run
 `flyte create api-key`, the policy grant below and `flyte delete assignment` on a Linux x86_64 machine or VM
 with the engine checked out and the same Flyte config; every other setup step runs on macOS.
 
 ### Grant the key a role
 
-When `--chat-key` or `--deploy-key` is refused the policy or the assignment (you may not manage access in the
+When `--chat-key` or `--union-keys` is refused the policy or the assignment (you may not manage access in the
 Union organization), it still hands over the key, ends `todo`, and prints one command for a Union admin, filled in
 with your values and the key's client ID. The admin runs it on a Linux x86_64 machine, signed in to the same
 endpoint (if that machine has no Flyte config for `--endpoint`, the command writes one and opens the browser sign-in first; a config for another endpoint stops it before any change); it makes or checks the policy (`contributor` on the project and domain only) and assigns it to that
@@ -70,7 +70,7 @@ client ID, and makes no key. For the deployment key, here with the example value
 name:
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --grant factory-deploy factory-deploy
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --grant factory-deployer factory-deployer
 ```
 
 The rest of this section is the same grant by hand, for a key made with `flyte create api-key`.
@@ -81,7 +81,7 @@ locally with the profile's `FLYTE_CONFIG`, `FLYTE_PROJECT` and `FLYTE_DOMAIN` se
 ([quickstart.md](quickstart.md#3-profile-and-secret-names)), and fill the `client_id=` line with the
 printed client ID. Creating policies and assignments needs permission to manage access in the Union organization;
 if you do not have it, send the block to whoever does. For the chat key the policy is `factory-chat`; for the
-deployment key, change the `policy=` line to `factory-deploy` and use that key's client ID. Pasted with
+deployment key, change the `policy=` line to `factory-deployer` (or `factory-project`) and use that key's client ID. Pasted with
 `client_id=` empty, the block stops before it creates anything.
 
 ```bash
@@ -156,7 +156,7 @@ widen the policy's bindings in an editor (the block's commands are the `flyte cr
 `flyte create assignment --creds-subject` subcommands, run through `uv run` with the profile's config):
 
 ```bash
-uv run flyte --config "$FLYTE_CONFIG" update policy factory-deploy
+uv run flyte --config "$FLYTE_CONFIG" update policy factory-deployer
 ```
 
 ### claude.ai

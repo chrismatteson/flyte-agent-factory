@@ -18,6 +18,10 @@ import argparse
 import sys
 from pathlib import Path
 
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
 from flyte_agent_factory import _delivery, _promote
 
 

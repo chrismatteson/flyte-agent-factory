@@ -26,23 +26,25 @@ from typing import cast
 
 import flyte
 
-from flyte_agent_factory import _local_browser, _profile
+from flyte_agent_factory import _local_browser, _profile, _union_identity
 from flyte_agent_factory._bridge import redact
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._images import agent_image
 
+PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="egress-probe",
     image=agent_image(browser=True),
-    env_vars=_profile.pod_env(),
+    secrets=[*_QUEUE_SECRETS],
+    env_vars={**_profile.pod_env(), **_QUEUE_ENV},
     resources=flyte.Resources(cpu=(1, 2), memory=("2Gi", "4Gi"), shm="2Gi"),
 )
 
-PROFILE = _profile.require()
 CONSOLE = f"{PROFILE.console_base}/runs"
 
-# Names the Flyte runtime uses for the in-pod API key, in precedence order.
-_KEY_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY", "FLYTE_API_KEY", "UNION_API_KEY")
+# The pod's key, as the factory mounts it (`_union_identity`).
+_KEY_VARS = (_union_identity.KEY_ENV, "FLYTE_API_KEY", "UNION_API_KEY")
 
 HOSTS = [
     # The control: known-good, no auth, nothing special about it.
@@ -88,6 +90,7 @@ def _resolve(host: str) -> str:
 @env.task(report=True)
 async def probe() -> str:
     """Compare what curl and an in-pod Chromium can reach, and return the findings as JSON."""
+    _union_identity.establish()
     findings: dict[str, object] = {
         # Names and values both: a proxy variable's *value* is the explanation
         # when curl and Chromium disagree, and none of these is a credential.

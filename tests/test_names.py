@@ -90,3 +90,21 @@ def test_the_pod_copy_of_the_shell_policy_forwards_policy_and_tooling_variables_
     for name, value in (forwarded | held_back).items():
         monkeypatch.setenv(name, value)
     assert {k: v for k, v in agent._shell_policy_env().items() if k in forwarded | held_back} == forwarded
+
+
+def test_the_pod_copy_of_the_shell_policy_never_carries_the_deploying_pods_identity(monkeypatch):
+    # A deployer (or a session hand-deploying) holds its own Union key under these names; copied into a
+    # slot's spec it would be plain text there, and the slot would act as that key (#183). The push mode is
+    # the deployer's to set, through `_profile.set_deployer_env` only (#179).
+    from flyte_agent_factory import _profile, _union_identity
+
+    held_back = [
+        _union_identity.KEY_ENV,
+        _union_identity.SESSION_KEY_ENV,
+        _union_identity.TIER_ENV,
+        _union_identity.SECRET_ENV,
+        *_profile.DEPLOYER_ONLY_ENV,
+    ]
+    for name in held_back:
+        monkeypatch.setenv(name, "from-the-shell")
+    assert set(agent._shell_policy_env()) & set(held_back) == set()

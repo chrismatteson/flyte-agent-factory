@@ -30,10 +30,10 @@ from typing import TYPE_CHECKING, cast
 
 # Keep runtime imports usable when deployment tools load this file by path.
 if TYPE_CHECKING:
-    from . import _deploy, _profile
+    from . import _deploy, _profile, _union_identity
     from ._errors import REMOTE_ERRORS
 else:
-    from flyte_agent_factory import _deploy, _profile
+    from flyte_agent_factory import _deploy, _profile, _union_identity
     from flyte_agent_factory._errors import REMOTE_ERRORS
 
 
@@ -160,17 +160,22 @@ def collect_planned_secrets(
     return imported
 
 
-def _list_existing_secrets(project: str, domain: str) -> set[str]:
+def _list_existing_secrets(profile: _profile.Profile, project: str, domain: str) -> set[str]:
     """Return the names of the secrets that exist in `project`/`domain`. Tests replace this."""
-    import flyte
     from flyte import remote
 
-    flyte.init_from_api_key(api_key=os.environ["_UNION_EAGER_API_KEY"], project=project, domain=domain)
-    return {secret.name for secret in remote.Secret.listall()}
+    _union_identity.init_for_script(
+        profile,
+        key_env=os.environ.get(_deploy.DEPLOY_KEY_ENV, ""),
+        project=project,
+        domain=domain,
+    )
+    with _union_identity.denied("listing secrets"):
+        return {secret.name for secret in remote.Secret.listall()}
 
 
 def find_missing_secrets(
-    needed: Mapping[str, list[str]], project: str, domain: str, base_env: Mapping[str, str]
+    profile: _profile.Profile, needed: Mapping[str, list[str]], project: str, domain: str
 ) -> dict[str, list[str]]:
     """Return each secret that `needed` mounts and `project`/`domain` lacks, with the envs needing it.
 
@@ -179,11 +184,10 @@ def find_missing_secrets(
     """
     if not any(needed.values()):
         return {}
-    if "_UNION_EAGER_API_KEY" not in base_env:
-        print("secrets not verified: no API key in the environment", file=sys.stderr, flush=True)
-        return {}
     try:
-        existing = _list_existing_secrets(project, domain)
+        existing = _list_existing_secrets(profile, project, domain)
+    except (_union_identity.IdentityMissing, _union_identity.IdentityDenied):
+        raise  # a deploy with no usable identity would fail anyway; say so, not "cannot tell"
     except REMOTE_ERRORS as exc:  # any failure to list is "cannot tell", never "none exist"
         print(
             f"secrets not verified: listing them failed ({type(exc).__name__})", file=sys.stderr, flush=True
@@ -223,17 +227,33 @@ def deploy(
     """
     slots = [s.env for s in profile.slots]
     _deploy.check_slots(profile, slots)
+    # Only the deployer runs this module (`_deploy.deploy_in_tree`), and it sets these in `base_env` after its
+    # isolation canary; the hand deploys call `_deploy` directly and pass none. The environments get them only
+    # from here, never from the deploying process's own environment (`_profile.pod_env`).
+    deployer = {name: base_env[name] for name in _profile.DEPLOYER_ONLY_ENV if base_env.get(name)}
     tail: list[str] = []
     if _deploy.deploy_slots(
-        profile, src, slots, project=project, domain=domain, ref=ref, base_env=base_env, stderr_tail=tail
+        profile,
+        src,
+        slots,
+        project=project,
+        domain=domain,
+        ref=ref,
+        base_env=base_env,
+        stderr_tail=tail,
+        deployer_env=deployer,
     ):
         raise _deploy.make_child_failure(f"slot deploy of {ref} failed", tail)
     env = _deploy.factory_env(base_env, project, domain)
     tail = []
-    if _deploy.deploy_factory(profile, src, project=project, domain=domain, env=env, stderr_tail=tail):
+    if _deploy.deploy_factory(
+        profile, src, project=project, domain=domain, env=env, stderr_tail=tail, deployer_env=deployer
+    ):
         raise _deploy.make_child_failure(f"factory deploy of {ref} failed", tail)
     tail = []
-    if _deploy.deploy_apps(profile, src, project=project, domain=domain, env=env, stderr_tail=tail):
+    if _deploy.deploy_apps(
+        profile, src, project=project, domain=domain, env=env, stderr_tail=tail, deployer_env=deployer
+    ):
         raise _deploy.make_child_failure(f"apps deploy of {ref} failed", tail)
 
 
@@ -268,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
             needed = collect_planned_secrets(profile, src, os.environ)
             project = os.environ.get("FLYTE_MCP_PROJECT", profile.backend.project)
             domain = os.environ.get("FLYTE_MCP_DOMAIN", profile.backend.domain)
-            missing = find_missing_secrets(needed, project, domain, os.environ)
+            missing = find_missing_secrets(profile, needed, project, domain)
             if missing:
                 # Not the last-line contract of a success: the deployer reads this line, then the error file.
                 print(json.dumps({"missing_secrets": missing}), flush=True)
@@ -282,7 +302,13 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(_deploy.planned_envs(profile)))
         else:
             deploy(profile, src, project=args.project, domain=args.domain, ref=args.ref, base_env=os.environ)
-    except (_profile.ProfileError, _deploy.DeployError, _deploy.Refused) as exc:
+    except (
+        _profile.ProfileError,
+        _deploy.DeployError,
+        _deploy.Refused,
+        _union_identity.IdentityMissing,
+        _union_identity.IdentityDenied,
+    ) as exc:
         args.error.write_text(str(exc))
         print(exc, file=sys.stderr)
         return 1

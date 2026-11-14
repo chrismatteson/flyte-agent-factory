@@ -23,6 +23,11 @@ signin_host = "signin.example.com"
 # Flyte config file passed to the CLI.
 config = "~/.flyte/example-config.yaml"
 
+[union]
+# Union secrets that each hold an API key (profiles/README.md#union). Required for a Union backend.
+project_key = "factory-project-key"
+deployer_key = "factory-deployer-key"
+
 [repo]
 # The workspace: the repository projects are pushed to (the only one [secrets] deploy_key reaches).
 project = "git@github.com:you/my-sandbox.git"

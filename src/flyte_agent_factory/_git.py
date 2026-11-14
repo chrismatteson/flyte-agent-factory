@@ -111,8 +111,12 @@ def install_deploy_key(repo: str = "") -> str | None:
     return str(key_path)
 
 
-async def clone(repo: str, branch: str, dest: Path) -> None:
+async def clone(repo: str, branch: str, dest: Path, credential: Path | None = None) -> None:
     """Clone `repo` into `dest`, installing its deploy key first.
+
+    `credential` is a git credential-store file holding an installation token (`_git_https.write_token`):
+    the App path, for a repo the App is installed on. `repo` must then be an `https://` URL, and no deploy
+    key is installed. The token reaches git through the store, never the command line or the remote URL.
 
     A single helper rather than the three copies this replaced, because the key
     is what makes a clone possible at all and two of those copies had
@@ -120,10 +124,16 @@ async def clone(repo: str, branch: str, dest: Path) -> None:
     the clone tries to run ssh-askpass and dies on `Host key verification
     failed`. Installing it here means a new call site cannot reintroduce that.
     """
-    install_deploy_key(repo)
+    env = None
+    if credential is not None:
+        from . import _git_https
+
+        env = {**os.environ, **_git_https.config_env(credential)}
+    else:
+        install_deploy_key(repo)
     cmd = ["git", "clone", *(["--branch", branch] if branch else []), repo, str(dest)]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
     )
     out, _ = await proc.communicate()
     if proc.returncode != 0:

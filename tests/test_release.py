@@ -1157,9 +1157,10 @@ async def test_a_pass_in_a_granted_round_restores_the_grants(rig, passed_in, gra
     _inbox._save_pass(passed_in, "A", verdict_posted=True)
     rig.start()
     await rig.advance(60)
+    # The escalation's last step is its message to the session; under load it lands after the fake minute.
+    await settle(rig, lambda: any("review budget" in str(text) for text in rig.proc.submitted[-1:]))
     assert _session_config._granted_rounds == passed_in - _session_config._QA_MAX_ROUNDS
     assert _session_config._max_rounds() == passed_in
-    await settle(rig, lambda: any("review budget" in str(text) for text in rig.proc.submitted[-1:]))
     message = rig.proc.submitted[-1]
     assert "review budget" in message
     if grants_left:

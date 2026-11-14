@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from itertools import islice
+from types import MappingProxyType
 from typing import Callable, cast
 
 import flyte
@@ -33,6 +35,7 @@ from . import (
     _profile,
     _pull_requests,
     _queue,
+    _union_identity,
 )
 from ._errors import REMOTE_ERRORS
 from ._images import agent_image
@@ -48,6 +51,7 @@ LABEL_ISSUE = "factory-issue"
 log = logging.getLogger(__name__)
 _missing_reports: set[str] = set()
 
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 _secrets: list[str | flyte.Secret] = []
 if PROFILE.board:
     _secrets.append(flyte.Secret(key=PROFILE.board.pat_secret, as_env_var=_board.TOKEN_ENV))
@@ -55,6 +59,7 @@ if PROFILE.github.configured:
     _secrets.append(
         flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_pull_requests.KEY_ENV_VAR)
     )
+_secrets.extend(_QUEUE_SECRETS)
 env = flyte.TaskEnvironment(
     name="factory-reconcile",
     image=agent_image(),
@@ -66,7 +71,14 @@ env = flyte.TaskEnvironment(
         "FLYTE_MCP_PROJECT": _factory.PROJECT,
         "FLYTE_MCP_DOMAIN": _factory.DOMAIN,
         **_profile.pod_env(),
+        **_QUEUE_ENV,
     },
+)
+
+
+#: Board drift: reads the board repo's issues, commits, PRs, branches and statuses, and sets a status.
+_DRIFT_SCOPE: Mapping[str, str] = MappingProxyType(
+    {"issues": "read", "contents": "read", "pull_requests": "read", "statuses": "write"}
 )
 
 
@@ -346,6 +358,7 @@ def heal_milestones(
 )
 async def reconcile(completion_run: str = "") -> str:
     """Heal the board (with `[board]`) and the issue milestones (with the GitHub App)."""
+    _union_identity.establish()
     if completion_run:
         # Submitted by the project's last act, before Flyte has marked its run terminal.
         while True:
@@ -383,7 +396,7 @@ async def reconcile(completion_run: str = "") -> str:
                 _board_events.drift,
                 PROFILE,
                 token,
-                _github.GithubApp(PROFILE.github.app_id, key),
+                _github.GithubApp(PROFILE.github.app_id, key, permissions=_DRIFT_SCOPE),
                 index.latest,
                 newest=index.newest,
                 queued=await asyncio.to_thread(queued_issues, PROFILE),
@@ -396,7 +409,11 @@ async def reconcile(completion_run: str = "") -> str:
     if milestones:
         try:
             count = await asyncio.to_thread(
-                heal_milestones, PROFILE, _github.GithubApp(PROFILE.github.app_id, key), None, runs
+                heal_milestones,
+                PROFILE,
+                _github.GithubApp(PROFILE.github.app_id, key, permissions=_github.ISSUES_WRITE),
+                None,
+                runs,
             )
             done.append(f"{count} milestone(s) posted")
         except REMOTE_ERRORS as exc:

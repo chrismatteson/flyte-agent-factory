@@ -13,6 +13,7 @@ import subprocess
 import sys
 import sysconfig
 from pathlib import Path
+from types import SimpleNamespace
 
 import flyte
 import flyte.app
@@ -199,10 +200,11 @@ def test_each_identity_is_its_own_app_with_its_own_token_and_archive(monkeypatch
         "browser_github_token",
         "tailscale_oauth_client_id",
         "tailscale_oauth_client_secret",
+        "factory-project-key",  # the queue tier's Union key, mounted last
     ]
     # linkedin overrides the default exit node with "" (direct egress): no exit node, no tailscale pair.
     assert _env_vars(apps["linkedin"])["BROWSER_EXIT_NODE"] == ""
-    assert [s.key for s in _secrets(apps["linkedin"])] == ["browser_linkedin_token"]
+    assert [s.key for s in _secrets(apps["linkedin"])] == ["browser_linkedin_token", "factory-project-key"]
 
 
 def test_the_deploy_override_of_the_exit_node_applies_to_inheriting_identities_only(monkeypatch):
@@ -227,6 +229,7 @@ def test_the_legacy_profile_yields_exactly_the_old_app(monkeypatch):
         ("browser_personal_token", "BROWSER_PERSONAL_TOKEN"),
         ("tailscale_oauth_client_id", "TAILSCALE_OAUTH_CLIENT_ID"),
         ("tailscale_oauth_client_secret", "TAILSCALE_OAUTH_CLIENT_SECRET"),
+        ("factory-project-key", "AGENT_FACTORY_UNION_KEY"),
     ]
 
 
@@ -432,7 +435,10 @@ def test_a_child_streams_its_stderr_and_keeps_the_last_lines(tmp_path, capsys):
 
 def test_the_apps_child_without_kubernetes_says_so_instead_of_a_traceback(no_kubernetes, tmp_path):
     profile = _profile.parse(WORK + PERSONAL)
-    env = _profile.child_env(profile, _env(_UNION_EAGER_API_KEY="unused"))
+    env = _profile.child_env(
+        profile,
+        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY="unused"),
+    )
     done = subprocess.run(
         [no_kubernetes, "-c", _deploy.APPS_CHILD, str(SRC), "0", "p", "d"],
         env=env,
@@ -449,7 +455,7 @@ def test_the_apps_child_without_kubernetes_says_so_instead_of_a_traceback(no_kub
 def test_the_apps_child_records_what_it_deployed():
     # The child's last step is `record(deploy_app(env))`: an app that was not active is not recorded.
     assert "record(_deploy_apps.deploy_app(env, dry_run=dry))" in _deploy.APPS_CHILD
-    assert _deploy.APPS_CHILD.index("import kubernetes") < _deploy.APPS_CHILD.index("init_from_api_key")
+    assert _deploy.APPS_CHILD.index("import kubernetes") < _deploy.APPS_CHILD.index("init_for_script")
 
 
 def test_the_apps_stage_runs_when_the_profile_enables_no_app(monkeypatch):
@@ -496,13 +502,14 @@ def _main_check(monkeypatch, tmp_path, text):
 
 @pytest.fixture
 def key(monkeypatch):
-    monkeypatch.setenv("_UNION_EAGER_API_KEY", "unused")
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "unused")
 
 
 def test_a_missing_secret_stops_the_check_naming_it_and_what_needs_it(monkeypatch, tmp_path, capsys, key):
     from flyte_agent_factory import _deploy_child
 
-    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda project, domain: set())
+    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda profile, project, domain: set())
     code, error = _main_check(monkeypatch, tmp_path, WORK + PERSONAL)
     assert code == 3
     out = capsys.readouterr().out.strip().splitlines()
@@ -519,7 +526,7 @@ def test_a_missing_secret_stops_the_check_naming_it_and_what_needs_it(monkeypatc
 def test_the_check_names_each_identitys_missing_token(monkeypatch, tmp_path, capsys, key):
     from flyte_agent_factory import _deploy_child
 
-    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda project, domain: set())
+    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda profile, project, domain: set())
     code, error = _main_check(monkeypatch, tmp_path, WORK + TWO)
     assert code == 3
     missing = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["missing_secrets"]
@@ -537,7 +544,7 @@ def test_the_check_defines_every_identity_app(key):
     profile = _profile.parse(WORK + TWO)
     needed = _deploy_child.collect_planned_secrets(profile, SRC, _env())
     assert needed["claude-browser-github"][0] == "browser_github_token"
-    assert needed["claude-browser-linkedin"] == ["browser_linkedin_token"]
+    assert needed["claude-browser-linkedin"] == ["browser_linkedin_token", "factory-project-key"]
 
 
 def test_the_check_passes_when_every_secret_exists(monkeypatch, tmp_path, capsys, key):
@@ -547,7 +554,7 @@ def test_the_check_passes_when_every_secret_exists(monkeypatch, tmp_path, capsys
     needed = _deploy_child.collect_planned_secrets(profile, SRC, _env())
     assert "browser_personal_token" in needed["claude-browser-personal"]
     everything = {secret for secrets in needed.values() for secret in secrets}
-    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda project, domain: everything)
+    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda profile, project, domain: everything)
     code, _ = _main_check(monkeypatch, tmp_path, WORK + PERSONAL)
     assert code == 0
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == _deploy.planned_envs(profile)
@@ -556,7 +563,7 @@ def test_the_check_passes_when_every_secret_exists(monkeypatch, tmp_path, capsys
 def test_secrets_that_cannot_be_listed_do_not_block_the_deploy(monkeypatch, tmp_path, capsys, key):
     from flyte_agent_factory import _deploy_child
 
-    def listing_fails(project, domain):
+    def listing_fails(profile, project, domain):
         raise ConnectionError("https://u:hunter2@x.org down")
 
     monkeypatch.setattr(_deploy_child, "_list_existing_secrets", listing_fails)
@@ -567,12 +574,61 @@ def test_secrets_that_cannot_be_listed_do_not_block_the_deploy(monkeypatch, tmp_
 
 
 def test_no_api_key_does_not_block_the_deploy(monkeypatch, tmp_path, capsys):
+    """On a laptop there is neither a deployer key nor the injected one: the check runs as the CLI login."""
+    import flyte
+    from flyte import remote
+
     from flyte_agent_factory import _deploy_child
 
     monkeypatch.delenv("_UNION_EAGER_API_KEY", raising=False)
-    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda *a: pytest.fail("no key, no lookup"))
+    monkeypatch.delenv("AGENT_FACTORY_DEPLOY_KEY_ENV", raising=False)
+    profile = _profile.parse(WORK + PERSONAL)
+    needed = _deploy_child.collect_planned_secrets(profile, SRC, _env())
+    everything = [SimpleNamespace(name=secret) for secrets in needed.values() for secret in secrets]
+    monkeypatch.setattr(flyte, "init_from_api_key", lambda **kw: pytest.fail("no API key on a laptop"))
+    monkeypatch.setattr(flyte, "init_from_config", lambda path=None, **kw: None)
+    monkeypatch.setattr(remote.Secret, "listall", lambda: iter(everything))
     code, _ = _main_check(monkeypatch, tmp_path, WORK + PERSONAL)
-    assert code == 0 and "secrets not verified: no API key" in capsys.readouterr().err
+    assert code == 0 and "not verified" not in capsys.readouterr().err
+
+
+def test_the_secret_lookup_acts_as_the_deployer_key_inside_the_deployer(monkeypatch, key):
+    """Never the pod's injected key: the variable the deployer names, or the CLI login without one."""
+    import flyte
+    from flyte import remote
+
+    from flyte_agent_factory import _deploy_child
+
+    seen = {}
+    monkeypatch.setattr(flyte, "init_from_api_key", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(flyte, "init_from_config", lambda *a, **kw: pytest.fail("no CLI login in a pod"))
+    monkeypatch.setattr(remote.Secret, "listall", lambda: iter([SimpleNamespace(name="a")]))
+    monkeypatch.setenv("_UNION_EAGER_API_KEY", "injected")
+    profile = _profile.parse(WORK)
+    assert _deploy_child._list_existing_secrets(profile, "p", "d") == {"a"}
+    assert seen == {"api_key": "unused", "project": "p", "domain": "d"}
+
+
+def test_the_secret_lookup_on_a_laptop_uses_the_cli_login(monkeypatch):
+    import flyte
+    from flyte import remote
+
+    from flyte_agent_factory import _deploy_child
+
+    seen = {}
+    monkeypatch.delenv("AGENT_FACTORY_DEPLOY_KEY_ENV", raising=False)
+    monkeypatch.setattr(flyte, "init_from_api_key", lambda **kw: pytest.fail("no API key on a laptop"))
+    monkeypatch.setattr(flyte, "init_from_config", lambda path=None, **kw: seen.update(kw))
+    monkeypatch.setattr(remote.Secret, "listall", lambda: iter([]))
+    assert _deploy_child._list_existing_secrets(_profile.parse(WORK), "p", "d") == set()
+    assert seen == {"project": "p", "domain": "d"}
+
+
+def test_a_check_without_the_deployer_key_fails_naming_the_variable(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
+    monkeypatch.delenv("AGENT_FACTORY_UNION_KEY", raising=False)
+    code, error = _main_check(monkeypatch, tmp_path, WORK + PERSONAL)
+    assert code == 1 and "AGENT_FACTORY_UNION_KEY is not set" in error.read_text()
 
 
 def test_the_secret_lookup_uses_the_deploy_project_and_domain(monkeypatch, tmp_path, key):
@@ -580,7 +636,7 @@ def test_the_secret_lookup_uses_the_deploy_project_and_domain(monkeypatch, tmp_p
 
     seen: list[tuple[str, str]] = []
 
-    def existing(project, domain):
+    def existing(profile, project, domain):
         seen.append((project, domain))
         return set()
 
@@ -613,9 +669,9 @@ def test_the_doc_says_a_dropped_browser_is_stopped_not_deleted():
 def test_a_check_that_finds_every_secret_says_so(monkeypatch, capsys):
     from flyte_agent_factory import _deploy_child
 
-    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda p, d: {"a", "b", "c"})
+    monkeypatch.setattr(_deploy_child, "_list_existing_secrets", lambda profile, p, d: {"a", "b", "c"})
     needed = {"env-1": ["a", "b"], "env-2": ["b"]}
-    assert _deploy_child.find_missing_secrets(needed, "p", "d", {"_UNION_EAGER_API_KEY": "k"}) == {}
+    assert _deploy_child.find_missing_secrets(_profile.parse(WORK), needed, "p", "d") == {}
     assert "secrets verified: all 2 present in p/d: a, b" in capsys.readouterr().err
 
 
@@ -656,7 +712,10 @@ def test_the_real_apps_child_stops_a_failed_browser_the_profile_dropped(tmp_path
     script = _deploy.APPS_CHILD.replace(
         "import os, sys, flyte\n", "import os, sys, flyte\n" + _FAILED_APP_STUB, 1
     )
-    env = _profile.child_env(profile, _env(_UNION_EAGER_API_KEY="unused"))
+    env = _profile.child_env(
+        profile,
+        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY="unused"),
+    )
     done = subprocess.run(
         [sys.executable, "-c", script, str(SRC), "0", "p", "d"],
         env=env,
@@ -672,11 +731,13 @@ def test_the_real_apps_child_stops_a_failed_browser_the_profile_dropped(tmp_path
 
 
 def test_the_factory_mounts_every_identitys_token_for_browser_link():
-    from flyte_agent_factory import _factory
+    from flyte_agent_factory import _factory_envs
 
     def mounted(text):
         return {
-            s.key: s.as_env_var for s in _factory._env_secrets(_profile.parse(text)) if not isinstance(s, str)
+            s.key: s.as_env_var
+            for s in _factory_envs.env_secrets(_profile.parse(text))
+            if not isinstance(s, str)
         }
 
     assert mounted(WORK + TWO)["browser_github_token"] == "BROWSER_GITHUB_TOKEN"

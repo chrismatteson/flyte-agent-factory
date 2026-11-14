@@ -7,6 +7,7 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -253,7 +254,8 @@ class _App:
     def __init__(self, app_id: str, pem: str) -> None:
         self.ids = (app_id, pem)
 
-    def installation_token(self, repo: str) -> str:
+    def installation_token(self, repo: str, permissions: Mapping[str, str]) -> str:
+        assert dict(permissions) == {"metadata": "read"}  # only whether it is installed: the least there is
         self.asked.append((*self.ids, repo))
         if self.error:
             raise self.error

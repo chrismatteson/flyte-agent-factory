@@ -28,6 +28,7 @@ from flyte_agent_factory import (
     _dashboard,
     _deploy,
     _factory_base,
+    _factory_envs,
     _factory_grants,
     _factory_live,
     _factory_meters,
@@ -43,6 +44,7 @@ from flyte_agent_factory import (
     _names,
     _profile,
     _queue,
+    _union_identity,
     browser,
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS as REMOTE_ERRORS
@@ -386,7 +388,9 @@ def _gardening_targets() -> list[_gardening.Target] | None:
     profile = _factory_base.PROFILE
     if not (profile.github.configured and _deploy.GITHUB_KEY_ENV in os.environ and profile.repo):
         return None
-    app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
+    app = _github.GithubApp(
+        profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV], permissions=_github.CONTENTS_READ
+    )
     try:
         text = app.read_file(_github.parse_repo(profile.repo), _gardening.FILE)
     except _github.GithubError as exc:
@@ -410,7 +414,11 @@ def gardening_decision(now: float | None = None) -> tuple[str, list[str]]:
         and _deploy.GITHUB_KEY_ENV in os.environ
         and _factory_base.PROFILE.repo
     ):
-        app = _github.GithubApp(_factory_base.PROFILE.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
+        app = _github.GithubApp(
+            _factory_base.PROFILE.github.app_id,
+            os.environ[_deploy.GITHUB_KEY_ENV],
+            permissions=_github.ISSUES_READ,
+        )
         open_issues = len(app.open_issues(_github.parse_repo(_factory_base.PROFILE.repo), _gardening.LABEL))
     regression = (
         _gardening.regressed(_gardening.read_counts(_factory_base.PROFILE.state.uri))
@@ -968,6 +976,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
         credentials=_factory_grants.reduce_to_public(data.get("credentials") or {}),
         snapshot_age_s=max(0, time.time() - generated) if generated is not None else None,
         standards=_factory_status._standards(data),
+        **_factory_status.status_fields(_factory_base.PROFILE, os.environ),
     )
     while True:
         output = json.dumps(result)
@@ -1062,46 +1071,14 @@ def cycle_projects() -> dict[str, Any]:
     return {"status": "rotating", "projects": rows}
 
 
-def _env_secrets(profile: _profile.Profile) -> list[str | flyte.Secret]:
-    mounted: list[str | flyte.Secret] = (
-        [
-            flyte.Secret(key=profile.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV),
-            flyte.Secret(key=cast(_profile.Board, profile.board).pat_secret, as_env_var="GITHUB_BOARD_PAT"),
-        ]
-        if profile.planner.admission == "planner"
-        else []
-    )
-    if profile.github.configured and profile.planner.admission != "planner":
-        # Read-only use: `gardening_decision` counts the open `gardening` issues.
-        mounted.append(flyte.Secret(key=profile.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV))
-    if profile.secrets.claude_token:
-        # Only for `mounted_token_fingerprint`: admission must tell the current token's readings from a
-        # swapped-out one's, and only the value can.
-        mounted.append(flyte.Secret(key=profile.secrets.claude_token, as_env_var=_factory_meters.TOKEN_ENV))
-    # Only for `factory.browser_link`, which asks an identity's app for a view ticket.
-    mounted.extend(
-        flyte.Secret(key=identity.token_secret, as_env_var=identity.token_env)
-        for identity in profile.browser.identities
-    )
-    return mounted
-
-
-def _scan_secrets(profile: _profile.Profile) -> list[str | flyte.Secret]:
-    """Return the deploy keys a scan pod clones with: the default one and each `[repo_keys]` entry."""
-    keys = [
-        (profile.secrets.deploy_key, _git.GIT_DEPLOY_KEY_ENV_VAR),
-        *((secret, _git.repo_key_env_var(key)) for key, secret in profile.repo_keys.items()),
-    ]
-    return [flyte.Secret(key=secret, as_env_var=var) for secret, var in keys if secret]
-
-
 # The factory env mounts no deploy key (its projects' pods do), so the scan has its own environment.
 # `_git.install_deploy_key` keeps one key per pod, which is why each repository is a separate action.
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_factory_base.PROFILE, "queue")
 scan_env = flyte.TaskEnvironment(
     name="gardening-scan",
     image=agent_image(),  # the image the factory runs in, i.e. $FLYTE_INTERNAL_IMAGE there
     resources=flyte.Resources(cpu=2, memory="4Gi"),
-    secrets=_scan_secrets(_factory_base.PROFILE),
+    secrets=[*_factory_envs.scan_secrets(_factory_base.PROFILE), *_QUEUE_SECRETS],
     env_vars={
         **(
             {_git.REPO_KEYS_ENV_VAR: json.dumps(_factory_base.PROFILE.repo_key_vars)}
@@ -1109,6 +1086,7 @@ scan_env = flyte.TaskEnvironment(
             else {}
         ),
         **_profile.pod_env(),
+        **_QUEUE_ENV,
     },
 )
 
@@ -1116,13 +1094,14 @@ env = flyte.TaskEnvironment(
     name="factory",
     image=agent_image(),
     resources=flyte.Resources(cpu=1, memory="1Gi"),
-    secrets=_env_secrets(_factory_base.PROFILE),
+    secrets=[*_factory_envs.env_secrets(_factory_base.PROFILE), *_QUEUE_SECRETS],
     depends_on=[scan_env],
     env_vars={
         "FLYTE_MCP_PROJECT": PROJECT,
         "FLYTE_MCP_DOMAIN": DOMAIN,
         "OPERATE_CAP": str(_factory_base.cap()),
         **_profile.pod_env(),
+        **_QUEUE_ENV,
     },
 )
 
@@ -1130,6 +1109,7 @@ env = flyte.TaskEnvironment(
 @env.task
 async def read_login_meter(account: str, engine: str = "claude") -> str:
     """Read the mounted setup-token's usage; return no secret material."""
+    _union_identity.establish()
     if engine != "claude" or account.partition(" ")[0] != engine:
         raise ValueError("meter account must name the Claude setup-token")
     try:
@@ -1160,6 +1140,7 @@ async def launch(
     names the signed-in browser identities the project may use, comma-separated; "none" removes the grant a
     resume would inherit, and "" leaves it as it is (a new project has none).
     """
+    _union_identity.establish()
     # Signed intake may use every configured repo; chat remains limited by [mcp] repos.
     if repo:
         _resolve_repo(repo)
@@ -1181,6 +1162,7 @@ async def launch(
 @env.task
 async def browser_link(identity: str) -> str:
     """Return JSON {identity, url}: a one-time link (ten minutes, single use) to sign in to `identity`."""
+    _union_identity.establish()
     configured = _factory_policy.browser_identity_names(_factory_base.PROFILE)
     if identity not in configured:
         known = ", ".join(sorted(configured)) or "none configured"
@@ -1196,6 +1178,7 @@ async def credential_link(name: str, credential: str, hours: float = 4.0) -> str
     `url` is the owner's seal link, `paste_to` the `direct-` condition to signal the sealed text to. No
     credential passes here.
     """
+    _union_identity.establish()
     link = await asyncio.to_thread(_factory_grants.credential_link, name, credential, hours, operated_live)
     return json.dumps(link)
 
@@ -1203,18 +1186,21 @@ async def credential_link(name: str, credential: str, hours: float = 4.0) -> str
 @env.task
 async def credentials() -> str:
     """JSON list over every live project: {project, credentials: [name, kind, state, expires]}. No values."""
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(_factory_grants.credentials, operated_live))
 
 
 @env.task
 async def status(name: str, rows: int = 40) -> str:
     """JSON status and the newest timeline rows from a project's run report."""
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(read_status, name, rows))
 
 
 @env.task
 async def queue_list() -> str:
     """JSON of the live projects, the waiting launches in order, and the most recent closed ones."""
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(queue_view))
 
 
@@ -1224,6 +1210,7 @@ async def queue_cancel(name: str) -> str:
 
     Aborts a live run of the request if a dispatcher had just created one.
     """
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(cancel, name))
 
 
@@ -1233,6 +1220,7 @@ async def rotate_token() -> str:
 
     Update the Flyte secret first. JSON: {status: rotating|nothing to rotate, projects: [...]}.
     """
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(cycle_projects))
 
 
@@ -1242,6 +1230,7 @@ async def set_reserve(account: str, k: float) -> str:
 
     `account` is claude or codex; 0 removes the reserve. The next admission uses it.
     """
+    _union_identity.establish()
     state = _factory_base.PROFILE.state.uri
     if not state:
         raise ValueError("the reserve needs [state] uri in the deployment profile")
@@ -1252,12 +1241,14 @@ async def set_reserve(account: str, k: float) -> str:
 @env.task
 async def clear_limit(engine: str = "claude") -> str:
     """Tell every pod `engine`'s usage limit was reset by hand; each drops it within a minute."""
+    _union_identity.establish()
     return json.dumps(await asyncio.to_thread(_factory_meters.clear_limit, engine))
 
 
 @env.task
 async def get_reserve() -> str:
     """JSON of each account's reserve constant (an account that is absent has none)."""
+    _union_identity.establish()
     state = _factory_base.PROFILE.state.uri
     return json.dumps(await asyncio.to_thread(_queue.read_reserves, state) if state else {})
 
@@ -1278,6 +1269,7 @@ async def get_reserve() -> str:
 )
 async def sweep() -> str:
     """Dispatch the queue; the safety net for the event-driven dispatch at the end of every project."""
+    _union_identity.establish()
     try:
         await asyncio.to_thread(_factory_recreate.recreate_aborted)
     except REMOTE_ERRORS as exc:  # a repair; the queue must still be dispatched without it
@@ -1309,6 +1301,7 @@ def _no_scan_key(repo: str) -> str:
 @scan_env.task(timeout=flyte.Timeout(max_runtime=SCAN_RUNTIME))
 async def list_targets(workspace_repo: str) -> str:
     """Return the targets in `gardening.toml` on `workspace_repo`, as JSON names."""
+    _union_identity.establish()
     if reason := _no_scan_key(workspace_repo):
         raise ValueError(f"cannot read {_gardening.FILE}: {reason}")
     with tempfile.TemporaryDirectory(prefix="gardening-targets-") as tmp:
@@ -1320,6 +1313,7 @@ async def list_targets(workspace_repo: str) -> str:
 @scan_env.task(timeout=flyte.Timeout(max_runtime=SCAN_RUNTIME))
 async def scan_target(repo: str) -> str:
     """Return standards gate on `repo`'s default branch: `{"counts": {rule: n}}` or `{"unscanned": why}`."""
+    _union_identity.establish()
     if reason := _no_scan_key(repo):
         return json.dumps({"unscanned": reason})
     with tempfile.TemporaryDirectory(prefix="gardening-scan-") as tmp:
@@ -1380,6 +1374,7 @@ async def garden_weekly() -> str:
     The scan records the standards-gate findings that `dispatch` weighs (`gardening_decision`) when it
     decides whether the launch takes a slot early.
     """
+    _union_identity.establish()
     if not _factory_base.PROFILE.repo:
         # A weekly trigger that raised would only fail every week; a skip says why and costs nothing.
         return "skip: gardening runs in the workspace repository: the profile needs one ([direction] repo)"
@@ -1426,6 +1421,7 @@ async def garden_weekly() -> str:
 )
 async def plan_pass() -> str:
     """Gather and admit Ready work while holding the direction repository's CAS lock."""
+    _union_identity.establish()
     from . import _admission, _board, _planner_facts, _planner_runtime
 
     if _factory_base.PROFILE.planner.admission != "planner":

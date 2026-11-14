@@ -41,7 +41,7 @@ import flyte
 from flyte import remote
 from flyte.io import Dir
 
-from flyte_agent_factory import _profile
+from flyte_agent_factory import _profile, _union_identity
 from flyte_agent_factory._git import clone
 from flyte_agent_factory._images import VOICE_PACKAGES, agent_image
 
@@ -71,6 +71,7 @@ retrain = flyte.Trigger(
 # A GPU, and therefore on-demand: this cluster has no GPUs in any spot
 # nodepool, so `interruptible=True` with a GPU is rejected at admission. No
 # device class is named, so the scheduler can use whatever is free.
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="voice-factory",
     image=(
@@ -82,8 +83,8 @@ env = flyte.TaskEnvironment(
     ),
     resources=flyte.Resources(cpu=(2, 8), memory=("8Gi", "32Gi"), gpu=1, disk="50Gi"),
     interruptible=False,
-    env_vars={"PYTHONUNBUFFERED": "1", **_profile.pod_env()},
-    secrets=[flyte.Secret(key=PROFILE.secrets.deploy_key, as_env_var="GIT_DEPLOY_KEY")],
+    env_vars={"PYTHONUNBUFFERED": "1", **_profile.pod_env(), **_QUEUE_ENV},
+    secrets=[flyte.Secret(key=PROFILE.secrets.deploy_key, as_env_var="GIT_DEPLOY_KEY"), *_QUEUE_SECRETS],
 )
 
 
@@ -102,6 +103,7 @@ async def train(audio: Dir, repo: str = DEFAULT_REPO, branch: str = "") -> str:
         A one-line summary naming the artifact version it published.
 
     """
+    _union_identity.establish()
     import flyte.report
 
     work = Path("/tmp/voice-factory")

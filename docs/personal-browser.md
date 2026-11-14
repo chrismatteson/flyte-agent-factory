@@ -233,7 +233,7 @@ app on its next tick.
 
 Every slot is redeployed with the rest of the slots on the next merge, which is what mounts the tokens
 there. Before deploying anything, the deployer's check
-(`python -m flyte_agent_factory._deploy_child check`) imports every
+(the `check` step of `flyte_agent_factory._deploy_child`) imports every
 environment the profile plans, as each deploy child would, and for a profile with the personal
 browser also defines every identity's app; if any of that fails, nothing is deployed.
 

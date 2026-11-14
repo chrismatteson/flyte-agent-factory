@@ -328,6 +328,9 @@ async def test_author_uses_deploy_policy(monkeypatch, explicit, expected):
         pass
 
     class Timeline:
+        def row(self, *args):
+            pass
+
         def header(self, key, value):
             headers[key] = value
 

@@ -28,10 +28,11 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import flyte
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
         _profile,
         _pull_requests,
         _router,
+        _union_identity,
     )
     from . import (
         _git as _repo_git,
@@ -89,6 +91,7 @@ else:
         _profile,
         _pull_requests,
         _router,
+        _union_identity,
     )
     from flyte_agent_factory import (
         _git as _repo_git,
@@ -115,18 +118,22 @@ QUEUE_BOUND = timedelta(minutes=10)
 #: Labels on every case run, so a benchmark's runs are listed by the server.
 LABEL_BENCH = "factory-bench"
 
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="factory-bench",
     image=agent_image(),
     # Polling, git fetches and the deploy subprocesses that submit image builds: nothing heavy.
     resources=flyte.Resources(cpu=1, memory="2Gi"),
     # The App fetches the engine and each case's branch; it never reaches a deploy child or a check.
-    secrets=(
-        [flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV)]
-        if PROFILE.github.private_key_secret
-        else []
-    ),
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env()},
+    secrets=[
+        *(
+            [flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_deploy.GITHUB_KEY_ENV)]
+            if PROFILE.github.private_key_secret
+            else []
+        ),
+        *_QUEUE_SECRETS,
+    ],
+    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     depends_on=[_bench_check.env],
 )
 
@@ -145,20 +152,28 @@ def _app() -> _github.GithubApp:
     key = os.environ.get(_deploy.GITHUB_KEY_ENV, "")
     if not key:
         raise RuntimeError(f"the benchmark needs the GitHub App key mounted as {_deploy.GITHUB_KEY_ENV}")
-    return _github.GithubApp(PROFILE.github.app_id, key)
+    return _github.GithubApp(PROFILE.github.app_id, key, permissions=_APP_SCOPE)
 
 
-def _clone_url(app: _github.GithubApp, url: str) -> str:
-    """Return an HTTPS URL for `url` carrying an installation token. Secret: never log it."""
+#: The benchmark's own API calls: the engine's default-branch head, the loop's kill switch and breaker
+#: issues, and a production PR's state. Clones and pushes mint their own token (`_clone_url`).
+_APP_SCOPE: Mapping[str, str] = MappingProxyType(
+    {"contents": "read", "issues": "write", "pull_requests": "read"}
+)
+
+
+def _clone_url(app: _github.GithubApp, url: str, permissions: Mapping[str, str]) -> str:
+    """Return an HTTPS URL for `url` with a token limited to `permissions`. Secret: never log it."""
     repo = _github.parse_repo(url)
-    return _github.clone_url(repo, app.installation_token(repo))
+    return _github.clone_url(repo, app.installation_token(repo, permissions))
 
 
 def _store(app: _github.GithubApp) -> _bench_store.Store:
     if PROFILE.direction is None:
         raise _bench_store.StoreError("benchmark results require a [direction] repository")
     try:
-        return _bench_store.Store(_clone_url(app, PROFILE.direction.repo))
+        # The store commits and pushes results.
+        return _bench_store.Store(_clone_url(app, PROFILE.direction.repo, _github.CONTENTS_WRITE))
     except _github.GithubError:
         raise _bench_store.StoreError(
             "results store could not obtain a GitHub App installation token for the direction repository; "
@@ -173,7 +188,7 @@ def _source_clone_url(app: _github.GithubApp, repo: str) -> str:
     environments and a trigger at import, which the bench pod has no business deploying.
     """
     try:
-        return _github.clone_url(repo, app.installation_token(repo))
+        return _github.clone_url(repo, app.installation_token(repo, _github.CONTENTS_READ))
     except _github.GithubError as exc:
         if exc.status != 404:
             raise
@@ -720,6 +735,7 @@ QUOTA_MAX_WAIT_S = 8 * 24 * 3600
 @env.task
 async def read_login_meter(account: str, poll: str = "") -> str:
     # Depending on the factory environment would also register its production queue-sweep trigger.
+    _union_identity.establish()
     return await _factory.read_login_meter.func(account)
 
 
@@ -789,6 +805,7 @@ async def run_case(case: str) -> str:
 
     Retried runs re-attach to the case's run by its deterministic name.
     """
+    _union_identity.establish()
     planned = json.loads(case)
     app = _app()
     if planned.get("login") and await asyncio.to_thread(_existing_run, planned["case"]) is None:
@@ -796,7 +813,13 @@ async def run_case(case: str) -> str:
         planned["meter_at_start"] = {"five_h_pct": meter.five_hour_pct, "week_pct": meter.weekly_pct}
     cancelled = threading.Event()
     driver = asyncio.create_task(
-        asyncio.to_thread(drive_case, planned, _clone_url(app, _bench_table().repo), cancelled=cancelled)
+        # The case pushes its starting branch to the bench repo.
+        asyncio.to_thread(
+            drive_case,
+            planned,
+            _clone_url(app, _bench_table().repo, _github.CONTENTS_WRITE),
+            cancelled=cancelled,
+        )
     )
     try:
         run, final, harness = await asyncio.shield(driver)
@@ -808,8 +831,9 @@ async def run_case(case: str) -> str:
         except asyncio.CancelledError:
             pass  # The driver re-raises cancellation only after its cleanup boundary finishes.
         raise
-    # A fresh URL: an installation token lasts an hour, and the case may have run for three.
-    url = _clone_url(app, _bench_table().repo)
+    # A fresh URL: an installation token lasts an hour, and the case may have run for three. The cleanup
+    # deletes the case's branches by push.
+    url = _clone_url(app, _bench_table().repo, _github.CONTENTS_WRITE)
     check = None if harness["outcome"] == "harness_error" else await check_case(url, planned)
     if check is not None and planned["kind"] == "escalate":
         harness["commits"] = check["commits"]
@@ -843,7 +867,11 @@ def deploy_engine_sync(app: _github.GithubApp, sha: str, source: _bench.Source |
         # The deploy children import and run the engine being benchmarked: they never get the App key.
         credentials = _pull_requests.credential_env_vars(PROFILE.github.private_key_secret, os.environ)
         base = {k: v for k, v in os.environ.items() if k not in credentials}
-        url = _source_clone_url(app, source.repo) if source else _clone_url(app, PROFILE.repos["factory"])
+        url = (
+            _source_clone_url(app, source.repo)
+            if source
+            else _clone_url(app, PROFILE.repos["factory"], _github.CONTENTS_READ)
+        )
         with _deploy.fetched_tree(url, sha) as tree:
             src = _bench.candidate_src(tree, source.path) if source else tree / "src"
             code = _deploy.deploy_slots(
@@ -857,6 +885,7 @@ def deploy_engine_sync(app: _github.GithubApp, sha: str, source: _bench.Source |
 @env.task
 async def deploy_engine(sha: str, source_repo: str = "", source_path: str = "") -> list[str]:
     """Return the bench env names of engine `sha`, deployed if they were not already."""
+    _union_identity.establish()
     source = candidate_source(source_repo, source_path)
     return await asyncio.to_thread(deploy_engine_sync, _app(), sha, source)
 
@@ -1089,6 +1118,7 @@ async def benchmark(
     Flyte bounds each case to its time cap plus the stop delivery and grace windows.
     `max_usd = 0` returns the estimate and spends nothing.
     """
+    _union_identity.establish()
     app = _app()
     engine_source = candidate_source(source_repo, source_path)
     # The source is passed only when there is one: the default call keeps its old shape.
@@ -1421,4 +1451,5 @@ def _collect_labels() -> int:
 )
 async def collect_labels() -> int:
     """Publish new production labels to the direction repository's results branch."""
+    _union_identity.establish()
     return await asyncio.to_thread(_collect_labels)

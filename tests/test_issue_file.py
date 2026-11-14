@@ -1,5 +1,6 @@
 """`.claude-flyte/ISSUE.md`: the supervisor reads the linked issue so the session needs no credential."""
 
+import json
 import os
 import stat
 from datetime import datetime, timezone
@@ -181,6 +182,13 @@ def test_only_get_requests_are_made(tmp_path, app, profile, github):
     assert {m for m, path in methods if path.startswith(f"/repos/{REPO}/issues")} == {"GET"}
     # minting the installation token is the one POST, and it is the App's, not the issue's
     assert {p for m, p in methods if m != "GET"} == {"/app/installations/77/access_tokens"}
+
+
+def test_the_token_reads_issues_and_nothing_else(tmp_path, app, profile, github):
+    # Least privilege (#179): the supervisor's App may write issues, but ISSUE.md only reads one.
+    write(tmp_path, app, profile)
+    minted = [json.loads(r.content) for r in github.requests if r.url.path.endswith("/access_tokens")]
+    assert minted and all(body["permissions"] == {"issues": "read"} for body in minted)
 
 
 def test_github_error_is_a_row_and_keeps_the_previous_file(tmp_path, app, profile, github):

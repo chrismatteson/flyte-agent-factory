@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import _auth, _board, _browser_exit_node, _git, _names, _profile, _pull_requests
+from . import _board, _browser_exit_node, _git, _names, _profile, _pull_requests, _union_identity
 
 if TYPE_CHECKING:
     from ._profile import Profile
@@ -53,11 +53,19 @@ CREDENTIAL_VARS = (
 )
 
 #: What a session keeps although it is a secret, because its documented work needs it:
-#: - the Union API key: `flyte_agent_factory.child.attach()` initialises the Flyte SDK from it to submit
-#:   child actions. It is the residual exposure: a Bash tool call can print it, and it is redacted
-#:   from published text (`_bridge.redact_tokens`) only where its format is recognisable.
+#: - the session tier's Union key and the variables that say how to use it (`session_env` sets them):
+#:   `child.attach()` submits child actions as it. It is the residual exposure: a Bash tool call can print
+#:   it, and it is redacted from published text (`_bridge.redact_tokens`) only where its format is
+#:   recognisable. It is the session tier's key, never the supervisor's, and never the one Union injects.
 #: - `PROJECT_ANTHROPIC_API_KEY`: the session instructions reserve it for the project's own API calls.
-SESSION_KEEPS = (*_auth.API_KEY_ENV_VARS, PROJECT_API_KEY_VAR)
+SESSION_KEEPS = (
+    _union_identity.KEY_ENV,
+    "FLYTE_AUTH_TYPE",
+    "FLYTE_AUTH_COMMAND",
+    _union_identity.TIER_ENV,
+    _union_identity.SECRET_ENV,
+    PROJECT_API_KEY_VAR,
+)
 
 #: Put before the subcommand of every git call the supervisor makes in a workspace the session writes.
 #: The session owns `.git/config` and `.git/hooks`, and `core.fsmonitor` and a hook are programs git
@@ -111,18 +119,28 @@ def session_env(env: Mapping[str, str], profile: Profile | None) -> dict[str, st
     prefix = env.get(_pull_requests.SECRETS_PREFIX_ENV_VAR, _pull_requests.DEFAULT_SECRETS_PREFIX)
     hidden = {
         *CREDENTIAL_VARS,
+        *_union_identity.INJECTED_VARS,  # another tier's identity: no child may act as it
         *_pull_requests.credential_env_vars(secret, env),
         *_board.credential_env_vars(board_secret, env),
         *_browser_exit_node.credential_env_vars(_browser_exit_node.settings()["tailscale_secret"], env),
         *mounted_secret_vars(env, profile),
         *browser_token_vars(env, profile),
     }
-    return {
+    kept = {
         k: v
         for k, v in env.items()
         if k in SESSION_KEEPS
         or not (k in hidden or k.startswith(_git.GIT_DEPLOY_KEY_ENV_VAR) or (prefix and k.startswith(prefix)))
     }
+    kept.pop(_union_identity.SESSION_KEY_ENV, None)  # the child gets that key as KEY_ENV instead
+    key = _union_identity.session_key(env)
+    if key:  # a pod without a Union identity (local, tests) gets none invented
+        kept[_union_identity.KEY_ENV] = key
+        kept[_union_identity.TIER_ENV] = "session"
+        kept[_union_identity.SECRET_ENV] = (
+            profile.union.key_for("session") if profile else env.get(_union_identity.SECRET_ENV, "")
+        )
+    return kept
 
 
 def child_env(**extra: str) -> dict[str, str]:

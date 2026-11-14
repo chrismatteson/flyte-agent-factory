@@ -239,7 +239,9 @@ def killed(profile: Profile, app: _github.GithubApp | None = None) -> bool:
 
         from ._pull_requests import KEY_ENV_VAR
 
-        app = _github.GithubApp(profile.github.app_id, os.environ[KEY_ENV_VAR])
+        app = _github.GithubApp(
+            profile.github.app_id, os.environ[KEY_ENV_VAR], permissions=_github.ISSUES_READ
+        )
     maintainers = {login.lower() for login in profile.github.maintainers}
     trusted = maintainers | {app.app_login().lower()}
     for issue in app.labelled_issues(profile.loop.repo, "loop-kill"):

@@ -70,6 +70,16 @@ def context_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / CONTEXT_SUBPATH
 
 
+def find_base(start: str | Path | None = None) -> Path:
+    """Return the nearest directory, from `start` (default the cwd) upwards, holding a run context.
+
+    A workspace project's commands run in `projects/<name>/` while the supervisor drops the context at
+    the workspace root, so the cwd alone would miss it. With none found, `start` itself.
+    """
+    here = Path(start) if start is not None else Path.cwd()
+    return next((d for d in (here, *here.resolve().parents) if context_path(d).is_file()), here)
+
+
 def write_context(base_dir: str | Path) -> Path:
     """Persist the current task's context so subprocesses can attach to it.
 
@@ -115,21 +125,22 @@ def attach(base_dir: str | Path | None = None) -> TaskContext:
     import flyte
     from flyte._internal.controllers import create_controller, get_controller
 
-    path = context_path(base_dir) if base_dir is not None else None
-    ctx = flyte.load_interactive_ctx(path=path) if path else flyte.load_interactive_ctx()
+    from . import _union_identity
+
+    base = Path(base_dir) if base_dir is not None else find_base()
+    ctx = flyte.load_interactive_ctx(path=context_path(base))
 
     # `load_interactive_ctx` installs the context but deliberately creates no
     # controller -- it was written for debuggers, which only read. Submission
-    # goes through one, and "rust" authenticates from the API key already in
-    # this pod's environment.
+    # goes through one. "remote" with `controller_kwargs` acts as this pod's tier key; "rust" would
+    # authenticate as the key Union injects into every pod, which is another tier's identity.
     try:
         get_controller()
     except RuntimeError:
-        create_controller("rust")
+        create_controller("remote", **_union_identity.controller_kwargs())
 
     # Whatever is submitted from here on is this caller's to stop, and nobody else's.
     _install_hook()
-    base = Path(base_dir) if base_dir is not None else Path.cwd()
     global _process_sink
     _process_sink = lambda name: record_child(base, ctx.action.name, name)  # noqa: E731 -- replaces, not stacks
     return ctx
@@ -148,7 +159,7 @@ def attach(base_dir: str | Path | None = None) -> TaskContext:
 #
 # Every controller names a child through `convert.generate_sub_action_id_and_output_path`, called as a
 # module attribute, so wrapping it sees every submission without touching the controller (which is a
-# compiled extension for "rust"). The listing was the alternative: it cannot tell siblings apart.
+# compiled extension in some controllers). The listing was the alternative: it cannot tell siblings apart.
 
 #: The sink for submissions made anywhere in this process (set by `attach`, so a second call replaces it),
 #: and the sinks for those made in one asyncio task tree.

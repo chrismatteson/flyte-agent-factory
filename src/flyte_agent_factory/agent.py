@@ -67,7 +67,6 @@ from flyte_agent_factory import (
     _issue_file,
     _issues,
     _judgement,
-    _local_browser,
     _meter,
     _names,
     _policy,
@@ -85,6 +84,7 @@ from flyte_agent_factory import (
     _supervise,
     _supervise_support,
     _timeline,
+    _union_identity,
     _usage,
 )
 from flyte_agent_factory._auth import (
@@ -134,12 +134,14 @@ def _shell_policy_env() -> dict[str, str]:
 
     The policy keys and the tooling variables (`_names.TOOLING_FIXED`): the other `AGENT_FACTORY_*`
     variables are this machine's paths (base dir, workspace) or are set for the pod by the lines around it.
+    Never the shell's own Union identity (#183) nor what only the deployer may set (#179).
     """
     return {
         k: v
         for k, v in os.environ.items()
         if k.startswith(_names.PREFIX)
-        and k not in _names.POD_FIXED | {_profile.PROFILE_ENV, _profile.TOML_ENV}
+        and k not in _names.POD_FIXED | {_profile.PROFILE_ENV, _profile.TOML_ENV, *_profile.DEPLOYER_ONLY_ENV}
+        and k not in _union_identity.OWN_IDENTITY_ENV
     }
 
 
@@ -215,6 +217,9 @@ _PROFILE_SLOT = (
 #: Every identity's token is mounted on every slot; which project may use which is decided at run time.
 _browser_identities = _session_config._PROFILE.browser.identities if _session_config._PROFILE else ()
 
+_project_secrets, _project_env = _union_identity.pod_for(_session_config._PROFILE, "project")
+_session_secrets, _session_env_vars = _union_identity.pod_for(_session_config._PROFILE, "session")
+
 env = flyte.TaskEnvironment(
     name=_ENV_NAME,
     # Modules reached lazily (`_factory` and its deps; the `credential-grant` command) must ship explicitly.
@@ -222,6 +227,7 @@ env = flyte.TaskEnvironment(
         "_factory.py",
         "_deploy.py",
         "_factory_base.py",
+        "_factory_envs.py",
         "_factory_grants.py",
         "_factory_live.py",
         "_factory_meters.py",
@@ -265,6 +271,7 @@ env = flyte.TaskEnvironment(
     # Unpacked into a fresh list so it takes `TaskEnvironment`'s `list[str | Secret]` (lists are invariant).
     secrets=[
         *_secrets(),
+        *_project_secrets,
         # Every slot carries every identity's token, for the supervisor only (`_secret_env.session_env`).
         *(
             flyte.Secret(key=identity.token_secret, as_env_var=identity.token_env)
@@ -276,6 +283,7 @@ env = flyte.TaskEnvironment(
     # itself at startup, via `_export_runtime_env`.
     env_vars={
         "PYTHONUNBUFFERED": "1",
+        **_project_env,
         "AGENT_FACTORY_ENGINE_SHA": _names.getenv("AGENT_FACTORY_ENGINE_SHA", ""),
         "AGENT_FACTORY_BROWSER_IDENTITY_NAMES": ",".join(i.name for i in _browser_identities),
         **_browser_exit_node.deploy_env(_session_config._PROFILE),
@@ -286,11 +294,7 @@ env = flyte.TaskEnvironment(
         **_codex_token_secret_env(),
         # Which mounted deploy key belongs to which repo (`_profile.Profile.deploy_env`);
         # `_git.install_deploy_key` reads it in the pod.
-        **(
-            {_git.REPO_KEYS_ENV_VAR: os.environ[_git.REPO_KEYS_ENV_VAR]}
-            if _names.getenv(_git.REPO_KEYS_ENV_VAR)
-            else {}
-        ),
+        **{k: v for k, v in os.environ.items() if k == _git.REPO_KEYS_ENV_VAR and v},
         # Per-role model/effort/engine choices made at deploy (e.g. every judge on Codex),
         # carried into the pod where the supervisor reads them.
         **_shell_policy_env(),
@@ -312,7 +316,8 @@ setup_env = flyte.TaskEnvironment(
     name="factory-setup",
     image=agent_image(),
     resources=flyte.Resources(cpu=1, memory="2Gi"),
-    env_vars={"PYTHONUNBUFFERED": "1", **_profile.pod_env()},
+    secrets=[*_project_secrets],
+    env_vars={"PYTHONUNBUFFERED": "1", **_project_env, **_profile.pod_env()},
 )
 
 # Sub-agents run here, not in `env`. Secrets are declared per environment, so a
@@ -324,9 +329,10 @@ subagent_env = flyte.TaskEnvironment(
     name=_SUBAGENT_ENV_NAME,
     image=agent_image(),
     resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="50Gi"),
-    secrets=[*_credentials_secret()],  # see `env` above: a copy typed as `list[str | Secret]`
+    secrets=[*_credentials_secret(), *_session_secrets],  # see `env` above: typed as `list[str | Secret]`
     env_vars={
         "PYTHONUNBUFFERED": "1",
+        **_session_env_vars,
         "AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE": _names.getenv("AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE", "claude"),
         **_token_secret_env(),
         **_codex_token_secret_env(),
@@ -407,6 +413,7 @@ async def project(
     # First, before any child exists: same-uid processes (the session's Bash calls) cannot then read
     # this process's credentials from /proc/<pid>/environ or /proc/<pid>/mem.
     _auth.set_non_dumpable()
+    identity = _union_identity.establish()
     timeline = _timeline._Timeline()
     # Before anything is spawned: no child inherits the App's key, under either of its names.
     app_key = _pull_requests.take_app_key(
@@ -439,13 +446,14 @@ async def project(
 
     timeline.header("project", project_name)
     timeline.header("run", run_name)
+    timeline.row("🔑", f"Union: tier {identity.tier}, secret {identity.secret}, client {identity.client_id}")
     timeline.header("model", f"{model} ({effort or 'default effort'})")
     # The console's run page, from the same profile the probes use; "" where there is no console.
     timeline.run_url = _board.run_url(_session_config._PROFILE, run_name) if ctx and ctx.action else ""
     github = _session_config._PROFILE.github if _session_config._PROFILE else None
-    milestone_app = (
-        _github.GithubApp(github.app_id, app_key) if github and github.configured and app_key else None
-    )
+    milestone_app: _github.GithubApp | None = None
+    if github and github.configured and app_key:  # milestones are comments on the project's issue
+        milestone_app = _github.GithubApp(github.app_id, app_key, permissions=_github.ISSUES_WRITE)
     # Quietly: `_start_board` normalises it again below and is the one that says when it cannot.
     timeline.issues = await asyncio.to_thread(
         _issues.for_project,
@@ -541,7 +549,7 @@ async def project(
 
     # --- workspace ------------------------------------------------------ #
     await _session_setup._prepare_workspace(
-        brief=brief, repo=repo, branch=branch, resuming=state.resumed, timeline=timeline
+        brief=brief, repo=repo, branch=branch, resuming=state.resumed, timeline=timeline, app_key=app_key
     )
     await _session_setup._start_pull_requests(repo, app_key, timeline)
     await _supervise_support._start_board(issue, project_name, board_token, timeline)
@@ -566,8 +574,10 @@ async def project(
     # reporting "the console is signed out", because every word of console-auth
     # guidance had gone into the demo memory and none into this one.
     console_token = _session_config.BASE_DIR / ".console-token"
-    if browser and _session_config._CONSOLE_HOST and _local_browser.api_key():
-        console_token.write_text(_local_browser.api_key())
+    # The session tier's key, which is the one the session itself acts as (`_secret_env.session_env`).
+    session_key = _union_identity.session_key(os.environ)
+    if browser and _session_config._CONSOLE_HOST and session_key:
+        console_token.write_text(session_key)
         console_token.chmod(0o600)
         timeline.row("🔑", f"console token at {console_token} for the session to install")
     else:
@@ -1072,6 +1082,7 @@ async def subagent(
     import flyte.report
 
     _auth.set_non_dumpable()  # as in `project`: the sub-agent's children cannot read this process's secrets
+    _union_identity.establish()
     route_blob = None
     routes: list[dict[str, Any]] = []
     refusals: dict[str, float] = {}
@@ -1323,19 +1334,10 @@ async def codex_bootstrap_login(secret_name: str = "", attempts: int = 3) -> str
     link, sign in and enter the code; the login is stored as the Flyte secret `secret_name`. With no
     argument, the profile's only slot `codex_login`. Name the same secret on one slot as `codex_login`.
     """
-    if not secret_name:
-        logins = _codex_login.profile_logins()
-        if len(logins) != 1:
-            raise ValueError(
-                "pass secret_name: the profile names "
-                + (", ".join(logins) if logins else "no slot codex_login")
-            )
-        secret_name = logins[0]
-    if not secret_name.startswith("codex_login"):
-        # Chat can start this task, so it must not be able to overwrite any other secret.
-        raise ValueError(f"secret_name must start with codex_login, not {secret_name!r}")
+    _union_identity.establish()
+    name, timeline = _codex_login.login_secret(secret_name), _timeline._Timeline()
     return await _codex_login.bootstrap(
-        secret_name, store=_author._replace_secret, timeline=_timeline._Timeline(), attempts=attempts
+        name, store=_author._replace_secret, timeline=timeline, attempts=attempts
     )
 
 
@@ -1366,6 +1368,7 @@ async def gcp_bootstrap(
     default (`roles/owner`; the list of APIs the infrastructure brief needs). Delete the key and
     the service account when the project is finished.
     """
+    _union_identity.establish()
     gcp = _session_config._PROFILE.gcp if _session_config._PROFILE else None
     timeline = _timeline._Timeline()
     timeline.header("what", "bootstrapping GCP access for a project")
@@ -1385,9 +1388,6 @@ async def gcp_bootstrap(
             timeline.row("⏳", f"no code within {max_wait_s}s")
             return ""
 
-    async def store(name: str, value: str) -> None:
-        await flyte.remote.Secret.create.aio(name=name, value=value)
-
     try:
         async with httpx.AsyncClient(timeout=60) as http:
             summary = await _gcp.bootstrap(
@@ -1400,7 +1400,7 @@ async def gcp_bootstrap(
                 billing_roles=_gcp_setting(billing_roles, (), _gcp.DEFAULT_BILLING_ROLES),
                 apis=_gcp_setting(apis, gcp.apis if gcp else (), _gcp.DEFAULT_APIS),
                 ask=ask,
-                store_secret=store,
+                store_secret=lambda name, value: flyte.remote.Secret.create.aio(name=name, value=value),
                 log=timeline.row,
                 http=http,
                 attempts=attempts,

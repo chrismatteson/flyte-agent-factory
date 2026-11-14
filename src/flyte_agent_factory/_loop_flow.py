@@ -10,8 +10,9 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import TypedDict, cast
 
 import flyte
@@ -36,10 +37,12 @@ from . import (
     _pull_requests,
     _queue,
     _router,
+    _union_identity,
 )
 from ._images import agent_image
 
 PROFILE = _profile.require()
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="factory-loop",
     image=agent_image(),
@@ -58,18 +61,38 @@ env = flyte.TaskEnvironment(
                 if PROFILE.github.configured
                 else []
             )
+            + _QUEUE_SECRETS
         ),
     ),
     env_vars={
         "FLYTE_MCP_PROJECT": _factory.PROJECT,
         "FLYTE_MCP_DOMAIN": _factory.DOMAIN,
         **_profile.pod_env(),
+        **_QUEUE_ENV,
     },
 )
 
 
-def _app() -> _github.GithubApp:
-    return _github.GithubApp(PROFILE.github.app_id, os.environ[_pull_requests.KEY_ENV_VAR])
+#: `loop_run` up to the merge, on the `[loop]` repo: reads the PR, its CI and review status, comments on and
+#: labels it, and reads (or opens) the kill switch and breaker issues. Not `contents: write`: a dry-run loop
+#: must work on an App that holds only `contents: read`.
+_REVIEW_SCOPE: Mapping[str, str] = MappingProxyType(
+    {"pull_requests": "write", "issues": "write", "contents": "read", "statuses": "read", "checks": "read"}
+)
+#: The backlog generator: reads the loop repo's tree and issues, and opens issues.
+_BACKLOG_SCOPE: Mapping[str, str] = MappingProxyType({"contents": "read", "issues": "write"})
+
+
+def _merge_scope_for_pr() -> Mapping[str, str]:
+    """Return what merging a loop PR needs; `workflows: write` only when `[github] workflows` is set."""
+    return MappingProxyType(
+        {**_github.session_push_scope(PROFILE.github.workflows), "pull_requests": "write"}
+    )
+
+
+def _app(permissions: Mapping[str, str]) -> _github.GithubApp:
+    key = os.environ[_pull_requests.KEY_ENV_VAR]
+    return _github.GithubApp(PROFILE.github.app_id, key, permissions=permissions)
 
 
 def _engine_source() -> dict[str, str]:
@@ -327,10 +350,11 @@ def _previous_decision(
 @env.task(report=True, timeout=flyte.Timeout(max_queued_time=timedelta(minutes=5)))
 async def loop_run(pr_number: int) -> str:
     """Process a PR in [loop] repo. Dry-run records the decision; disabled loops do nothing."""
+    _union_identity.establish()
     if not PROFILE.loop.enabled:
         return "skip"
     snapshot = await _initialize_spend() or {}
-    app, repo = _app(), PROFILE.loop.repo
+    app, repo = _app(_REVIEW_SCOPE), PROFILE.loop.repo
     pull = await asyncio.to_thread(app.pull, repo, pr_number)
     if pull["state"] != "open":
         return "skip"
@@ -448,7 +472,7 @@ async def loop_run(pr_number: int) -> str:
             body = _loop.decision_comment("stale", verdict, head, baseline, mode=mode)
             await asyncio.to_thread(_comment_once, app, repo, pr_number, body)
             return "stale"
-        result = await asyncio.to_thread(app.merge_pull, repo, pr_number, head)
+        result = await asyncio.to_thread(_app(_merge_scope_for_pr()).merge_pull, repo, pr_number, head)
         if not result.get("merged"):
             raise _github.GithubError("GitHub did not merge the pull request")
         await asyncio.to_thread(app.add_labels, repo, pr_number, ["loop:merged"])
@@ -473,7 +497,8 @@ def _generate_backlog(app: _github.GithubApp) -> str:
         records, summaries = [], []
         if PROFILE.direction:
             store_repo = _github.parse_repo(PROFILE.direction.repo)
-            url = _github.clone_url(store_repo, app.installation_token(store_repo))
+            # Read only: the generator reads the results store and never pushes to it.
+            url = _github.clone_url(store_repo, app.installation_token(store_repo, _github.CONTENTS_READ))
             with _bench_store.Store(url) as store:
                 records = store.records()
                 for summary_path in sorted((store.tree / "runs").glob("*/summary.json")):
@@ -533,6 +558,7 @@ def _generate_backlog(app: _github.GithubApp) -> str:
 )
 async def generate_backlog() -> str:
     """Generate at most five improvement issues daily, only when the loop is enabled."""
+    _union_identity.establish()
     if not PROFILE.loop.enabled:
         return "skip"
-    return await asyncio.to_thread(_generate_backlog, _app())
+    return await asyncio.to_thread(_generate_backlog, _app(_BACKLOG_SCOPE))

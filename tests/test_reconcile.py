@@ -784,7 +784,7 @@ def test_reconcile_task_is_named_as_deployed_and_mounts_the_app_key():
     import subprocess
     import sys
 
-    from flyte_agent_factory import _deploy, _pull_requests
+    from flyte_agent_factory import _deploy, _pull_requests, _union_identity
 
     profile = board_profile(app=True)
     env = {key: value for key, value in os.environ.items() if key != _profile.PROFILE_ENV}
@@ -795,7 +795,8 @@ def test_reconcile_task_is_named_as_deployed_and_mounts_the_app_key():
 from flyte_agent_factory import _reconcile
 assert _reconcile.reconcile.name == {_deploy.RECONCILE_TASK!r}, _reconcile.reconcile.name
 assert [(s.key, s.as_env_var) for s in _reconcile.env.secrets] == [
-    ("github_board_pat", "GITHUB_BOARD_PAT"), ("github_key_x", {_pull_requests.KEY_ENV_VAR!r})
+    ("github_board_pat", "GITHUB_BOARD_PAT"), ("github_key_x", {_pull_requests.KEY_ENV_VAR!r}),
+    ({profile.union.key_for("queue")!r}, {_union_identity.KEY_ENV!r}),
 ], _reconcile.env.secrets
 """
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
@@ -981,7 +982,7 @@ async def test_a_report_error_does_not_fail_a_tick_with_a_board(world, monkeypat
     )
     monkeypatch.setattr(_board, "take_token", lambda *a: "token")
     monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
-    monkeypatch.setattr(_github, "GithubApp", lambda *a: app)
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: app)
     started = _reconcile._started_at(first)
     assert started is not None
     monkeypatch.setattr(time, "time", lambda: started + 3630)
@@ -1108,7 +1109,7 @@ async def test_board_remote_failure_does_not_skip_milestone_healing(world, monke
     monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
     monkeypatch.setattr(_board, "take_token", lambda *a: "token")
     monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
-    monkeypatch.setattr(_github, "GithubApp", lambda *a: App())
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: App())
     monkeypatch.setattr(_reconcile, "project_runs", list)
     monkeypatch.setattr(_reconcile, "heal_milestones", heal)
 
@@ -1228,6 +1229,7 @@ def test_reconcile_request_budget_with_a_new_app_each_tick(world, monkeypatch):
             PRIVATE_PEM,
             client=httpx.Client(base_url=_github.API, transport=httpx.MockTransport(github_handle)),
             clock=Clock(),
+            permissions=_github.ISSUES_WRITE,
         )
         _reconcile.heal_milestones(world.profile, github(app))
         counts.append((len(graphql), len(rest), sum(method == "GET" for method, _ in rest)))
@@ -1608,7 +1610,14 @@ async def test_reconcile_runs_the_truth_pass_after_the_tick_and_reports_its_corr
     monkeypatch.setattr(_board_events, "drift", drift)
     monkeypatch.setattr(_reconcile, "heal_milestones", lambda *args: 0)
     monkeypatch.setattr(_reconcile, "queued_issues", lambda profile: {ISSUE.lower()})
-    monkeypatch.setattr(_github, "GithubApp", lambda *args: object())
+    made: list[object] = []
+    # Every App names the permissions its tokens get (#179): the audit's reads and its status writes.
+
+    def app(*args, permissions=None):
+        made.append(permissions)
+        return object()
+
+    monkeypatch.setattr(_github, "GithubApp", app)
     Board({ISSUE: {"status": "Ready"}}).install(monkeypatch)
     monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
     monkeypatch.setattr(_board, "take_token", lambda *a: "token")
@@ -1617,6 +1626,7 @@ async def test_reconcile_runs_the_truth_pass_after_the_tick_and_reports_its_corr
     assert calls == ["drift"]  # one reconciler: no second board pass
     assert seen == {"token": "token", "queued": {ISSUE.lower()}, "newest": None}
     assert "2 board truth correction(s)" in result
+    assert _reconcile._DRIFT_SCOPE in made
 
 
 async def test_reconcile_without_the_app_skips_the_truth_pass(world, monkeypatch, caplog):

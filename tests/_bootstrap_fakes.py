@@ -50,9 +50,7 @@ class World:
         self.signed_in = False
         self.registered = False
         self.mcp_url: str | None = None
-        self.api_key = True
         self.dead = False
-        self.closed = 0  # times the run released the deployer (the ephemeral API key)
         self.login = "pat"  # the signed-in GitHub user
         self.org = False  # the owner is an organization, whose App installations can be listed
         self.installations = ["agent-factory-pat"]
@@ -294,17 +292,11 @@ class FakeDeployer:
     def __init__(self, world: World) -> None:
         self.w = world
 
-    def api_key_available(self) -> bool:
-        return self.w.api_key
-
     def deploy(self, profile: Path, *, work: bool = True) -> str | None:
         self.w.change(f"deploy work={work}")
         self.w.registered = True
         self.w.mcp_url = "https://factory-mcp.example.test"
         return self.w.mcp_url
-
-    def close(self) -> None:
-        self.w.closed += 1
 
 
 def make_context(world: World, settings: Settings, out: list[str], token: str = CLAUDE_TOKEN) -> Context:
@@ -320,6 +312,7 @@ def make_context(world: World, settings: Settings, out: list[str], token: str = 
         run_command=lambda argv: _run_command(world, argv),
         write_tty=lambda text: _write_tty(world, text),
         sleep=lambda seconds: None,
+        platform="linux",  # the key maker is chosen by it; a test of the other chooses it
     )
 
 

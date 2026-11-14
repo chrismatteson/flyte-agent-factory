@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Mapping
 from dataclasses import replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from flyte import remote
@@ -99,6 +100,9 @@ def live_children(profile: Profile) -> list[_planner.ActiveRun]:
     return found
 
 
+_SCOPE: Mapping[str, str] = MappingProxyType({"pull_requests": "read", "contents": "read", "issues": "read"})
+
+
 def _github_repos(profile: Profile) -> list[str]:
     """`owner/repo` of every profile repository that is on GitHub."""
     found: list[str] = []
@@ -117,7 +121,8 @@ def read_facts(profile: Profile) -> _planner.Facts:
         raise ValueError(f"planner needs a [board] in the profile and these variables: {', '.join(missing)}")
     board = _board.BoardClient(os.environ[_board.TOKEN_ENV])
     board.bootstrap(profile.board.owner, profile.board.owner_type, profile.board.number, create=False)
-    app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV])
+    # Open PRs and tracked paths of each repo, and the loop's kill-switch issues.
+    app = _github.GithubApp(profile.github.app_id, os.environ[_deploy.GITHUB_KEY_ENV], permissions=_SCOPE)
     repos = _github_repos(profile)
     live = _factory.operated_live()
     facts = _planner.facts_from(

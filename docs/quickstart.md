@@ -27,8 +27,9 @@ follow the same steps yourself. The skill's procedure is its
 
 It asks whether Flyte or Union is already running for you and for its URL, then collects the non-secret values:
 endpoint, project, domain, the GitHub owner for your workspace, the state bucket and the engine. It never asks for a
-credential. The deploy key into your workspace is the only GitHub credential setup requires; the App is optional
-([github-app.md](github-app.md), which also says why the model is assumed and where it is decided, #179). claude.ai has no local shell, so it ends the conversation part with **one copy-paste command**
+credential. The GitHub App is the guided-setup default (read-only on code; pushes stay on deploy keys until the isolation canary reports `isolated`) and optional: without it the deploy key into your
+workspace is the only GitHub credential setup requires, with no CI visibility
+([github-app.md](github-app.md), which also says why two GitHub credentials remain for now). claude.ai has no local shell, so it ends the conversation part with **one copy-paste command**
 with those values filled in, which you run on your machine (Claude Code runs it for you). That command,
 `ops/bootstrap.py` in an engine checkout, does the machine work and prompts locally for anything secret.
 
@@ -73,8 +74,11 @@ The setup it performs, in the order a person thinks of it:
 7. **First deploy.** From the public `unionai-oss/flyte-agent-factory` `main`, with
    `--profile <your workspace clone>/profile.toml`, so a new user has no separate move step. From then on the
    deployer follows `[direction]`. Moving an **existing** install onto `[direction]` later needs one deploy with
-   that same `--profile` argument, because the deployer refuses to change its own direction, on purpose: that is
+   that same `--profile` argument, because a deployer with no `[direction]` has no repo to read: that is
    the bootstrap's `--redeploy` command below, run once with your values (see [setup.md](setup.md#deploying)).
+   Moving `[direction]` to another repository afterwards needs no deploy: commit the new location to the new
+   repository's profile (naming itself) first, then change `[direction]` in the old repository's profile; the
+   deployer verifies both and moves. Afterwards the old repository can be archived.
 
    **Deploying later engine changes.** The deployer deploys the default-branch head of `[deploy] repo` (default
    `[repo] factory`, the public engine) once that head's CI passed. Your App is installed on your workspace, not on
@@ -91,7 +95,7 @@ Around those seven, the bootstrap also checks tools and signs you in to Flyte, m
 stores your engine token, and, after the deploy, reads the factory MCP's URL into the profile and redeploys. The
 full table has one line per step, and a line stays `todo` until its live check passes. The command runs the steps in this table's
 order, which is the numbered order above with three exceptions the dependencies force: the Flyte sign-in and project
-come before the deploy key, because the key and the App's key are stored as Flyte secrets; the ruleset follows every
+come before the Union keys and the deploy key, because those keys and the App's key are stored as Flyte secrets; the ruleset follows every
 push to `main` except the last (the factory URL, which exists only after the deploy), and that push is yours, which
 the ruleset lets through; and the engine token comes after the board.
 
@@ -103,12 +107,13 @@ the ruleset lets through; and the engine token comes after the board.
 | `profile` | `profile.toml` exists and validates | nothing |
 | `signin` | a Flyte config for your endpoint works | sign in at the browser page it opens |
 | `project` | the Flyte project exists | nothing |
+| `union-keys` | the factory's project and deployer Union keys are stored as the secrets `[union]` names | on macOS or without the plugin, paste each key from the console at the hidden prompt |
 | `deploy-key` | the write deploy key exists on GitHub and as a Flyte secret | nothing |
 | `github-app` | your App exists, is stored and is installed | confirm on the GitHub pages it opens |
 | `ruleset` | `main` is protected | the Settings steps, if it printed them |
 | `board` | a board is linked to the workspace (any board: if one is already linked, the bootstrap makes none) | the three clicks above (the second only if the Projects tab lacks the board) |
 | `engine-token` | your Claude token is a Flyte secret | run `claude setup-token` in another terminal, paste at the hidden prompt |
-| `deploy` | the factory tasks are registered and current (`--redeploy` runs it again) | on Union, nothing on Linux x86_64: it makes a one-off deployment key for the run and deletes it at the end. Elsewhere it stops and says so (see below) |
+| `deploy` | the factory tasks are registered and current (`--redeploy` runs it again) | nothing: it runs as your Flyte CLI login, on any machine |
 | `mcp-url` | `[mcp] public_url` is set | nothing |
 | `connect` | cannot be checked from here | add the connector ([below](#connect-the-chat-and-launch)) |
 
@@ -462,68 +467,52 @@ and `[repo_keys]`; the operator's GitHub connector credential never goes into a 
 
 ## 5. Deploy and connect the factory
 
-### Local Union deployment bootstrap
+### The factory's Union keys and the deploy
 
-The bootstrap's `deploy` step uses `_UNION_EAGER_API_KEY` from your environment if it is set. Otherwise it makes a
-one-off key for the run and deletes it at the end, and that needs this: the deploy makes its one-off Union API key with flyteplugins-union, which installs on Linux x86_64 only. On another machine
-(macOS, Linux on ARM) no single command can make the key, so the step stops and says so; run the bootstrap on a Linux
-x86_64 machine, or export `_UNION_EAGER_API_KEY` with a key made there, as below.
+Nothing here uses `_UNION_EAGER_API_KEY`, the key Union injects into every task pod. Every pod of the factory acts
+as the key of its tier (`[union]` in the profile, [profiles/README.md](../profiles/README.md#union)), and a hand
+deploy acts as you: the deploy scripts use your Flyte CLI login (`flyte.init_from_config`), so a deploy needs no
+API key of its own and no Linux machine.
 
-The deployment child scripts call `flyte.init_from_api_key` with `os.environ["_UNION_EAGER_API_KEY"]`.
-The selected Flyte config does **not** automatically supply this environment variable. The pinned SDK expects
-the full base64-encoded `endpoint:client_id:client_secret:org` credential, not just the client secret or a
-`client_id:secret` pair. Its endpoint must match your intended backend. Keep it local.
+The bootstrap's `union-keys` step makes the two keys the profile names, `project_key` and `deployer_key`, and stores
+each as a Flyte secret over your CLI login. It prints their client IDs and nothing else. Each key has no default
+policies and gets its own policy (`factory-project`, `factory-deployer`) binding `contributor` to the factory's
+project and domain.
 
-Reuse a suitable deployment key from your local password manager if one exists. Otherwise, on a Linux x86_64
-machine, the stopped `deploy` line prints this one command with your values filled in (here with the example
-values); it makes the `factory-deploy` key with no default policies, a `factory-deploy` policy binding
-`contributor` to the factory's project and domain, and the assignment, then writes the encoded key once to that
-terminal only, never to stdout. If that machine has no Flyte config for `--endpoint`, the command writes one and opens the browser sign-in first; a config for another endpoint stops it before any change.
+- On Linux x86_64 it makes the keys with `flyteplugins-union`, and grants them.
+- On macOS, or without that plugin, it prints the console steps to create a key named for the policy with no default
+  policies, then reads the key you paste at a **hidden prompt** (the same non-echoing `getpass` as the Claude token)
+  and stores it. The key is never echoed, printed or written to disk. The pinned SDK expects the full base64-encoded
+  `endpoint:client_id:client_secret:org` credential the console shows once, not just the client secret.
+- If you may not manage access in the organization, the step still stores the keys and ends with one `--grant` command
+  per key for a Union administrator to run (it makes no key). Policy creation, the assignment and live deployment have
+  not been run against a live tenant by this project; see
+  [install-audit.md](install-audit.md#setup-walkthrough-verification).
+
+Run only this step, for example to add the keys later or after an administrator has changed your role, with the
+command the bootstrap prints for your values (here the example values):
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --deploy-key
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --union-keys
 ```
 
-Store the encoded value in your local password manager. If a `factory-deploy` key already exists, the command stops
-and says how to delete it by hand; it never deletes one. Never send the encoded key or client secret to chat.
+If a key of that name already exists in Union (an earlier run died between making it and storing it) its value cannot
+be read back: the step says which to delete (`flyte get api-key` lists the client IDs, `flyte delete api-key <client
+ID>` removes one), and a rerun makes a new one. It never deletes a key itself. Never send a key or client secret to chat.
 
-If you run with another administrator, make the key and the grant by hand instead. Create the key:
+To make a key by hand instead (another administrator, say), create it and store it as the secret the profile names:
 
 ```bash
-uv run flyte --config "$FLYTE_CONFIG" create api-key --name factory-deploy --no-default-policies
+uv run flyte --config "$FLYTE_CONFIG" create api-key --name factory-project --no-default-policies
 ```
 
 The CLI displays a client ID and an `export FLYTE_API_KEY=...` suggestion containing the encoded credential.
-**Do not execute that suggested export with a literal secret.** Store the encoded value in your local password
-manager. With `--no-default-policies` the key has no permissions until a policy is assigned. Run the grant block
-in [factory-mcp-setup.md](factory-mcp-setup.md#connecting-a-client) with `policy=factory-deploy` and this key's
-client ID; ask chat to prepare that existing grant block as one copy-paste command with `policy=factory-deploy`
-and `client_id` filled in from the non-secret client ID.
-The chat key gets its own policy later. It binds `contributor` to the factory's project and domain;
-if `ops/deploy_work.py` fails with a permission error, that page gives the command that widens the policy. Policy
-creation, the assignment and live deployment have not been run against a live tenant by this project; see
-[install-audit.md](install-audit.md#setup-walkthrough-verification).
-
-In a local bash or zsh terminal with session recording disabled, load only the encoded value at the prompt:
-
-```bash
-{
-set +x
-printf 'Union encoded deployment key: '
-stty -echo
-IFS= read -r _UNION_EAGER_API_KEY
-stty echo
-printf '\n'
-if [ -n "$_UNION_EAGER_API_KEY" ]; then export _UNION_EAGER_API_KEY; else printf 'No key entered; run this block again.\n'; fi
-}
-```
-
-This works in both bash and zsh, which differ on `read -s` and `read -p`; the braces make the shell read the whole
-block before the prompt, so the rest of the paste is not taken as the key. The prompt prevents echo and a
-literal credential in shell history; if you interrupt it, run `stty echo` to restore your terminal. Do not
-print the variable, put it in a profile, or paste the terminal output into chat. The key is available to local
-deployment child processes; this is separate from the runtime's backend credentials and native storage
-identity.
+**Do not execute that suggested export with a literal secret.** With `--no-default-policies` the key has no
+permissions until a policy is assigned: run the grant block in
+[factory-mcp-setup.md](factory-mcp-setup.md#connecting-a-client) with `policy=factory-project` and this key's
+client ID. Store the encoded value with `flyte create secret`, at its prompt, under the `[union] project_key` name;
+do the same for `factory-deployer` and `deployer_key`. If `ops/deploy_work.py` fails with a permission error, the
+grant page gives the command that widens the policy.
 
 Confirm the selected profile and intended target, then run the two first-install commands. Deploying builds
 images and consumes backend compute; run it when you are ready to deploy, rather than as a connection test.
@@ -534,11 +523,18 @@ PYTHONPATH=src uv run python ops/deploy_work.py
 PYTHONPATH=src uv run python ops/deploy_factory.py
 ```
 
+A hand deploy acts as your own `flyte` login (the profile's `[backend] config`) and needs no API key: the scripts
+leave `AGENT_FACTORY_DEPLOY_KEY_ENV` and the key Union injects into pods (`_UNION_EAGER_API_KEY`, `EAGER_API_KEY`)
+out of what they run, even when your shell has them set. Every `ops/` script puts `src` on the path itself:
+`PYTHONPATH=src` is needed only where a command imports the package itself (`python -m` on one of its modules, a
+`python -c` or a heredoc); `flyte run` and `flyte deploy` find `src` through `--root-dir src`, and carry it anyway.
+
 The first deploy from a workspace clone names its profile once, as `--profile ../my-workspace/profile.toml` (or the
 environment variable above). Because that file carries `[direction]`, the deployer reads it from the workspace from
 then on. Moving an **existing** install onto `[direction]` later needs one deploy with that `--profile` too: the
-bootstrap's `--redeploy` command of step 7 above, run once. The deployer refuses to change its own direction by
-design.
+bootstrap's `--redeploy` command of step 7 above, run once. Moving `[direction]` to another repository later is a
+commit: put the new location in the new repository's profile (naming itself) first, then change `[direction]` in
+the old repository's profile; the deployer verifies both, moves, and the old repository can be archived.
 
 Keep a successful slots deployment if the factory deployment fails; resolve the named failure and rerun only
 the failed step. When resuming, inspect what is already deployed first:
@@ -561,15 +557,9 @@ second `[mcp]` table. The resulting section looks like:
 public_url = "https://factory-mcp.example.com"
 ```
 
-Then rerun `ops/deploy_factory.py` while the deployment key is still loaded. After the final deployment
-(or before leaving a failed session), remove it from the shell:
-
-```bash
-unset _UNION_EAGER_API_KEY
-```
-
-To resume a failed deployment in a new shell, restore the profile exports in step 3 and reload the saved key
-with the non-echo prompt; do not create another key. This is a two-pass bootstrap; a deployed app URL
+Then rerun `ops/deploy_factory.py`. To resume a failed deployment in a new shell, restore the profile exports in
+step 3 and run the same commands again; nothing needs reloading, since the deploy uses your CLI login. This is a
+two-pass bootstrap; a deployed app URL
 is not proof a chat client can authenticate. The connector path is `<public_url>/flyte-mcp/mcp`.
 
 Follow [chat-operator.md, Setup](chat-operator.md#setup) in order:

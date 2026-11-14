@@ -13,29 +13,32 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Protocol
 
 import flyte
 from flyte import remote
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flyte_agent_factory import _profile
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 _profile.select_from_argv()  # before _factory reads the profile at import
 
-from flyte_agent_factory import _factory, _factory_base, _factory_meters, _meter  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory import _factory, _factory_base, _factory_meters, _meter, _union_identity  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
 # Longer than a probe needs to start; it is a bound, not a budget.
 QUEUE_BOUND = timedelta(minutes=5)
 
 
 def _init() -> None:
-    flyte.init_from_api_key(
-        api_key=os.environ["_UNION_EAGER_API_KEY"], project=_factory.PROJECT, domain=_factory.DOMAIN
-    )
+    _union_identity.init_for_script(_factory_base.PROFILE)
 
 
 def _account(token: str) -> str:

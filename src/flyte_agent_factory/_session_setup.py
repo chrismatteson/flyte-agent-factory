@@ -26,7 +26,9 @@ from flyte_agent_factory import (
     _checkpoint,
     _gates,
     _git,
+    _git_https,
     _github,
+    _github_mode,
     _local_browser,
     _policy,
     _pull_requests,
@@ -37,6 +39,7 @@ from flyte_agent_factory import (
     _session_config,
     _session_log,
     _timeline,
+    _union_identity,
     _usage,
     _workspace,
 )
@@ -281,19 +284,114 @@ def _check_image_tools(files: dict[str, str] | None, timeline: _timeline._Timeli
                 timeline.row("🚨", message)
 
 
+#: The task that refreshes the session's push token; held so it is not garbage collected mid-run.
+_token_refresh: asyncio.Task[None] | None = None
+
+
+def _push_token_path() -> Path:
+    return _session_config.CONFIG_DIR / "github-push-credentials"
+
+
+async def _arm_https_push(app_key: str, repo: str, timeline: _timeline._Timeline) -> str:
+    """Set up a push by repo-scoped App token. Returns the `owner/repo` slug, or "" to keep the deploy key.
+
+    Only when the deployer proved isolation and set `AGENT_FACTORY_GITHUB_PUSH=app` (`_github_mode`); any
+    other value is today's deploy-key behaviour, untouched. The first token is minted here, so a failure
+    falls back to the deploy key with a row instead of leaving a session that cannot push.
+    """
+    profile = _session_config._PROFILE
+    if not (profile and profile.github.configured and app_key and repo):
+        return ""
+    if _github_mode.mode(profile, os.environ) != "app":
+        return ""
+    try:
+        slug = _github.parse_repo(repo)
+        app = _github.GithubApp(profile.github.app_id, app_key)
+        scope = _github.session_push_scope(bool(getattr(profile.github, "workflows", False)))
+        await asyncio.to_thread(_git_https.mint, app, slug, _push_token_path(), scope)
+    except _github.GithubError as exc:
+        timeline.row("⚠️", f"push by App token is unavailable, using the deploy key: {exc}")
+        return ""
+    global _token_refresh
+    _token_refresh = asyncio.create_task(
+        _git_https.refresh_loop(app, slug, _push_token_path(), scope, timeline.row)
+    )
+    return slug
+
+
+def _read_token_path() -> Path:
+    return _session_config.CONFIG_DIR / "github-read-credentials"
+
+
+def _deploy_key_covers(repo: str) -> bool:
+    """Whether a mounted deploy key reaches `repo`: the workspace's own key, or its `[repo_keys]` entry."""
+    profile = _session_config._PROFILE
+    if profile is None:
+        return True
+
+    def slug(url: str) -> str:
+        try:
+            return _github.parse_repo(url).lower()
+        except _github.GithubError:
+            return url
+
+    covered = {slug(profile.repo), *(slug(url) for url in profile.repo_key_vars)}
+    return slug(profile.canonical_repo(repo)) in covered
+
+
+async def _arm_https_read(app_key: str, repo: str, timeline: _timeline._Timeline) -> str:
+    """Set up a read by repo-scoped `contents: read` App token. Returns the `owner/repo` slug, or "".
+
+    For a launch repository no deploy key reaches, in any push mode but `app`: the App installed on it is the
+    way to read it, with no key made per repository by hand. The token reads that one repository and
+    cannot push; it is re-minted like the push token. A repo the App is not installed on keeps today's
+    deploy-key clone, with a row.
+    """
+    profile = _session_config._PROFILE
+    if not (profile and profile.github.configured and app_key and repo) or _deploy_key_covers(repo):
+        return ""
+    try:
+        slug = _github.parse_repo(repo)
+        app = _github.GithubApp(profile.github.app_id, app_key)
+        await asyncio.to_thread(_git_https.mint, app, slug, _read_token_path(), _github.CONTENTS_READ)
+    except _github.GithubError as exc:
+        timeline.row("⚠️", f"no App read token for {repo}, cloning with the deploy key: {exc}")
+        return ""
+    global _token_refresh
+    _token_refresh = asyncio.create_task(
+        _git_https.refresh_loop(app, slug, _read_token_path(), _github.CONTENTS_READ, timeline.row)
+    )
+    timeline.row("🔑", f"reading {slug} with a contents-read App token; no deploy key reaches it")
+    return slug
+
+
 async def _prepare_workspace(
-    *, brief: str, repo: str, branch: str, resuming: bool, timeline: _timeline._Timeline
+    *, brief: str, repo: str, branch: str, resuming: bool, timeline: _timeline._Timeline, app_key: str = ""
 ) -> None:
     _session_config.WORKSPACE.mkdir(parents=True, exist_ok=True)
+    slug, store = await _arm_https_push(app_key, repo, timeline), _push_token_path()
+    if not slug:
+        slug, store = await _arm_https_read(app_key, repo, timeline), _read_token_path()
 
     # Clone before anything else writes here: `git clone` refuses a non-empty
     # target, and the inbox/brief below would make it non-empty.
     if repo and not resuming and not (_session_config.WORKSPACE / ".git").exists():
         timeline.row("📥", f"cloning {repo}")
-        await _clone(repo, branch, _session_config.WORKSPACE)
+        if slug:
+            await _clone(_git_https.remote_url(slug), branch, _session_config.WORKSPACE, store)
+        else:
+            await _clone(repo, branch, _session_config.WORKSPACE)
     if repo and (_session_config.WORKSPACE / ".git").exists():
-        # Defence in depth beside the workspace-only deploy key: a push anywhere else is refused locally.
-        _push_guard.install(_session_config.WORKSPACE, repo)
+        if slug:
+            _git_https.install(_session_config.WORKSPACE, slug, store)
+            assert _session_config._PROFILE is not None  # the arm functions return a slug only with one
+            workflows = bool(getattr(_session_config._PROFILE.github, "workflows", False))
+            _push_guard.install(
+                _session_config.WORKSPACE, _git_https.remote_url(slug), workflows=None if workflows else False
+            )
+        else:
+            # Defence in depth beside the workspace-only deploy key: a push anywhere else is refused locally.
+            _push_guard.install(_session_config.WORKSPACE, repo)
 
     (_session_config.WORKSPACE / _session_config._INBOX_DIR).mkdir(parents=True, exist_ok=True)
     _exclude_harness(_session_config.WORKSPACE)
@@ -482,19 +580,20 @@ async def _start_pull_requests(repo: str, app_key: str, timeline: _timeline._Tim
         return
     app = _github.GithubApp(github.app_id, app_key)
     try:
-        default_branch = await asyncio.to_thread(app.default_branch, slug)
+        default_branch = await asyncio.to_thread(app.scoped(_github.PR_WRITE).default_branch, slug)
     except (
         _github.GithubError,
         KeyError,
     ):  # GitHub or the key failing only costs this lookup; git answers instead
         default_branch = ""
     candidate = _pull_requests.PullRequests(
-        app,
+        app.scoped(_github.PR_WRITE),
         slug,
         _session_config._project_name,
         timeline.run_url,
         timeline.row,
         issue=timeline.issues.issue if timeline.issues else "",
+        status_app=app.scoped(_github.VERIFIER),
     )
     await _checkout_project_branch(candidate.branch, timeline, default_branch)
     _pr = candidate
@@ -713,7 +812,8 @@ def _delegate_reattach(timeline: _timeline._Timeline) -> Reattach:
     """Return the `Delegations` reattach hook: collect a worker action submitted before a restart."""
 
     async def reattach(target: Path, run_name: str, name: str) -> str:
-        action = await flyte.remote.Action.get.aio(run_name=run_name, name=name)
+        with _union_identity.denied("reading a delegated action"):
+            action = await flyte.remote.Action.get.aio(run_name=run_name, name=name)
         # `Action.wait` is a plain coroutine in the SDK, not syncified: there is no `.aio`.
         await action.wait(quiet=True)
         task = asyncio.current_task()

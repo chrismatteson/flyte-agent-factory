@@ -68,14 +68,23 @@ if [ "$2" != {url} ]; then
 fi
 {scan}
 """
+#: Set to "0" in the hook when pushes go by an App token that lacks the `workflows` permission.
+_NO_WORKFLOWS_ENV = "AGENT_FACTORY_PUSH_WORKFLOWS"
+_WORKFLOWS_DIR = ".github/workflows/"
 _ZEROS = "0" * 40
 
 
-def install(checkout: Path, workspace_url: str, remote: str = "origin") -> None:
+def install(
+    checkout: Path, workspace_url: str, remote: str = "origin", *, workflows: bool | None = None
+) -> None:
     """Make `checkout` push only to `workspace_url`, through `remote` by default.
 
     The URL is compared as the string git is given, so `workspace_url` must be spelled as the remote is
-    configured; it is what `_git.clone` was called with.
+    configured; it is what `_git.clone` was called with (`_git_https.remote_url` for an App-token push).
+
+    `workflows=False` is the App-token push without `[github] workflows`: the hook then also refuses a push
+    that changes `.github/workflows/`, which GitHub would reject anyway, with the reason. `None` (a deploy
+    key, which has no such limit) leaves the hook as it always was.
     """
     git(checkout, "config", "remote.pushDefault", remote)
     if remote in git(checkout, "remote").split():
@@ -88,7 +97,8 @@ def install(checkout: Path, workspace_url: str, remote: str = "origin") -> None:
     hook.write_text(
         _HOOK.format(
             url=shlex.quote(workspace_url),
-            scan=build_entry_command("flyte_agent_factory._push_guard", "scan_main"),
+            scan=(f"{_NO_WORKFLOWS_ENV}=0 " if workflows is False else "")
+            + build_entry_command("flyte_agent_factory._push_guard", "scan_main"),
         )
     )
     hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
@@ -136,6 +146,9 @@ def scan_main() -> int:
             if local == _ZEROS:  # a deletion carries no commits
                 continue
             for commit in _list_new_commits(local, remote):
+                if os.environ.get(_NO_WORKFLOWS_ENV) == "0" and _touches_workflows(commit):
+                    print(_WORKFLOWS_REFUSED, file=sys.stderr)
+                    return 1
                 found = _find(commit, values)
                 if found:
                     what, where = found
@@ -149,6 +162,25 @@ def scan_main() -> int:
         print(f"push refused: {exc}; nothing was pushed. Try again in a moment.", file=sys.stderr)
         return 1
     return 0
+
+
+_WORKFLOWS_REFUSED = (
+    "push refused: push changes .github/workflows/ but the App token lacks the workflows permission; "
+    "set [github] workflows = true and accept the permission on the installation "
+    "(docs/github-app.md#workflows)"
+)
+
+
+def _touches_workflows(commit: str) -> bool:
+    """Whether `commit` changes a file under `.github/workflows/` (a merge: against any parent)."""
+    # `-z`: without it git quotes a path holding a quote or control character, hiding the prefix.
+    proc = subprocess.run(
+        ["git", "diff-tree", "--root", "-r", "-m", "-z", "--no-commit-id", "--name-only", commit],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise _Unscannable("git diff-tree failed, so the commits cannot be checked")
+    return any(path.startswith(_WORKFLOWS_DIR.encode()) for path in proc.stdout.split(b"\0"))
 
 
 def _fetch_live_values() -> tuple[str, ...]:

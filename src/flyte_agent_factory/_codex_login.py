@@ -37,6 +37,22 @@ def profile_logins() -> list[str]:
     return [slot.codex_login for slot in profile.slots if slot.codex_login] if profile else []
 
 
+def login_secret(secret_name: str) -> str:
+    """Return the secret a login is stored as: `secret_name`, else the profile's only slot `codex_login`."""
+    if not secret_name:
+        logins = profile_logins()
+        if len(logins) != 1:
+            raise ValueError(
+                "pass secret_name: the profile names "
+                + (", ".join(logins) if logins else "no slot codex_login")
+            )
+        secret_name = logins[0]
+    if not secret_name.startswith("codex_login"):
+        # Chat can start this task, so it must not be able to overwrite any other secret.
+        raise ValueError(f"secret_name must start with codex_login, not {secret_name!r}")
+    return secret_name
+
+
 def device_prompt(output: str) -> tuple[str, str]:
     """(url, code) from `codex login --device-auth` output, or ("", "") while not printed yet."""
     clean = _ANSI_RE.sub("", output)

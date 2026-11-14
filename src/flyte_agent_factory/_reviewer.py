@@ -10,7 +10,7 @@ import flyte
 import flyte.errors
 from flyte.io import Dir
 
-from flyte_agent_factory import _policy, _timeline, _usage
+from flyte_agent_factory import _policy, _timeline, _union_identity, _usage
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 #: How long a reviewer may wait to be placed before it is moved to on-demand, and
@@ -161,10 +161,11 @@ async def _call_reviewer_raw(**kwargs: Any) -> tuple[str, Dir]:
     `_one_judge` retries and, if every reviewer misses, turns into ReviewUnavailable.
     """
     bound = flyte.Timeout(max_queued_time=_REVIEWER_QUEUE_BOUND)
-    try:
-        return await subagent_task.override(interruptible=True, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # Flyte's `.aio` is untyped
-    except flyte.errors.MaxQueuedTimeExceededError:
-        return await subagent_task.override(interruptible=False, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # as above
+    with _union_identity.denied("submitting a reviewer"):
+        try:
+            return await subagent_task.override(interruptible=True, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # Flyte's `.aio` is untyped
+        except flyte.errors.MaxQueuedTimeExceededError:
+            return await subagent_task.override(interruptible=False, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # as above
 
 
 #: Every failing judge's findings, every round: (round, judge, findings). Shown to

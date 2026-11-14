@@ -8,17 +8,21 @@ The operator re-runs it after dealing with each event, so one process = one even
 from __future__ import annotations
 
 import argparse
-import os
+import sys
 import time
+from pathlib import Path
 
-import flyte
 from flyte import remote
+
+# Run under `uv run`, which does not install this project (`package = false`): without this the import
+# below fails with ModuleNotFoundError (as in ops/bootstrap.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from flyte_agent_factory import _profile
 
 _profile.select_from_argv()
 
-from flyte_agent_factory import _factory  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
+from flyte_agent_factory import _factory_base, _union_identity  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
 
 DONE = ("SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT")
 
@@ -32,11 +36,7 @@ def main() -> None:
     p.add_argument("--max", type=int, default=1500)
     p.add_argument("--every", type=int, default=30)
     args = p.parse_args()
-    flyte.init_from_api_key(
-        api_key=os.environ["_UNION_EAGER_API_KEY"],
-        project=_factory.PROJECT,
-        domain=_factory.DOMAIN,
-    )
+    _union_identity.init_for_script(_factory_base.PROFILE)
     seen = {s for s in args.seen.split(",") if s}
     deadline = time.time() + args.max
     while time.time() < deadline:

@@ -42,10 +42,12 @@ APP_LOST = (
 )
 
 
-#: The one fact about the deploy's API key that no command can get around; the step output and the documents
-#: quote it as it is (`tests/test_bootstrap_review.py`). `flyteplugins-union` ships a Linux x86_64 wheel only.
-API_KEY_REQUIREMENT = (
-    "the deploy makes its one-off Union API key with flyteplugins-union, which installs on Linux x86_64 only"
+#: The one fact about making a Union API key from the command line that nothing can get around; the step
+#: output and the documents quote it as it is (`tests/test_bootstrap_review.py`). `flyteplugins-union` ships
+#: a Linux x86_64 wheel only. Deploys no longer need it: they run as the person's CLI login.
+KEY_PLUGIN_REQUIREMENT = (
+    "making a Union API key from the command line needs flyteplugins-union, "
+    "which installs on Linux x86_64 only"
 )
 
 
@@ -217,13 +219,8 @@ class FlyteOps(Protocol):
 class Deployer(Protocol):
     """Runs the two deploy scripts; the real one starts `ops/deploy_*.py` as subprocesses."""
 
-    def api_key_available(self) -> bool: ...
     def deploy(self, profile: Path, *, work: bool = True) -> str | None:
         """Deploy the work slots (when `work`) and the factory; return the factory-mcp URL if printed."""
-        ...
-
-    def close(self) -> None:
-        """Release what `deploy` made (the ephemeral API key); called once at the end of every run."""
         ...
 
 
