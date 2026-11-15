@@ -87,6 +87,7 @@ from flyte_agent_factory import (
     _timeline,
     _union_identity,
     _usage,
+    _workspace_repair,
 )
 from flyte_agent_factory._auth import (
     assert_claude_available,
@@ -470,10 +471,9 @@ async def project(
     timeline.repo, timeline.branch = repo, branch
     await timeline.flush(force=True)
 
-    # --- mount ---------------------------------------------------------- #
-    # The workspace and the session transcript live on a Volume, so there is
-    # nothing to unpack: after this they are simply on disk.
+    # --- restore: workspace and transcript are on disk after this, a resumed workspace repaired ----- #
     state = await _state.restore(root=_session_config.STATE_ROOT, workspace_in=workspace_in)
+    await _workspace_repair.repair_workspace(_session_config.STATE_ROOT / _state.WORKSPACE_SUBDIR, timeline)
     _usage._meters = _usage.open_meters(_session_config.STATE_ROOT / "meters")
     os.environ["AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE"] = "claude"
     _session_setup._export_runtime_env()

@@ -223,7 +223,8 @@ def test_other_clocks_and_generators_are_allowed_with_recorded_limits(tmp_path):
     case = project(tmp_path)
     module = case / "shortlinks" / "__main__.py"
     text = module.read_text().replace(
-        "datetime.now(timezone.utc)", "datetime.fromtimestamp(time.time(), timezone.utc)"
+        "datetime.now(timezone.utc)",
+        "datetime.fromtimestamp(time.clock_gettime(time.CLOCK_REALTIME), timezone.utc)",
     )
     module.write_text(text.replace("random.choices(", "random.SystemRandom().choices("))
     result = check(case)

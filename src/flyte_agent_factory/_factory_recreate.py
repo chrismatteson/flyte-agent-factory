@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import flyte.io
 from flyte import remote
 
-from flyte_agent_factory import _dashboard, _deploy, _factory_base, _queue, _state_store
+from flyte_agent_factory import _dashboard, _deploy, _factory_base, _queue, _state_store, _workspace_archive
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 #: How long a queue sweep may wait to be placed (`sweep`'s `max_queued_time`).
@@ -158,8 +160,11 @@ def _load_checkpoint_workspace(location: str) -> flyte.io.Dir | None:
     tree = checkpoint.load_sync()
     if tree is None or not (tree / "workspace").is_dir():
         return None
-    # `from_local` is syncified: it blocks here, but the SDK types it as a coroutine function.
-    return flyte.io.Dir.from_local(str(tree / "workspace"))  # type: ignore[return-value]  # see above: syncified
+    # Packed like a published workspace (`_state.publish`), so the resumed run keeps the file modes.
+    with tempfile.TemporaryDirectory() as staging:
+        _workspace_archive.pack(tree / "workspace", Path(staging))
+        # `from_local` is syncified: it blocks here, but the SDK types it as a coroutine function.
+        return flyte.io.Dir.from_local(staging)  # type: ignore[return-value]  # see above: syncified
 
 
 def _recreated_workspace(queue: str, entry: _queue.Entry) -> tuple[flyte.io.Dir | None, str] | None:

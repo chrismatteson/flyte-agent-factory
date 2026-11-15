@@ -410,7 +410,19 @@ def write_lane_launcher(directory: Path, image: str = "") -> Path:
     return launcher
 
 
-def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None:
+def _has_slow_lane(project: Path) -> bool:
+    pyproject = project / "pyproject.toml"
+    return pyproject.is_file() and bool(_SLOW_MARKER.search(pyproject.read_text()))
+
+
+def can_use_child_lanes(project: Path) -> bool:
+    """Return True when `project` has a slow lane, a `uv.lock` and `tests/`: its lanes may go to children."""
+    return _has_slow_lane(project) and (project / "uv.lock").is_file() and (project / "tests").is_dir()
+
+
+def _run_head_pytest(
+    project: Path, child_lanes: bool = False, work: GateWork | None = None
+) -> HeadRun | None:
     """Run the head tree's whole suite once, as the project's interpreter would, and read its junit.
 
     A project with a slow lane runs it beside the rest in a second process: the two share the CPUs but
@@ -428,16 +440,14 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
     )
     python = project / ".venv/bin/python"
     interpreter = str(python) if python.is_file() else sys.executable
-    pyproject = project / "pyproject.toml"
-    slow_lane = pyproject.is_file() and _SLOW_MARKER.search(pyproject.read_text())
+    slow_lane = _has_slow_lane(project)
     lanes = [["-m", "not slow"], ["-m", "slow"]] if slow_lane else [[]]
-    in_children = (
-        child_lanes and bool(slow_lane) and (project / "uv.lock").is_file() and (project / "tests").is_dir()
-    )
+    in_children = child_lanes and slow_lane and can_use_child_lanes(project)
     image = ""
     skipped_children = ""
     if in_children:
-        image = _run_image(project, _launcher_env())
+        launcher_env = _launcher_env()
+        image = work.run_image(project, launcher_env) if work else _run_image(project, launcher_env)
         if not image and os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") and not _runs_here_when_not_run():
             # A run is attached: its lanes are not run on this pod either (`write_lane_launcher` alike).
             failure = "child lanes not run (the run's image could not be looked up); not run here either\n"
@@ -588,6 +598,11 @@ class GateWork:
     trusted_base: str = ""
     #: The pre-review sets this: the head run sends its lanes to child actions (see `_run_head_pytest`).
     child_lanes: bool = False
+    #: Set when `checks.sh` ran this tree's suite and was cut off at its limit (the attribution says whether
+    #: load or the suite): a second full run on the same pod would only be as loaded, so none is made.
+    checks_timed_out: str = ""
+    #: How load changed the `checks.sh` run, when it did (for the pre-review row).
+    checks_load: str = ""
     head_sha: str = ""
     #: Why a root-layout start tree could not be built: a failing language rule then cannot be compared.
     start_fault: str = ""
@@ -602,6 +617,13 @@ class GateWork:
     base_hits: int = 0
     _head: HeadRun | None = None
     _head_done: bool = False
+    _image: str | None = None
+
+    def run_image(self, project: Path, env: dict[str, str]) -> str:
+        """Return the run's own image (see `_run_image`); looked up once for `checks.sh` and the gate."""
+        if self._image is None:
+            self._image = _run_image(project, env)
+        return self._image
 
     def head_pytest(self, project: Path) -> HeadRun | None:
         """Return the head tree's tests, from `checks.sh` or one run made here; None when neither exists."""
@@ -618,8 +640,13 @@ class GateWork:
                 self.pytest_reused = True
                 self.slow_seconds = run.slow_seconds
                 return self._head
+        if self.checks_timed_out and self.junit_dir is not None:
+            self._head = HeadRun(
+                1, f"not rerun: checks.sh timed out on this tree ({self.checks_timed_out})", None
+            )
+            return self._head
         if self.share_pytest:
-            self._head = _run_head_pytest(project, self.child_lanes)
+            self._head = _run_head_pytest(project, self.child_lanes, self)
             self.slow_seconds = self._head.slow_seconds if self._head else 0.0
             self.capacity = self._head.capacity if self._head else ""
         return self._head
@@ -793,6 +820,8 @@ def _judge_tests(
     if shared is not None and shared.capacity and not shared.code:
         # Running the changed tests here is not a substitute for the suite, and was what overran the limits.
         return _gate_base.Status.NO_CAPACITY, _capacity.explain(shared.capacity)
+    if shared is not None and shared.cases is None and shared.output.startswith("not rerun"):
+        return 1, shared.output
     if shared is None or shared.cases is None or not _changed_tests_pass(shared.cases, relative):
         code, output = _gate_base._run(
             command, project if python_tests else workspace, env=env, timeout=_gate_base.TEST_TIMEOUT

@@ -49,3 +49,11 @@ def test_the_xdist_hook_answers_with_the_budget(monkeypatch):
     monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
     monkeypatch.setattr(_cpu_budget, "cpus", lambda **_: 3)
     assert conftest.pytest_xdist_auto_num_workers(None) == 3
+
+
+def test_a_set_worker_count_leaves_the_xdist_hook_out(monkeypatch):
+    import tests.conftest as conftest
+
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "5")
+    monkeypatch.setattr(_cpu_budget, "cpus", lambda **_: 3)
+    assert conftest.pytest_xdist_auto_num_workers(None) is None

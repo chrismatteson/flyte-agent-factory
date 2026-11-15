@@ -24,6 +24,7 @@ from typing import Any
 
 from . import (
     _delivery,
+    _design_seed,
     _evidence,
     _gate_base,
     _gate_rules,
@@ -209,26 +210,24 @@ def apply_managed_block(existing: str, body: str) -> str:
     return f"{existing}{sep}{block}\n"
 
 
-def _universal_newlines(text: str) -> str:
-    """Normalise newlines as `Path.read_text` hands them to the harness writer: CRLF and CR read as LF."""
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _harness_only(path: str, current: bytes | None, original: bytes | None) -> bool:
+def _harness_only(path: str, current: bytes | None, original: bytes | None, root: Path | None = None) -> bool:
     """Return True when the difference between `original` and `current` is only the harness's.
 
     Neither the scope gate nor the commit gate may ask for or reject such a change: the harness
     rewrites the file after the project commits, so one gate demanding a commit and the other
     rejecting it would never both pass. For a managed-block file the harness's write is replayed on
     `original`: only when that reproduces `current` exactly is the change the harness's, so any edit
-    the project made -- even whitespace -- still counts.
+    the project made -- even whitespace -- still counts. `root` is the workspace (`_design_seed` hashes).
     """
+    if root and _design_seed.is_untouched_seed(root, path, current, original):
+        return True
     if path in _gate_scope._HARNESS_FILES or PurePosixPath(path).parts[0] in {".claude", ".claude-flyte"}:
         return True
     if path not in _MANAGED_BLOCK_FILES or current is None:
         return False
     now = current.decode(errors="replace")
-    before = _universal_newlines(original.decode(errors="replace")) if original is not None else ""
+    # Newlines as `Path.read_text` hands them to the harness writer: CRLF and CR read as LF.
+    before = io.StringIO(original.decode(errors="replace"), newline=None).read() if original else ""
     begins = [i for i in range(len(now)) if now.startswith(MEMORY_BEGIN, i)]
     ends = [j for j in range(len(now)) if now.startswith(MEMORY_END, j)]
     return any(
@@ -261,7 +260,7 @@ def _net_changes(workspace: Path, start: Path, paths: list[str]) -> list[str]:
         p
         for p in paths
         if content(start, p) != content(workspace, p)
-        and not _harness_only(p, content(workspace, p), content(start, p))
+        and not _harness_only(p, content(workspace, p), content(start, p), workspace)
     ]
 
 
@@ -304,7 +303,7 @@ def _uncommitted(workspace: Path, name: str, layout: str = "sandbox", folder: st
     return [
         p
         for p in dict.fromkeys(paths)
-        if (p == script and root) or not _harness_only(p, *_head_and_worktree(workspace, p))
+        if (p == script and root) or not _harness_only(p, *_head_and_worktree(workspace, p), workspace)
     ]
 
 
@@ -1414,10 +1413,11 @@ def _parent_tree(project: Path, into: Path) -> Path | None:
     module that was already over the limit and did not grow is debt, not a failure, on main as on a pull
     request's merge.
     """
-    code, prefix = _gate_base._run(["git", "rev-parse", "--show-prefix"], project)
-    if code or _gate_base._run(["git", "rev-parse", "--verify", "--quiet", "HEAD~1"], project)[0]:
+    if _gate_base._run(["git", "rev-parse", "--verify", "--quiet", "HEAD~1"], project)[0]:
         return None
     into.mkdir()
+    # Run from a subdirectory of the repository (a workspace's projects/<name>/), git archive writes only that
+    # directory, with paths relative to it: `into` is then the project's tree, with no prefix to add.
     archive = subprocess.run(
         ["git", "archive", "--format=tar", "HEAD~1", "--", "."], cwd=project, capture_output=True, check=False
     )
@@ -1425,7 +1425,7 @@ def _parent_tree(project: Path, into: Path) -> Path | None:
         return None
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
         tar.extractall(into, filter="data")
-    return into / prefix.strip() if prefix.strip() else into
+    return into
 
 
 def finding_counts(results: Sequence[Result]) -> dict[str, int]:

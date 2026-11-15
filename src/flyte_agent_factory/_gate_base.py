@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import os
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
 
-from . import _lane_shards, _secret_env
+from . import _lane_shards, _load_clock, _secret_env
 
 
 class Status(enum.Enum):
@@ -110,24 +113,61 @@ def _run(
     """
     if args[0] == "git":
         args = _secret_env.git_argv(*args[1:])
-    try:
-        # Tools print whatever bytes they like; a replacement character beats a crashed gate.
-        result = subprocess.run(
-            args,
-            cwd=cwd,
-            env=_secret_env.child_env() if env is None else env,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return 124, f"command timed out after {timeout} seconds"
-    except FileNotFoundError as exc:
-        return 127, f"{exc.filename} not found"
-    output = result.stdout + result.stderr
-    return result.returncode, output if args[0] == "git" or tail is None else output[-tail:]
+    # Files, not pipes: nothing has to drain them while the load clock is polled, and a grandchild that
+    # outlives the tool cannot hold this call open by keeping a pipe's write end.
+    with (
+        tempfile.TemporaryFile("w+", errors="replace") as out,
+        tempfile.TemporaryFile("w+", errors="replace") as err,
+    ):
+        try:
+            # Tools print whatever bytes they like; a replacement character beats a crashed gate. A new
+            # session lets the clock follow, and the kill reach, every process the tool started.
+            proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                env=_secret_env.child_env() if env is None else env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            return 127, f"{exc.filename} not found"
+        except PermissionError as exc:
+            # A restored workspace can lose exec bits; say so rather than let the supervisor's gate stage die.
+            return (
+                126,
+                f"{exc.filename or args[0]} is not executable ({type(exc).__name__}: {exc.strerror or exc})",
+            )
+        except OSError as exc:
+            return (
+                126,
+                f"{exc.filename or args[0]} could not start ({type(exc).__name__}: {exc.strerror or exc})",
+            )
+        # The limit is on load-adjusted time: a busy shared node must not fail a tool that is working.
+        clock = _load_clock.LoadClock(timeout, proc.pid)
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.05)
+                    break
+                except subprocess.TimeoutExpired:
+                    if clock.poll():
+                        _kill_group(proc)
+                        return 124, f"command timed out after {timeout} seconds ({clock.attribution()})"
+        except BaseException:
+            _kill_group(proc)  # this thread was interrupted: no tool is left running behind the gate
+            raise
+        out.seek(0)
+        err.seek(0)
+        output = out.read() + err.read()
+    return proc.returncode, output if args[0] == "git" or tail is None else output[-tail:]
+
+
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
 
 
 def is_workspace(checkout: Path) -> bool:

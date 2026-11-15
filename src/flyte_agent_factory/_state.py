@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import _secret_env
+from . import _secret_env, _workspace_archive
 
 if TYPE_CHECKING:
     from flyte import Checkpoint
@@ -110,7 +110,7 @@ async def restore(*, root: Path, workspace_in: Dir | None = None) -> ProjectStat
     if workspace_in is not None:
         workspace = root / WORKSPACE_SUBDIR
         workspace.mkdir(parents=True, exist_ok=True)
-        await workspace_in.download(str(workspace))
+        await _workspace_archive.download(workspace_in, workspace)
         resumed_from = getattr(workspace_in, "path", "") or "workspace_in"
 
     _ensure_layout(root)
@@ -210,7 +210,8 @@ async def save_checkpoint(state: ProjectState, *, exclude_private: bool = False)
 
 
 async def publish(state: ProjectState) -> Dir:
-    """Hand the workspace back as a `Dir`, for a later run to resume from."""
-    from flyte.io import Dir
+    """Hand the workspace back as a `Dir`, for a later run to resume from.
 
-    return await Dir.from_local(str(state.workspace))
+    It is one tar inside the `Dir`: object storage drops file modes, and a resumed `.venv` needs its own.
+    """
+    return await _workspace_archive.upload(state.workspace)

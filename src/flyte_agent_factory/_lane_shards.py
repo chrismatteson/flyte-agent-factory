@@ -34,20 +34,32 @@ MIN_FILE_SECONDS = 0.5
 FILL = 0.85
 
 
-def read_cpu_allowance(cpu_max: Path = CPU_MAX) -> int:
-    """Return the CPUs this process may use: the affinity count, cut by the cgroup v2 quota; at least 1.
+def read_cpu_quota(cpu_max: Path = CPU_MAX) -> float:
+    """Return the CPUs this process may use, unrounded: the affinity count, cut by the cgroup v2 quota.
 
-    A pod's `os.cpu_count()` is the node's (16 on this cluster) whatever its quota, so `-n auto` starts far
-    more workers than CPUs. A missing or unreadable quota file leaves the affinity count.
+    The one reading of the quota: the load clock (`_load_clock`) uses it as is, the worker count rounded. A
+    missing or unreadable quota file leaves the affinity count.
     """
-    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        cpus = float(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        cpus = float(os.cpu_count() or 1)
     try:
         quota, period = cpu_max.read_text().split()[:2]
         if quota != "max":
-            count = min(count, int(int(quota) / int(period) + 0.5))
+            cpus = min(cpus, int(quota) / int(period))
     except (OSError, ValueError, ZeroDivisionError):
         pass
-    return max(1, count)
+    return cpus
+
+
+def read_cpu_allowance(cpu_max: Path = CPU_MAX) -> int:
+    """Return the CPUs this process may use as a worker count: `read_cpu_quota`, rounded; at least 1.
+
+    A pod's `os.cpu_count()` is the node's (16 on this cluster) whatever its quota, so `-n auto` starts far
+    more workers than CPUs.
+    """
+    return max(1, int(read_cpu_quota(cpu_max) + 0.5))
 
 
 def discover_test_files(root: Path) -> list[str]:
