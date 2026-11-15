@@ -56,7 +56,7 @@ def started(monkeypatch):
     """Pytest runs the scan starts, without running any."""
     runs: list[Path] = []
 
-    def fake(project, child_lanes=False):
+    def fake(project, child_lanes=False, work=None):
         # A scan runs its lanes here: only the pre-review sends them to child actions.
         assert child_lanes is False
         runs.append(project)
@@ -129,7 +129,7 @@ def test_launcher_text_in_a_passing_shared_run_is_not_a_missing_pytest(project, 
     # The run already decided pytest is present: a child-lane fallback note quotes the launcher's own words.
     note = "child lane not run (exit 1: No module named pytest; missing pytest completion): ran here\n"
 
-    def fake(project, child_lanes=False):
+    def fake(project, child_lanes=False, work=None):
         return _gate_tests.HeadRun(0, note + "1 passed", [_gate_tests.JunitCase("t", "test_a", True)])
 
     monkeypatch.setattr(_gate_tests, "_run_head_pytest", fake)
@@ -147,3 +147,36 @@ def test_sharded_slow_lane_seconds_are_its_longest_shard(tmp_path, project):
     assert run is not None
     assert run.slow_seconds == 95.5
     assert len(run.cases) == 3
+
+
+def test_a_tree_whose_checks_timed_out_is_not_run_again_on_the_same_pod(tmp_path, project, started):
+    work = _gate_tests.GateWork(
+        junit_dir=tmp_path / "junit", share_pytest=True, checks_timed_out="the node was busy: ..."
+    )
+    work.head_sha = git(project, "rev-parse", "HEAD").strip()
+
+    run = work.head_pytest(project)
+
+    assert not started
+    assert run is not None and run.code == 1 and run.cases is None
+    assert run.output == "not rerun: checks.sh timed out on this tree (the node was busy: ...)"
+
+
+def test_the_fail_to_pass_rule_fails_with_the_same_reason_instead_of_running_tests(
+    tmp_path, project, started
+):
+    work = _gate_tests.GateWork(
+        junit_dir=tmp_path / "junit", checks_timed_out="the checks themselves are slow"
+    )
+    work.head_sha = git(project, "rev-parse", "HEAD").strip()
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests/test_new.py").write_text("def test_new():\n    assert True\n")
+    git(project, "add", ".")
+    git(project, "commit", "-m", "tests")
+
+    code, output = _gate_tests.fail_to_pass(
+        project, ".", "HEAD~1", ["tests/test_new.py"], "", "", "", start=project, layout="root", work=work
+    )
+
+    assert code == 1 and output.startswith("not rerun: checks.sh timed out on this tree")
+    assert not started

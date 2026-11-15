@@ -177,6 +177,21 @@ def test_a_scan_judges_growth_against_the_previous_commit(tmp_path):
     assert code == 1 and "was 1510" in output
 
 
+def test_a_scan_of_a_workspace_project_judges_growth_against_its_own_previous_tree(tmp_path):
+    """A project in a repository subdirectory (projects/<name>/) finds its modules in its parent tree."""
+    _git(tmp_path, "init", "-q")
+    project = tmp_path / "projects/engine"
+    _write(project, "pkg/big.py", LIMIT + 10)
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "debt")
+    (project / "README.md").write_text("x\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "unrelated")
+    reference = _gates._parent_tree(project, tmp_path.parent / f"{tmp_path.name}-parent")
+    assert reference is not None and (reference / "pkg/big.py").is_file()
+    assert _module_size.check(project, reference, _gate_tests._is_test)[0] == 0
+
+
 def test_a_scan_outside_git_or_on_a_root_commit_has_no_reference(tmp_path):
     assert _gates._parent_tree(tmp_path, tmp_path / "parent") is None
     _git(tmp_path, "init", "-q")

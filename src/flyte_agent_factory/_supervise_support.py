@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -36,6 +37,7 @@ from flyte_agent_factory import (
     _inbox,
     _instructions,
     _issues,
+    _load_clock,
     _policy,
     _pull_requests,
     _roles,
@@ -204,6 +206,8 @@ def _pre_review_row(total: float, checks: float, work: _gate_tests.GateWork) -> 
         f"checks {checks:.0f}s{lane}",
         f"gate {gate:.0f}s" + (" (pytest reused)" if work.pytest_reused else ""),
     ]
+    if work.checks_load:
+        parts[0] += f" [{work.checks_load}]"
     if work.base_runs:
         parts.append(
             "base cached" if work.base_hits == work.base_runs else f"base {work.seconds['base']:.0f}s"
@@ -222,6 +226,10 @@ async def _run_declared_checks(
 
     A failure with `*.capacity` files in `junit_dir` is the cluster's, not the project's: the returned
     text says so, and is a `_capacity.ChecksNoCapacity` that carries the reason.
+
+    The limit is on load-adjusted time (`_load_clock`): a busy shared node does not fail checks that are
+    working. How it went is left in `timeline.checks` (`load`, `timed_out`, `image`), for the pre-review row
+    and the gate.
     """
     started = time.monotonic()
     timeline.phase("checks")
@@ -229,6 +237,8 @@ async def _run_declared_checks(
     tail = bytearray()
     code = 1
     timed_out = False
+    clock: _load_clock.LoadClock | None = None
+    image: str | None = None
     script = script or _session_config._checks_rel(_session_config._project_name, _session_config._layout())
     log_rel = _checks_log_rel(_session_config._project_name)
     log = workspace / log_rel
@@ -258,13 +268,20 @@ async def _run_declared_checks(
     if junit_dir is not None:
         env[_gate_tests.PYTEST_JUNIT_ENV] = str(junit_dir)
         env[_gate_tests.SLOW_LANE_ENV] = "child"
+        # The project's own venv cannot attach to this run, so a checks.sh that launches its lanes from it
+        # falls back to this loaded pod; the supervisor's interpreter can (the launcher below uses it too).
+        env.setdefault("AGENT_FACTORY_SLOW_LANE_PYTHON", sys.executable)
         # In a subdirectory of the junit directory, which is removed with it. The same for every project.
         # The same lookup as the gate's own lanes: the run's image, since FLYTE_INTERNAL_IMAGE here lacks git.
         image = await asyncio.to_thread(_gate_tests._run_image, workspace, _gate_tests._launcher_env())
         env[_gate_tests.TEST_LANE_ENV] = str(_gate_tests.write_lane_launcher(junit_dir / "lane", image))
-        # The launcher must report before the limit kills `checks.sh` and everything it started.
+        # The launcher must report before the limit kills `checks.sh` and everything it started. The limit is
+        # load-adjusted, so it never comes sooner than this wall-clock budget.
         env[_capacity.LANE_BUDGET_ENV] = str(_CHECKS_TIMEOUT_S - 120)
         env = _gate_base.set_xdist_env(env)
+        if image:
+            # For a checks.sh that starts its lanes itself rather than through the launcher.
+            env["FLYTE_INTERNAL_IMAGE"] = image
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash",
@@ -283,18 +300,21 @@ async def _run_declared_checks(
         # Drain as it runs: communicate() would retain an unbounded build log.
         reader = asyncio.create_task(capture())
         try:
+            clock = _load_clock.LoadClock(_CHECKS_TIMEOUT_S, proc.pid)
 
             async def wait_for_exit() -> int:
                 # asyncio's pending wait() can also wait for pipe EOF. Polling
                 # returncode lets us observe bash exiting independently of it.
                 while proc.returncode is None:
+                    if clock.poll():
+                        raise asyncio.TimeoutError
                     try:
                         await asyncio.wait_for(proc.wait(), 0.05)
                     except asyncio.TimeoutError:
                         pass
                 return await proc.wait()
 
-            code = await asyncio.wait_for(wait_for_exit(), _CHECKS_TIMEOUT_S)
+            code = await wait_for_exit()
             try:
                 await asyncio.wait_for(asyncio.shield(reader), 2)
             except asyncio.TimeoutError:
@@ -310,13 +330,21 @@ async def _run_declared_checks(
             log.write_bytes(tail)
     duration = time.monotonic() - started
     timeline.checks = {"ok": not code, "duration_s": round(duration, 1), "at": time.time()}
+    if clock is not None:
+        timeline.checks["load"] = clock.summary()
+    if image is not None:
+        timeline.checks["image"] = image
+    if timed_out and clock is not None:
+        timeline.checks["timed_out"] = clock.attribution()
     timeline.phase("building")
     status = "failed" if code else "passed"
     excerpt = "".join(c for c in tail.decode(errors="replace")[-200:] if ord(c) >= 0x20)
     timeline.row("🚧" if code else "✅", f"{script} {status} in {duration:.1f}s: {excerpt}")
     if not code:
         return ""
-    timeout = f" (timed out after {_CHECKS_TIMEOUT_S}s)" if timed_out else ""
+    timeout = ""
+    if timed_out and clock is not None:
+        timeout = f" (timed out: {_CHECKS_TIMEOUT_S} s limit; {clock.attribution()})"
     if junit_dir is not None and (reasons := _capacity.decide_checks_outcome(junit_dir)):
         problem = f"`{script}` failed with exit code {code}{timeout}: {_capacity.explain(reasons)}"
         return _capacity.ChecksNoCapacity(problem, reasons)

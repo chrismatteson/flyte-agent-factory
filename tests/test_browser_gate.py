@@ -193,7 +193,16 @@ def gate(app, clock):
     gate.stop()
 
 
-def post(gate, path, message, *, session="s1", accept="application/json, text/event-stream", headers=None):
+def post(
+    gate,
+    path,
+    message,
+    *,
+    session="s1",
+    accept="application/json, text/event-stream",
+    headers=None,
+    timeout=20,
+):
     """Post a JSON-RPC message; return (status, parsed message or None, raw body)."""
     request = urllib.request.Request(
         gate.url + path,
@@ -201,7 +210,7 @@ def post(gate, path, message, *, session="s1", accept="application/json, text/ev
         {"Content-Type": "application/json", "Accept": accept, "Mcp-Session-Id": session, **(headers or {})},
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             status, raw = response.status, response.read().decode()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read().decode()
@@ -827,6 +836,12 @@ def _playwright_command() -> list[str] | None:
     return None
 
 
+# Bounds for a hang, not expectations: a healthy run takes seconds, a cold Chromium start on a loaded
+# machine much longer.
+READY_BOUND_S = 120
+HANG_BOUND_S = 300
+
+
 @pytest.mark.slow
 def test_real_playwright_mcp_through_the_gate(tmp_path, clock):
     """Link click passes, a button click is held, approval releases it; needs @playwright/mcp."""
@@ -865,12 +880,18 @@ def test_real_playwright_mcp_through_the_gate(tmp_path, clock):
         endpoint=lambda name: f"http://127.0.0.1:{mcp_port}",
     )
     try:
-        for port in (web_port, mcp_port):
-            for _ in range(150):
+        # Wait for each listener, and fail at once, with the reason, if its process died.
+        for name, process, port in (("web server", web, web_port), ("playwright-mcp", mcp, mcp_port)):
+            deadline = time.monotonic() + READY_BOUND_S
+            while True:
+                assert process.poll() is None, (
+                    f"the {name} exited with {process.returncode} before it listened"
+                )
                 try:
                     socket.create_connection(("127.0.0.1", port), timeout=1).close()
                     break
                 except OSError:
+                    assert time.monotonic() < deadline, f"the {name} did not listen within {READY_BOUND_S}s"
                     time.sleep(0.2)
         gate.start()
         initialize = {
@@ -888,12 +909,20 @@ def test_real_playwright_mcp_through_the_gate(tmp_path, clock):
             json.dumps(initialize).encode(),
             {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=HANG_BOUND_S) as response:
             session = response.headers["Mcp-Session-Id"]
-        post(gate, "/github/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"}, session=session)
+        post(
+            gate,
+            "/github/mcp",
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            session=session,
+            timeout=HANG_BOUND_S,
+        )
 
         def run(name, arguments):
-            _, reply, _ = call(gate, name, arguments, session=session)
+            # The first navigate launches Chromium: wait for it, and fail at once if the browser died.
+            assert mcp.poll() is None, f"playwright-mcp exited with {mcp.returncode} during {name}"
+            _, reply, _ = call(gate, name, arguments, session=session, timeout=HANG_BOUND_S)
             assert reply is not None, name
             return reply
 

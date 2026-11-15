@@ -460,7 +460,10 @@ def test_flyte_supports_the_gcp_bootstrap_input_type():
 #: must still end in the restart; a leaked error would leave a stopped author with `_switching` set.
 #: +1 (board #49 follow-up, dispatch wake): the daemon-thread runner hands any exception to the awaiting
 #: coroutine, so a stalled or failing planner wake ends on a bounded timeout instead of holding the deploy.
-BROAD_HANDLER_SITES = 11
+#: +1 (restored-workspace hygiene): the pump's pre-review stage runs the session's own tools; whatever
+#: it raises (a `.venv` that lost its exec bits) bounces the DONE, because one that escapes ends the pump
+#: and leaves the run with nothing driving it.
+BROAD_HANDLER_SITES = 12
 
 
 def test_the_broad_handlers_are_pinned_to_the_boundary_sites():

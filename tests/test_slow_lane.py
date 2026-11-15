@@ -2237,3 +2237,44 @@ def test_a_failed_upload_leaves_an_outcome_record_the_supervisor_can_read(five_f
     record = json.loads((five_files / "slow.xml.result").read_text())
     assert record["completed"] is False and record["outcome"] == "upload" and record["code"] == 74
     assert "could not upload the tree" in _capacity.label_infrastructure_failures(five_files)
+
+
+def _context(directory: Path) -> Path:
+    path = directory / ".flyte" / "run_context.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}")
+    return path
+
+
+def test_a_workspace_project_attaches_with_the_context_at_its_repository_root(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    _context(tmp_path)
+    project = tmp_path / "projects" / "one"
+    project.mkdir(parents=True)
+    monkeypatch.chdir(project)
+    seen: list[object] = []
+    monkeypatch.setattr("flyte_agent_factory.child.attach", seen.append)
+    _slow_lane._attach()
+    assert seen == [tmp_path]
+
+
+def test_the_nearest_run_context_wins(tmp_path):
+    (tmp_path / ".git").mkdir()
+    _context(tmp_path)
+    project = tmp_path / "projects" / "one"
+    _context(project)
+    assert _slow_lane._run_context_dir(project) == project
+
+
+def test_a_run_context_outside_the_repository_is_not_used(tmp_path, monkeypatch):
+    _context(tmp_path)
+    repository = tmp_path / "repo"
+    (repository / ".git").mkdir(parents=True)
+    project = repository / "projects" / "one"
+    project.mkdir(parents=True)
+    assert _slow_lane._run_context_dir(project) is None
+    monkeypatch.chdir(project)
+    seen: list[object] = []
+    monkeypatch.setattr("flyte_agent_factory.child.attach", seen.append)
+    _slow_lane._attach()
+    assert seen == [None]

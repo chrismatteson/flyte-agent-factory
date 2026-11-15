@@ -27,6 +27,7 @@ import json
 import os
 import random
 import runpy
+import time
 from pathlib import Path
 
 control = Path(os.environ["BENCH_CONTROL"])
@@ -37,6 +38,9 @@ class Clock(RealDatetime):
         instant = RealDatetime.fromisoformat(json.loads(control.read_text())["now"])
         return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
 datetime.datetime = Clock
+# time.time() follows the same clock; time.clock_gettime(time.CLOCK_REALTIME) stays real.
+time.time = lambda: Clock.now(datetime.timezone.utc).timestamp()
+time.time_ns = lambda: round(time.time() * 1_000_000) * 1000
 choices = random.choices
 def controlled_choices(*args, **kwargs):
     state = json.loads(control.read_text())
@@ -51,6 +55,32 @@ runpy.run_module("shortlinks", run_name="__main__")
 """
 
 
+START_NOW = "2030-01-01T00:00:00+00:00"
+
+
+def write_state(control, state):
+    # Atomic: the service reads this file on every clock read, and a half-written file is a 500.
+    scratch = control.with_name(control.name + ".tmp")
+    scratch.write_text(json.dumps(state))
+    os.replace(scratch, control)
+
+
+def wait_for_wall_clock(instant):
+    # Only for a service whose clock the control file cannot move.
+    while time.time() < instant.timestamp():
+        time.sleep(0.001)
+
+
+def expire(control, link):
+    """Move the service's clock a second past the link's expiry (waits in real time if it ignores control)."""
+    state = json.loads(control.read_text())
+    past = datetime.fromisoformat(link["expires_at"]) + timedelta(seconds=1)
+    state["now"] = past.isoformat()
+    write_state(control, state)
+    if datetime.fromisoformat(link["created_at"]) != datetime.fromisoformat(START_NOW):
+        wait_for_wall_clock(past)
+
+
 @pytest.fixture
 def start_service(tmp_path):
     servers = []
@@ -61,7 +91,7 @@ def start_service(tmp_path):
             free = probe.getsockname()[1]
         db = tmp_path / f"{free}.db"
         control = tmp_path / f"{free}.json"
-        control.write_text(json.dumps({"now": "2030-01-01T00:00:00+00:00"}))
+        write_state(control, {"now": START_NOW})
         env = dict(os.environ, BENCH_CONTROL=str(control))
         command = ["-c", BOOTSTRAP] if controlled else ["-m", "shortlinks"]
         server = subprocess.Popen(
@@ -151,12 +181,13 @@ def test_no_expiry_means_expires_at_null(service):
     assert call(port, "GET", "/nulled")[0] == 302
 
 
-def test_an_expired_link_is_gone_and_its_slug_stays_taken(service):
-    port, _ = service
+def test_an_expired_link_is_gone_and_its_slug_stays_taken(start_service):
+    port, _, control = start_service(controlled=True)
     request = {"url": "https://example.com/a", "slug": "soon", "expires_in": 1}
-    assert call(port, "POST", "/links", request)[0] == 201
+    status, link = call(port, "POST", "/links", request)
+    assert status == 201
     assert call(port, "GET", "/soon")[0] == 302
-    time.sleep(1.3)
+    expire(control, link)
     for path in ("/soon", "/links/soon"):
         status, body = call(port, "GET", path)
         assert status == 410 and isinstance(body, dict) and "error" in body, path
@@ -167,14 +198,15 @@ def test_an_expired_link_is_gone_and_its_slug_stays_taken(service):
     assert call(port, "POST", "/links", {"url": "https://example.com/b", "slug": "soon"})[0] == 201
 
 
-def test_a_410_is_not_a_visit(service):
-    port, db = service
+def test_a_410_is_not_a_visit(start_service):
+    port, db, control = start_service(controlled=True)
     request = {"url": "https://example.com/a", "slug": "count", "expires_in": 1}
-    assert call(port, "POST", "/links", request)[0] == 201
+    status, link = call(port, "POST", "/links", request)
+    assert status == 201
     assert call(port, "GET", "/count")[0] == 302
     status, before = call(port, "GET", "/links/count")
     assert status == 200 and before["visits"] == 1
-    time.sleep(1.3)
+    expire(control, link)
     assert [call(port, "GET", "/count")[0] for _ in range(3)] == [410] * 3
     assert call(port, "GET", "/links/count")[0] == 410
     # Storage is private: discover visit columns, then fall back to the public count.
@@ -212,12 +244,10 @@ def test_expiry_includes_the_exact_boundary(start_service):
     if datetime.fromisoformat(link["created_at"]) != datetime.fromisoformat(state["now"]):
         # Other clocks need a real-time probe; exact equality is not deterministic over HTTP.
         warnings.warn("service does not use datetime.now; exact-equality assertion unavailable")
-        deadline = datetime.fromisoformat(link["expires_at"]).timestamp()
-        while time.time() < deadline:
-            time.sleep(0.001)
+        wait_for_wall_clock(datetime.fromisoformat(link["expires_at"]))
     else:
         state["now"] = link["expires_at"]
-        control.write_text(json.dumps(state))
+        write_state(control, state)
     for path in ("/boundary", "/links/boundary"):
         status, body = call(port, "GET", path)
         assert status == 410 and isinstance(body, dict) and "error" in body
@@ -230,16 +260,11 @@ def test_random_generation_does_not_return_an_expired_slug(start_service):
     })
     assert status == 201
     slug = link["slug"]
-    state = json.loads(control.read_text())
-    state.update(now=(datetime.fromisoformat(link["expires_at"]) + timedelta(seconds=1)).isoformat())
-    control.write_text(json.dumps(state))
-    if datetime.fromisoformat(link["created_at"]) != datetime.fromisoformat("2030-01-01T00:00:00+00:00"):
-        deadline = datetime.fromisoformat(link["expires_at"]).timestamp()
-        while time.time() < deadline:
-            time.sleep(0.001)
+    expire(control, link)
     assert call(port, "GET", f"/{slug}")[0] == 410
+    state = json.loads(control.read_text())
     state["collision"] = slug
-    control.write_text(json.dumps(state))
+    write_state(control, state)
     status, generated = call(port, "POST", "/links", {"url": "https://example.com/b"})
     assert status == 201
     assert generated["slug"] != slug

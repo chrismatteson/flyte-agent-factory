@@ -455,12 +455,15 @@ def _run_context_dir(start: Path) -> Path | None:
 
     The supervisor writes it at the workspace root, while a project's checks run from its own directory below
     that (`projects/<name>/`): looking only in the working directory sent the lane to run here every time.
+    The walk stops at the repository root, so a context outside the repository is never used.
     """
     from flyte_agent_factory.child import context_path
 
     for base in (start, *start.parents):
         if context_path(base).is_file():
             return base
+        if (base / ".git").exists():
+            break
     workspace = os.environ.get("AGENT_FACTORY_WORKSPACE")
     if workspace and context_path(workspace).is_file():
         return Path(workspace)

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from flyte_agent_factory import (
+    _design_seed,
     _gate_base,
     _gate_scope,
     _gates,
@@ -72,7 +73,7 @@ _PROFILE = _profile.current()
 
 _PROJECT_API_KEY_VAR = _secret_env.PROJECT_API_KEY_VAR
 
-DESIGN_FILE = "DESIGN.md"
+DESIGN_FILE = _design_seed.DESIGN_FILE
 
 
 def _passed_path() -> Path:

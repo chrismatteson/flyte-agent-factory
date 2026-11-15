@@ -6,7 +6,6 @@ import random
 import sqlite3
 import string
 import threading
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -14,6 +13,7 @@ from typing import Any
 from shortlinks import ATOMIC_VISITS, FREE_DELETED_SLUGS
 
 LOCK = threading.Lock()
+RENDEZVOUS = threading.Barrier(2)
 # slug, url, created_at, visits
 Row = tuple[str, str, str, int]
 
@@ -90,7 +90,12 @@ def serve(port: int, path: str) -> None:
                     db.commit()
             else:
                 seen = row[3]
-                time.sleep(0.02)
+                # Two visits always both read before either writes. A sleep only made that likely; the
+                # timeout is a bound for a visit that has no partner, not part of the race.
+                try:
+                    RENDEZVOUS.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    RENDEZVOUS.reset()
                 with LOCK:
                     db.execute("UPDATE links SET visits = ? WHERE slug = ?", (seen + 1, slug))
                     db.commit()
@@ -105,7 +110,11 @@ def serve(port: int, path: str) -> None:
                 db.commit()
             self.reply(204)
 
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    class Server(ThreadingHTTPServer):
+        # The default listen backlog is 5: a burst of concurrent clients got connections refused.
+        request_queue_size = 128
+
+    Server(("127.0.0.1", port), Handler).serve_forever()
 
 
 def main() -> None:
@@ -119,4 +128,5 @@ def main() -> None:
     serve(args.port, args.db)
 
 
-main()
+if __name__ == "__main__":
+    main()

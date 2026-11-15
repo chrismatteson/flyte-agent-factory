@@ -452,6 +452,7 @@ the session role definitions, the browser image files and the workspace template
 |---|---|
 | `agent.py` | the Flyte tasks: the `project` task (one project is one run) and its slot variants, `gcp_bootstrap` |
 | `_supervise.py` | the session loop: nudges, DONE, the pre-review gate and the review rounds |
+| `_pre_review.py` | the pre-review checks a DONE runs: readiness, the declared `checks.sh` and the standards gate |
 | `_supervise_support.py` | the DONE readiness preflight, the declared `checks.sh` run and the pre-review row |
 | `_session_setup.py` | workspace and session preparation: environment, team seed, git checkout, project branch, browser and MCP config |
 | `_session_config.py` | paths, timings and per-run state that several session parts share |

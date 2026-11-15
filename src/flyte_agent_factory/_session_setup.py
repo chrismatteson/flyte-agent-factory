@@ -24,6 +24,7 @@ from flyte_agent_factory import (
     _browser_exit_node,
     _browser_gate,
     _checkpoint,
+    _design_seed,
     _gates,
     _git,
     _git_https,
@@ -137,58 +138,6 @@ def _export_runtime_env() -> dict[str, str]:
     return dict(os.environ)
 
 
-# Seeded once and then left alone: this is where a human writes the house rules
-# the agents are told to follow, so re-seeding would overwrite their edits.
-_DESIGN_SEED = """\
-# Design guidance
-
-House rules for this project. Every agent reads this; it overrides their own
-instructions where they conflict. Edit it freely -- it is not regenerated.
-
-General engineering and security practice lives in `.claude-flyte/standards/`,
-including "Don't reinvent the wheel". Read those standards alongside
-this project guidance.
-
-## Things about this environment that have already cost time
-
-- **Containers run as an unprivileged user.** Nothing may assume it can write
-  outside `$HOME` (or `/tmp`). This broke three separate things before it was
-  understood: the agent's own state paths, the `claude` binary's install
-  location, and the browser app's profile directory. Derive writable paths from
-  `$HOME`; never hardcode `/var/lib`, `/state` or `/usr/local/bin`.
-- **The code bundle carries Python modules, not package data.** Anything that
-  is not a `.py` has to be put into the image (`Image.with_source_folder`), or
-  it will be present locally and silently absent in the container.
-- **Building an image is not running it.** An image that builds can still exit
-  on its first line. Prove a component starts, not that it compiles.
-
-## Running work on the cluster
-
-- Attach once with `flyte_agent_factory.child.attach()`, then write ordinary Flyte.
-  Anything you submit becomes a child action of this run.
-- **Images must already exist.** Reuse `$FLYTE_INTERNAL_IMAGE` or a public
-  image; use `flyte.sandbox.create(packages=[...])` when you genuinely need a
-  new one built.
-- **Always bound the queue** with `flyte.Timeout(max_queued_time=...)`, and on
-  `MaxQueuedTimeExceededError` fall back -- spot first, then on-demand with the
-  timeout cleared. A job with no queue bound waits forever and that is not a
-  failure.
-- **Keep the workspace small.** It is checkpointed whole on a timer, so cost
-  scales with its size. Datasets and model artifacts belong in a child action's
-  outputs, not in the working tree.
-
-## Working as a team
-
-Use the subagents in `.claude/agents/`, named by what they do: `scope` settles scope and
-acceptance criteria, `discover` finds out what the problem really is (DISCOVERY.md),
-`prototype` tries two or more shapes of anything a person will see or use, `shape` settles the
-design (DESIGN-RATIONALE.md), `build` builds it, and `verify` -- several in parallel, on
-different aspects -- finds out whether it actually works. Don't let one agent both build and
-bless its own work. The old names `product`, `designer`, `dev` and `qa` still work as aliases
-this release.
-"""
-
-
 def _roles_dir() -> Path:
     """Return the directory the role files live in.
 
@@ -235,7 +184,9 @@ def _seed_team(workspace: Path) -> list[str]:
 
     design = workspace / _session_config.DESIGN_FILE
     if not design.exists():
-        design.write_text(_DESIGN_SEED)
+        design.write_text(_design_seed.SEED)
+    if design.is_file() and design.read_bytes() == _design_seed.SEED.encode():
+        _design_seed.record(workspace)
     return installed
 
 

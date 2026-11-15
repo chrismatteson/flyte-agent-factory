@@ -7,13 +7,14 @@ discard work.
 """
 
 import shutil
+import tarfile
 import types
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from flyte_agent_factory import _checkpoint, _state
+from flyte_agent_factory import _checkpoint, _state, _workspace_archive
 
 
 class _FakeDir:
@@ -121,7 +122,9 @@ async def test_publish_hands_back_the_workspace(tmp_path, no_checkpoint, monkeyp
     class _Dir:
         @staticmethod
         async def from_local(path):
-            captured["path"] = path
+            # One tar, so the modes survive object storage; read it before the staging copy goes away.
+            with tarfile.open(Path(path) / _workspace_archive.WORKSPACE_ARCHIVE) as archive:
+                captured["members"] = archive.getnames()
             return types.SimpleNamespace(path=path)
 
     monkeypatch.setitem(__import__("sys").modules, "flyte.io", types.SimpleNamespace(Dir=_Dir))
@@ -129,8 +132,9 @@ async def test_publish_hands_back_the_workspace(tmp_path, no_checkpoint, monkeyp
 
     # The workspace, not the state root: the config dir holds the transcript
     # and has no business in a downstream run's inputs.
-    assert captured["path"] == str(state.workspace)
-    assert published.path == str(state.workspace)
+    assert "./out.txt" in captured["members"]
+    assert not [name for name in captured["members"] if "claude" in name]
+    assert published.path
 
 
 def test_the_checkpoint_location_is_where_this_action_saves(monkeypatch):

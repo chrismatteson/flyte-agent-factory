@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
-import tempfile
 import time
 import traceback
 from collections.abc import Callable
@@ -17,9 +15,8 @@ from flyte_agent_factory import (
     _checkpoint,
     _contract,
     _demo_checks,
-    _gate_tests,
-    _gates,
     _inbox,
+    _pre_review,
     _review,
     _review_wait,
     _reviewer,
@@ -593,91 +590,19 @@ async def _pump(
                     _inbox._clear_pass_keep_history()
                     # Mechanical readiness before the expensive judgement.
                     if workspace and qa_task is None and not _supervise_support._escalated:
-                        checks_started = time.monotonic()
-                        # A repair attempt needs the whole checklist, even when the first check fails.
-                        problems: list[str] = []
-                        # A bounce is counted once: preflight when a declared check or the gate failed,
-                        # otherwise "done" (not ready: no criteria, no checks script, demo package).
-                        check_failed = False
-                        demo_problem = await _demo_checks._demo_package_problem(workspace, demo_package)
-                        if demo_problem:
-                            problems.append(demo_problem)
-                        not_ready = await _supervise_support._done_preflight(workspace)
-                        if not_ready:
-                            problems.append(not_ready)
-                        # checks.sh leaves its pytest run here; the gate reads it instead of repeating it,
-                        # unless this round changed what decides that run's results (checks.sh, conftest).
-                        harness = _gates.changed_test_harness(
-                            workspace,
-                            _session_config._project_name,
-                            _gates.resolve_base(workspace, _session_config._project_name),
-                        )
-                        work = _gate_tests.GateWork(
-                            junit_dir=Path(tempfile.mkdtemp(prefix="factory-junit-")),
-                            checks_started=time.time(),
-                            reuse_refused=", ".join(harness),
-                            child_lanes=True,
-                        )
-                        checks_seconds = 0.0
+                        checked = await _pre_review.begin(workspace, demo_package)
                         capacity.note = note
-                        checks_capacity = ""  # why checks.sh found no room for its test lanes
-                        if (
-                            workspace
-                            / _session_config._checks_rel(
-                                _session_config._project_name, _session_config._layout()
-                            )
-                        ).is_file():
-                            checks_problem = await _supervise_support._run_declared_checks(
-                                workspace, timeline, work.junit_dir
-                            )
-                            checks_capacity = (
-                                checks_problem.capacity
-                                if isinstance(checks_problem, _capacity.ChecksNoCapacity)
-                                else ""
-                            )
-                            checks_seconds = time.monotonic() - checks_started
-                            if checks_problem and not checks_capacity:
-                                problems.append(checks_problem)
-                                check_failed = True
-                        else:
-                            checks_rel = _session_config._checks_rel(
-                                _session_config._project_name, _session_config._layout()
-                            )
-                            problems.append(
-                                f"Write `{checks_rel}` with the bash commands "
-                                "that prove the build and tests pass, run from the workspace root."
-                            )
-                        # Fetching vendored upstream blocks: it is done here, off the loop, so the standards
-                        # selection below (on the loop) only reads the cache.
-                        await asyncio.to_thread(_session_config.warm_vendored_cache)
-                        gate_problem = await asyncio.to_thread(
-                            _gates.run,
-                            workspace,
-                            _session_config._project_name,
-                            _session_config._project_brief,
-                            _session_config._demo_kind,
-                            note,
-                            _session_config._applicable_standards(),
-                            timeline,
-                            _session_config._layout(),
-                            list(_inbox._directions),
-                            work,
-                            _session_config._project_repo,
-                            _session_config._project_folder,
-                        )
-                        if work.junit_dir:
-                            shutil.rmtree(work.junit_dir, ignore_errors=True)
-                        if gate_problem:
-                            problems.append(gate_problem)
-                            check_failed = True
-                        timeline.row(
-                            "🚧",
-                            _supervise_support._pre_review_row(
-                                time.monotonic() - checks_started, checks_seconds, work
-                            ),
-                        )
+                        try:
+                            await _pre_review.check(checked, workspace, timeline, note)
+                        except Exception as exc:  # noqa: BLE001 -- bounce the DONE; cancellation is not an Exception
+                            # A tool that cannot start must bounce the DONE: an exception here would end the
+                            # pump and leave the run unattended.
+                            traceback.print_exc()
+                            _pre_review.could_not_run(checked, timeline, exc)
+                        _pre_review.finish(checked, timeline)
+                        problems, check_failed, work = checked.problems, checked.check_failed, checked.work
                         if await _supervise_support._hold_or_wait_without_blame(
-                            proc, timeline, capacity, problems, work, checks_capacity
+                            proc, timeline, capacity, problems, work, checked.checks_capacity
                         ):
                             declared_done = True  # holding or waiting is not idleness: nothing to nudge
                             continue

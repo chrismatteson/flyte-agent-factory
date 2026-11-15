@@ -524,9 +524,9 @@ def _no_test_packs_this_checkouts_ignored_files(monkeypatch):
 
 def patch_supervisor_clock(monkeypatch, clock):
     """Replace `time` in every module that `agent` was before it was split, so one clock drives them all."""
-    from flyte_agent_factory import _author, _subagent_run, _supervise, _supervise_support, agent
+    from flyte_agent_factory import _author, _pre_review, _subagent_run, _supervise, _supervise_support, agent
 
-    for module in (agent, _author, _subagent_run, _supervise, _supervise_support):
+    for module in (agent, _author, _pre_review, _subagent_run, _supervise, _supervise_support):
         monkeypatch.setattr(module, "time", clock)
 
 

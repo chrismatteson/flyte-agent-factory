@@ -827,7 +827,7 @@ def test_an_engine_already_deployed_is_not_deployed_again(monkeypatch):
     assert calls == []
 
 
-# Scheduling remains probabilistic without the seed's sleep, even with overlapping HTTP requests.
+# Scheduling remains probabilistic without the seed's rendezvous, even with overlapping HTTP requests.
 @pytest.mark.slow  # runs the shortlinks hidden check: the benchmark lane
 @pytest.mark.parametrize(
     "variant",
@@ -852,7 +852,7 @@ def test_hidden_check_rejects_other_incorrect_fixes(tmp_path, variant):
     module = project / "shortlinks" / "__main__.py"
     text = module.read_text()
     if variant == "no_sleep":
-        text = text.replace("time.sleep(0.02)", "pass")
+        text = text.replace("RENDEZVOUS.wait(timeout=5)", "pass")
     if variant == "stale_visits":
         text = text.replace(
             'db.execute("DELETE FROM links WHERE slug = ?", (slug,))',
@@ -1058,7 +1058,7 @@ def test_the_shortlinks_check_accepts_alternative_fixes(tmp_path, alternative):
     else:
         text = text.replace("UPDATE links SET deleted = 1 WHERE slug = ?", "DELETE FROM links WHERE slug = ?")
         (module.parent / "server.py").write_text(text)
-        text = "from shortlinks import server\n"
+        text = "from shortlinks import server\n\nserver.main()\n"
     module.write_text(text)
     result = _bench_check.run_hidden_check(_bench_suite.get("bugfix-shortlinks"), project, key_vars=())
     assert result["exit_code"] == 0, result["summary"]

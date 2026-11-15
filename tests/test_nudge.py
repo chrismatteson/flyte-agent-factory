@@ -24,9 +24,11 @@ from flyte_agent_factory import (
     _checkpoint,
     _contract,
     _demo_checks,
+    _gate_tests,
     _gates,
     _inbox,
     _instructions,
+    _load_clock,
     _policy,
     _review,
     _reviewer,
@@ -4711,7 +4713,9 @@ async def test_checks_background_stdout_preserves_exit(tmp_path, monkeypatch):
     checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
     checks.parent.mkdir(parents=True, exist_ok=True)
     checks.write_text("sleep 30 & echo started; exit 0")
-    monkeypatch.setattr(_supervise_support, "_CHECKS_TIMEOUT_S", 0.2)
+    # Well under the 30 s the background sleep holds stdout, so a run that waits for it still times out;
+    # 0.2 s was not enough for bash to start at load 41 on 4 CPUs.
+    monkeypatch.setattr(_supervise_support, "_CHECKS_TIMEOUT_S", 10)
     assert await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline()) == ""
     assert (
         tmp_path / _supervise_support._checks_log_rel(_session_config._project_name)
@@ -5770,3 +5774,65 @@ async def test_a_git_cancelled_while_it_is_still_being_spawned_is_killed_too(tmp
         await asyncio.sleep(0.05)
     os.kill(child, 9)
     pytest.fail("the child of a git cancelled during its spawn survived")
+
+
+@pytest.mark.asyncio
+async def test_checks_timeout_message_says_whether_load_or_the_checks_were_slow(tmp_path, monkeypatch):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    checks.write_text("sleep 60")
+    monkeypatch.setattr(_supervise_support, "_CHECKS_TIMEOUT_S", 0.5)
+    timeline = _timeline._Timeline()
+    problem = await _supervise_support._run_declared_checks(tmp_path, timeline)
+    assert re.search(
+        r"failed with exit code 124 \(timed out: 0\.5 s limit; (the checks themselves are slow|load)", problem
+    )
+    assert timeline.checks and timeline.checks["timed_out"] in problem
+
+
+@pytest.mark.asyncio
+async def test_checks_that_wait_for_cpu_are_not_timed_out_on_wall_time(tmp_path, monkeypatch):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    checks.write_text("sleep 1.2")
+    monkeypatch.setattr(_supervise_support, "_CHECKS_TIMEOUT_S", 1.0)
+
+    class Starved(_load_clock.LoadClock):
+        """The node takes most of the wall time: each poll finds the tree was due a CPU it did not get."""
+
+        @property
+        def adjusted(self) -> float:
+            return self.wall / 3
+
+    monkeypatch.setattr(_load_clock, "LoadClock", Starved)
+    assert await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline()) == ""
+
+
+@pytest.mark.asyncio
+async def test_checks_run_on_the_runs_own_image(tmp_path, monkeypatch):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    checks.write_text('echo "image=$FLYTE_INTERNAL_IMAGE"')
+    lookups = []
+
+    def lookup(project, env):
+        lookups.append(project)
+        return "registry.example/agent:run-image"
+
+    monkeypatch.setattr(_gate_tests, "_run_image", lookup)
+    monkeypatch.setattr(_gate_tests, "can_use_child_lanes", lambda project: True)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    timeline = _timeline._Timeline()
+    assert await _supervise_support._run_declared_checks(tmp_path, timeline, junit) == ""
+    assert timeline.checks and timeline.checks["image"] == "registry.example/agent:run-image"
+    log = tmp_path / _supervise_support._checks_log_rel(_session_config._project_name)
+    assert log.read_text() == "image=registry.example/agent:run-image\n"
+    assert len(lookups) == 1
+
+
+def test_pre_review_row_shows_load_when_it_made_a_difference():
+    work = _gate_tests.GateWork(checks_load="610s load-adjusted, load average up to 19.4 on 4 CPUs")
+    work.seconds["gate"] = 5.0
+    row = _supervise_support._pre_review_row(900.0, 890.0, work)
+    assert "checks 890s [610s load-adjusted, load average up to 19.4 on 4 CPUs]" in row

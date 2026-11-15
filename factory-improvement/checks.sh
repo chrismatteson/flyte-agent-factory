@@ -16,6 +16,19 @@ set -euo pipefail
 # The project root: the repository's, or a subdirectory of a workspace repository (projects/<name>/).
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# The lane launcher attaches to the run from the working directory's `.flyte/`, which the supervisor writes at
+# the repository root. A workspace project runs here, in a subdirectory: lend it the root's for this run, or
+# both lanes fall back to this pod and hold the checks past their time limit. (`.flyte/` is ignored.)
+lent_context=
+if [[ -n ${AGENT_FACTORY_TEST_LANE:-} && ! -e .flyte ]]; then
+  top=$(git rev-parse --show-toplevel)
+  if [[ $top != "$PWD" && -f $top/.flyte/run_context.json ]]; then
+    ln -s "$top/.flyte" .flyte
+    lent_context=1
+    trap 'rm -f .flyte' EXIT
+  fi
+fi
+
 # Read once and taken out of the environment: the suite's own tests of this script run it again.
 slow_here=${AGENT_FACTORY_SLOW_LANE_HERE:-}
 unset AGENT_FACTORY_SLOW_LANE_HERE
@@ -80,7 +93,8 @@ pytest_lane() {
 # Each lane's output is also kept, so that its verdict can be repeated at the end: whoever reads only the end of
 # this log (the supervisor keeps its last 12 KB) still sees why a lane failed, whichever lane finished last.
 lane_logs=$(mktemp -d)
-trap 'rm -rf "$lane_logs"' EXIT
+# One EXIT trap replaces another: this one also takes back the lent `.flyte/`.
+trap 'rm -rf "$lane_logs"; [[ -z $lent_context ]] || rm -f .flyte' EXIT
 pytest_lane fast "not slow" "$@" > >(tee "$lane_logs/fast.log") &
 fast=$!
 # The slow lane (benchmark hidden checks: real Terraform, pytest-in-pytest) costs about two thirds of the suite's

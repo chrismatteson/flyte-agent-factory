@@ -1,11 +1,13 @@
 """Factory gates use local tools and never spend an LLM review round."""
 
+import functools
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,6 +19,7 @@ from flyte_agent_factory import (
     _gate_scope,
     _gate_tests,
     _gates,
+    _load_clock,
     _review,
     _reviewer,
     _session_config,
@@ -1396,7 +1399,60 @@ def test_shipped_pytest_rule_allows_a_long_suite():
 
 def test_a_timed_out_command_reports_its_own_limit(tmp_path):
     code, output = _gate_base._run([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path, timeout=1)
-    assert (code, output) == (124, "command timed out after 1 seconds")
+    # The message goes on to say whether the node's load or the command was slow; see the tests below.
+    assert code == 124 and output.startswith("command timed out after 1 seconds (")
+
+
+def test_a_timed_out_command_says_the_command_is_slow_when_it_waited_for_nothing(tmp_path, monkeypatch):
+    # The tree's schedstat is faked as never waiting for CPU: the verdict cannot depend on this node's load.
+    clock = _load_clock.LoadClock
+    monkeypatch.setattr(
+        _load_clock, "LoadClock", functools.partial(clock, sampler=lambda pgid: {"1/1": (0, 0)})
+    )
+    code, output = _gate_base._run([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path, timeout=1)
+    assert code == 124
+    assert "the checks themselves are slow" in output
+
+
+def test_a_timed_out_command_is_killed_with_everything_it_started(tmp_path):
+    pidfile = tmp_path / "child.pid"
+    script = (
+        "import subprocess; p = subprocess.Popen(['sleep', '60']); "
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid)); p.wait()"
+    )
+    code, _ = _gate_base._run([sys.executable, "-c", script], tmp_path, timeout=1)
+    assert code == 124
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert (
+        not Path(f"/proc/{pid}").exists() or "Z" in Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2]
+    )
+
+
+def test_a_command_is_judged_by_the_load_clock_with_its_own_limit(tmp_path, monkeypatch):
+    limits = []
+
+    class Spy(_load_clock.LoadClock):
+        def poll(self):
+            limits.append(self.limit_s)
+            return super().poll()
+
+    monkeypatch.setattr(_load_clock, "LoadClock", Spy)
+    command = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+    assert _gate_base._run(command, tmp_path, timeout=30) == (0, "")
+    assert limits and set(limits) == {30}
+
+
+def test_a_command_that_cannot_start_reports_why_instead_of_raising(tmp_path):
+    script = tmp_path / "launcher"
+    script.write_text("#!/bin/sh\n")  # not executable
+    assert _gate_base._run([str(script)], tmp_path) == (
+        126,
+        f"{script} is not executable (PermissionError: Permission denied)",
+    )
+    assert _gate_base._run(["no-such-tool-here"], tmp_path) == (127, "no-such-tool-here not found")
 
 
 @pytest.mark.parametrize("make", [lambda p: p / "missing", lambda p: p / "lib.py"])

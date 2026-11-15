@@ -372,6 +372,38 @@ def test_checks_sh_leaves_the_slow_lane_to_ci_unless_asked(tmp_path):
     assert "CI's slow job runs it" in run.stderr
 
 
+def test_checks_sh_in_a_workspace_project_lends_the_launcher_the_root_run_context(tmp_path):
+    """In a workspace subdirectory both lanes get the root's run context, and the link is gone after."""
+    repo = Path(__file__).resolve().parents[1]
+    workspace = tmp_path / "workspace"
+    project = workspace / "projects" / "one"
+    (project / "factory-improvement").mkdir(parents=True)
+    checks = repo / "factory-improvement/checks.sh"
+    (project / "factory-improvement/checks.sh").write_bytes(checks.read_bytes())
+    git(workspace, "init", "-q")
+    (workspace / ".flyte").mkdir()
+    (workspace / ".flyte/run_context.json").write_text("{}")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "lane.log"
+    for name, body in {
+        "uv": "exit 0",
+        "test-lane": f'echo "$(cat .flyte/run_context.json) $*" >> {log}',
+    }.items():
+        (bin_dir / name).write_text(f"#!/bin/bash\n{body}\n")
+        (bin_dir / name).chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "AGENT_FACTORY_SLOW_LANE": "child",
+        "AGENT_FACTORY_TEST_LANE": str(bin_dir / "test-lane"),
+    }
+    subprocess.run(["bash", str(project / "factory-improvement/checks.sh")], cwd=project, env=env, check=True)
+    lanes = sorted(log.read_text().splitlines())
+    assert lanes == ["{} ", "{} --on-demand --no-local -m not slow"]
+    assert not (project / ".flyte").exists() and not (project / ".flyte").is_symlink()
+
+
 def test_checks_sh_with_arguments_narrows_the_run_and_leaves_no_junit(tmp_path):
     """Extra pytest arguments mean the run is not the whole suite, so the gate must not read it."""
     repo = Path(__file__).resolve().parents[1]
@@ -400,6 +432,19 @@ async def test_the_pre_review_sends_the_slow_lane_to_a_child_action(tmp_path):
     junit.mkdir()
     await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
     assert seen.read_text() == f"child {junit}\n"
+
+
+async def test_the_pre_review_hands_checks_sh_an_interpreter_that_attaches_child_lanes(tmp_path, monkeypatch):
+    """The project's venv lacks the Flyte controller: launched from it, the lanes fell back to this pod."""
+    monkeypatch.delenv("AGENT_FACTORY_SLOW_LANE_PYTHON", raising=False)
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    seen = tmp_path / "seen.txt"
+    checks.write_text(f'echo "$AGENT_FACTORY_SLOW_LANE_PYTHON" > {seen}')
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+    assert seen.read_text() == f"{sys.executable}\n"
 
 
 def _harness_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -965,7 +1010,9 @@ def test_child_lanes_are_off_by_default(tmp_path, lane_processes):
 def test_head_pytest_passes_child_lanes_on(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(
-        _gate_tests, "_run_head_pytest", lambda project, child_lanes=False: seen.append(child_lanes)
+        _gate_tests,
+        "_run_head_pytest",
+        lambda project, child_lanes=False, work=None: seen.append(child_lanes),
     )
 
     _gate_tests.GateWork(share_pytest=True, child_lanes=True).head_pytest(tmp_path)
@@ -974,8 +1021,8 @@ def test_head_pytest_passes_child_lanes_on(tmp_path, monkeypatch):
 
 
 def test_the_pre_review_runs_the_gates_own_pytest_in_child_lanes():
-    source = (ROOT / "src/flyte_agent_factory/_supervise.py").read_text()
-    construction = source[source.index("_gate_tests.GateWork(") :].split("\n                        )", 1)[0]
+    source = (ROOT / "src/flyte_agent_factory/_pre_review.py").read_text()
+    construction = source[source.index("_gate_tests.GateWork(") :].split("\n    )", 1)[0]
 
     assert "child_lanes=True" in construction
 
@@ -1448,7 +1495,7 @@ def test_gate_work_exposes_the_capacity_of_its_head_run(tmp_path, lane_processes
     monkeypatch.setattr(
         _gate_tests,
         "_run_head_pytest",
-        lambda project, child_lanes=False: _gate_tests.HeadRun(0, "", None, 0.0, "no capacity: x"),
+        lambda project, child_lanes=False, work=None: _gate_tests.HeadRun(0, "", None, 0.0, "no capacity: x"),
     )
 
     work.head_pytest(tmp_path)
@@ -1908,3 +1955,16 @@ async def test_checks_sh_keeps_its_image_when_the_runs_cannot_be_looked_up(tmp_p
     said = seen.read_text()
     assert "plain-flyte:1" in said
     assert "the run's image could not be looked up, so this lane runs here" in said
+
+
+def test_the_runs_image_is_looked_up_once_for_checks_and_gate(tmp_path, lane_processes):
+    project = _child_lane_project(tmp_path)
+    work = _gate_tests.GateWork(share_pytest=True, child_lanes=True)
+
+    assert work.run_image(project, {}) == "registry.example/agent:run-image"
+    work.head_pytest(project)
+
+    assert len(lane_processes.lookups) == 1
+    assert [c["env"]["FLYTE_INTERNAL_IMAGE"] for c in lane_processes] == [
+        "registry.example/agent:run-image"
+    ] * 2

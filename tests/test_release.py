@@ -798,6 +798,49 @@ async def test_a_second_done_that_the_checks_bounce_clears_the_pass(rig, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_a_pre_review_that_cannot_start_a_tool_bounces_the_done_and_the_pump_goes_on(rig, monkeypatch):
+    def broken_gate(*a, **k):
+        raise PermissionError(13, "Permission denied", "/work/.venv/bin/python")
+
+    async def until_a_row(text):
+        # The gate runs in a worker thread, so how many turns it takes depends on machine load.
+        for _ in range(100):
+            if text in " ".join(rig.rows()):
+                return
+            await rig.advance(30)
+        raise AssertionError(rig.rows())
+
+    monkeypatch.setattr(_gates, "run", broken_gate)
+    rig.bridge._notes.append("DONE: changed something")
+    rig.start()
+    await until_a_row("pre-review could not run: PermissionError")
+    assert rig.task and not rig.task.done(), "the pump stopped"
+    await rig.finish()
+
+
+@pytest.mark.asyncio
+async def test_a_pre_review_that_cannot_start_a_tool_prints_its_traceback(rig, monkeypatch, capsys):
+    # The bounce names only the exception; the traceback says where the tool failed to start.
+    def broken_gate(*a, **k):
+        raise PermissionError(13, "Permission denied", "/work/.venv/bin/python")
+
+    monkeypatch.setattr(_gates, "run", broken_gate)
+    rig.bridge._notes.append("DONE: changed something")
+    rig.start()
+    for _ in range(100):
+        if "pre-review could not run: PermissionError" in " ".join(rig.rows()):
+            break
+        await rig.advance(30)
+    else:
+        raise AssertionError(rig.rows())
+    err = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in err
+    assert "in broken_gate" in err
+    assert "PermissionError: [Errno 13] Permission denied: '/work/.venv/bin/python'" in err
+    await rig.finish()
+
+
+@pytest.mark.asyncio
 async def test_a_delegation_waiting_on_the_job_limit_blocks_release(rig):
     waiting = asyncio.ensure_future(asyncio.sleep(3600))
     rig.delegations.pending.add(waiting)

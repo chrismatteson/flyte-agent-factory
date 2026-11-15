@@ -910,7 +910,8 @@ def test_a_fractional_timeout_minutes_written_as_a_string_is_read(delivery):
 
 def test_the_timeout_minutes_is_the_limit_a_command_runs_under(delivery, monkeypatch):
     monkeypatch.setattr(_target_run, "TARGET_CI_TIMEOUT", 1)
-    steps = _named("lint", ["sleep 2"])
+    # Longer than the load clock's wall backstop (3x the limit): a busy node can forgive the first seconds.
+    steps = _named("lint", ["sleep 5"])
     assert _ci_status(delivery, steps, job_extra="    timeout-minutes: 1\n")["status"] == "PASS"
     assert "command timed out after 1 seconds" in _ci_status(delivery, steps)["output"]
 

@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from flyte_agent_factory import (
     _queue,
     _state_store,
     _union_identity,
+    _workspace_archive,
 )
 from flyte_agent_factory import _factory as factory
 from tests.fake_flyte import status_report
@@ -1176,8 +1178,15 @@ def test_the_workspace_is_read_out_of_a_saved_checkpoint(tmp_path, monkeypatch):
     (root / "claude").mkdir()
     location = f"file://{tmp_path / 'cp' / 'checkpoint'}"
     flyte.Checkpoint(checkpoint_dest=location).save_sync(root)
+
     # The real one uploads the directory before the checkpoint's temporary copy goes away.
-    monkeypatch.setattr(flyte.io.Dir, "from_local", lambda path: (Path(path) / "work.txt").read_text())
+    def read_back(path):
+        with tarfile.open(Path(path) / _workspace_archive.WORKSPACE_ARCHIVE) as archive:
+            member = archive.extractfile("./work.txt")
+            assert member is not None
+            return member.read().decode()
+
+    monkeypatch.setattr(flyte.io.Dir, "from_local", read_back)
 
     assert _factory_recreate._load_checkpoint_workspace(location) == "done so far"  # type: ignore[comparison-overlap]  # the fake from_local returns text
     assert _factory_recreate._load_checkpoint_workspace(f"file://{tmp_path / 'nowhere'}") is None

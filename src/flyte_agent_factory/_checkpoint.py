@@ -8,7 +8,6 @@ import math
 import os
 import signal
 import tarfile
-import tempfile
 from pathlib import Path
 
 from flyte.io import Dir
@@ -20,51 +19,27 @@ from flyte_agent_factory import (
     _session_config,
     _state,
     _timeline,
+    _workspace_archive,
 )
 from flyte_agent_factory._delegation import Emit
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
-_WORKSPACE_ARCHIVE = "agent-factory-workspace.tar"
-#: What an engine from before the rename wrote; still restored, for a workspace uploaded by one still running.
-_LEGACY_WORKSPACE_ARCHIVE = "claude-flyte-workspace.tar"
+_WORKSPACE_ARCHIVE = _workspace_archive.WORKSPACE_ARCHIVE
+_LEGACY_WORKSPACE_ARCHIVE = _workspace_archive.LEGACY_WORKSPACE_ARCHIVE
 
 
 async def _upload_workspace(workspace: Path) -> Dir:
     """Upload the workspace to a sub-agent, minus the supervisor's browser config."""
 
-    def pack(target: Path) -> None:
-        def skip_browser_config(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
-            # Nothing a sub-agent receives should name the personal browser's endpoint.
-            return None if member.name == "./.mcp.json" else member
+    def skip_browser_config(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        # Nothing a sub-agent receives should name the personal browser's endpoint.
+        return None if member.name == "./.mcp.json" else member
 
-        # Object storage carries file bytes, not POSIX modes. Git's index alone cannot
-        # restore executable bits on uncommitted files or preserve mode-only changes.
-        with tarfile.open(target / _WORKSPACE_ARCHIVE, "w") as archive:
-            archive.add(workspace, arcname=".", filter=skip_browser_config)
-
-    with tempfile.TemporaryDirectory() as staging:
-        staged = Path(staging)
-        await asyncio.to_thread(pack, staged)
-        return await Dir.from_local(str(staged))
+    return await _workspace_archive.upload(workspace, skip_browser_config)
 
 
 async def _download_workspace(workdir: Dir, workspace: Path) -> None:
-    await workdir.download(str(workspace))
-    archive_path = next(
-        (p for p in (workspace / _WORKSPACE_ARCHIVE, workspace / _LEGACY_WORKSPACE_ARCHIVE) if p.is_file()),
-        None,
-    )
-    # Direct callers and delegation jobs can still supply an ordinary directory.
-    if archive_path is not None:
-
-        def unpack() -> None:
-            with tarfile.open(archive_path, "r:") as archive:
-                # "tar", not "data": a workspace .venv links to the image's interpreter by absolute
-                # path, which "data" refuses. "tar" still keeps members inside the workspace.
-                archive.extractall(workspace, filter="tar")
-            archive_path.unlink()
-
-        await asyncio.to_thread(unpack)
+    await _workspace_archive.download(workdir, workspace)
 
 
 async def _checkpoint_loop(
