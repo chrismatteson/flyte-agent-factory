@@ -20,6 +20,8 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [secrets.md](secrets.md) | Every Flyte secret a profile can name: what it unlocks, how to get it, how to store it, where it is mounted, how to rotate it |
 | [install-audit.md](install-audit.md) | The gaps found walking the README as a stranger, what fixed each, and what is still to prove on a personal cluster |
 | [setup.md](setup.md) | From nothing to a first project: workspace, profile, setup-token, deploy key, deploying |
+| [small-nodes.md](small-nodes.md) | Running on one 4 CPU / 16 GiB node: what each component requests, the arithmetic, BestEffort apps, raising it per component |
+| [READBACK.md](READBACK.md) | How #15 (small nodes) was re-applied on #12's sharded test lanes: the shard budget arithmetic and the tests adjusted where the two meet |
 | [../profiles/README.md](../profiles/README.md) | Every profile table and key |
 | [standards.md](standards.md) | Writing your own standards: the rule format, how each rule is enforced, mapping your rule IDs to the factory's built-in checks |
 | [chat-operator.md](chat-operator.md) | The default interface: why a chat agent sits between you and the factory, what each side can do, and setting it up |

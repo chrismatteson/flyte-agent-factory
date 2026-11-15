@@ -44,7 +44,9 @@ from flyte_agent_factory import (
     _names,
     _profile,
     _queue,
+    _resources,
     _state_store,
+    _tick_guard,
     _union_identity,
     browser,
 )
@@ -1082,7 +1084,7 @@ _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_factory_base.PROFILE, "qu
 scan_env = flyte.TaskEnvironment(
     name="gardening-scan",
     image=agent_image(),  # the image the factory runs in, i.e. $FLYTE_INTERNAL_IMAGE there
-    resources=flyte.Resources(cpu=2, memory="4Gi"),
+    resources=_resources.for_component(_factory_base.PROFILE, "scan").to_flyte(),
     secrets=[*_factory_envs.scan_secrets(_factory_base.PROFILE), *_QUEUE_SECRETS],
     env_vars={
         **(
@@ -1098,7 +1100,7 @@ scan_env = flyte.TaskEnvironment(
 env = flyte.TaskEnvironment(
     name="factory",
     image=agent_image(),
-    resources=flyte.Resources(cpu=1, memory="1Gi"),
+    resources=_resources.for_component(_factory_base.PROFILE, "ticks").to_flyte(),
     secrets=[*_factory_envs.env_secrets(_factory_base.PROFILE), *_QUEUE_SECRETS],
     depends_on=[scan_env],
     env_vars={
@@ -1271,6 +1273,8 @@ async def get_reserve() -> str:
 async def sweep() -> str:
     """Dispatch the queue; the safety net for the event-driven dispatch at the end of every project."""
     _union_identity.establish()
+    if skipped := await _tick_guard.skip_reason(_deploy.SWEEP_TASK, project=PROJECT, domain=DOMAIN):
+        return skipped
     try:
         await asyncio.to_thread(_factory_recreate.recreate_aborted)
     except REMOTE_ERRORS as exc:  # a repair; the queue must still be dispatched without it
@@ -1353,7 +1357,14 @@ async def _scan_one(target: str) -> dict[str, Any]:
 
 async def scan_targets(names: list[str]) -> dict[str, dict[str, Any]]:
     """Each named target's scan, by name: `{"counts": ...}` or `{"unscanned": reason}`."""
-    return dict(zip(names, await asyncio.gather(*(_scan_one(name) for name in names)), strict=True))
+    # One scan pod at a time: `_resources.budget` counts one `gardening-scan`.
+    one_at_a_time = asyncio.Semaphore(1)
+
+    async def scan(name: str) -> dict[str, Any]:
+        async with one_at_a_time:
+            return await _scan_one(name)
+
+    return dict(zip(names, await asyncio.gather(*(scan(name) for name in names)), strict=True))
 
 
 @env.task(
@@ -1376,6 +1387,8 @@ async def garden_weekly() -> str:
     decides whether the launch takes a slot early.
     """
     _union_identity.establish()
+    if skipped := await _tick_guard.skip_reason(_deploy.GARDEN_TASK, project=PROJECT, domain=DOMAIN):
+        return skipped
     if not _factory_base.PROFILE.repo:
         # A weekly trigger that raised would only fail every week; a skip says why and costs nothing.
         return "skip: gardening runs in the workspace repository: the profile needs one ([direction] repo)"

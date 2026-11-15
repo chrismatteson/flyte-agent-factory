@@ -24,9 +24,9 @@ import flyte
 import flyte.io
 
 if TYPE_CHECKING:
-    from . import _bench_suite, _union_identity
+    from . import _bench_suite, _profile, _resources, _union_identity
 else:
-    from flyte_agent_factory import _bench_suite, _union_identity
+    from flyte_agent_factory import _bench_suite, _profile, _resources, _union_identity
 if TYPE_CHECKING:
     from ._images import TERRAFORM_SHA256, TERRAFORM_VERSION
 else:
@@ -94,7 +94,8 @@ env = flyte.TaskEnvironment(
             ]
         )
     ),
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
+    # Heavy and optional: not in the default budget (`_resources`).
+    resources=_resources.for_component(_profile.current(), "bench").to_flyte(),
     # A missed check is rerun with the case; it may be preempted.
     interruptible=True,
 )

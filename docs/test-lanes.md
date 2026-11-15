@@ -60,6 +60,10 @@ and the default is used.
 | `AGENT_FACTORY_LANE_BUDGET_S` | 1100 | The caller's wall budget for the lane. `checks.sh` gets 780 (its 900 s less 120), the gate 1100 (1200 less 100). Each attempt's `max_runtime` is what is left when it is submitted, less its queue bound, so that no attempt can end past the budget. A retry that would get less than 60 s is not submitted; the shard is then capacity (`no budget left for a retry after waiting for capacity`). |
 | `AGENT_FACTORY_LANE_RUN_HERE` | unset | Set to `1` to run on the session pod, labelled `ran here`, a lane the child actions could not run for a reason that is not capacity, setup or the change (no image looked up, a launcher that could not attach or crashed). Off by default, even in a run: on a 2- or 4-CPU pod the whole lane overruns the limits it was sent away from. A lane without capacity is never run here. |
 
+A shard's resources follow from its CPUs (`_resources.lane_shard`); a deployment profile's `[resources.lanes]` table
+replaces any key it sets at every shard size, read from the profile text the pod carries
+([small-nodes.md](small-nodes.md#test-lane-shards)).
+
 The queue bounds are fixed: two minutes on spot, then three on on-demand (`_slow_lane.QUEUE_BOUND` and
 `ON_DEMAND_QUEUE_BOUND`). So a lane waits at most five minutes for room before it says it has none.
 

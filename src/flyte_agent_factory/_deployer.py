@@ -41,7 +41,9 @@ if TYPE_CHECKING:
         _isolation_canary,
         _profile,
         _pull_requests,
+        _resources,
         _standards,
+        _tick_guard,
         _union_identity,
     )
     from ._errors import REMOTE_ERRORS
@@ -54,7 +56,9 @@ else:
         _isolation_canary,
         _profile,
         _pull_requests,
+        _resources,
         _standards,
+        _tick_guard,
         _union_identity,
     )
     from flyte_agent_factory._errors import REMOTE_ERRORS
@@ -148,9 +152,7 @@ env = flyte.TaskEnvironment(
         "regex>=2024.5.15",
         "kubernetes>=31.0.0",
     ),
-    # A tick is a few HTTP calls; a deploy is subprocesses that import the agent and submit an image
-    # build to the remote builder. Nothing here is heavy.
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
+    resources=_resources.for_component(PROFILE, "deployer").to_flyte(),
     # Spot: a preempted tick records nothing, and the next one retries.
     interruptible=True,
     secrets=[
@@ -184,11 +186,20 @@ _reconcile_minutes = _deploy.reconcile_minutes
 
 
 TRIGGER = flyte.Trigger(
-    name="deploy-on-merge",
+    name=_deploy.DEPLOY_TRIGGER,
     automation=flyte.FixedRate(_reconcile_minutes(PROFILE)),
     description="Deploy the deploy repo's default branch when it has changed and its CI has passed",
     auto_activate=True,
 )
+
+
+def _triggers(profile: _profile.Profile) -> list[flyte.Trigger]:
+    """Declare the schedule only with `[deploy] auto`; without it a tick every few minutes does nothing.
+
+    The webhook submits `deploy_if_changed` directly, so it works without one. A deploy with auto off
+    deletes a schedule an earlier version left (`_deploy.delete_retired_triggers`).
+    """
+    return [TRIGGER] if profile.deploy.auto else []
 
 
 def _say(message: str) -> str:
@@ -1131,7 +1142,7 @@ async def deploy_pair(sha: str, direction_sha: str) -> dict[str, Any]:
 @env.task(
     report=True,
     # The SDK accepts lists at runtime, but its annotation only admits tuples.
-    triggers=cast(tuple[flyte.Trigger, ...], [TRIGGER]),
+    triggers=cast(tuple[flyte.Trigger, ...], _triggers(PROFILE)),
     timeout=flyte.Timeout(max_runtime=MAX_RUNTIME, max_queued_time=timedelta(minutes=5)),
 )
 async def deploy_if_changed() -> str:
@@ -1139,7 +1150,11 @@ async def deploy_if_changed() -> str:
     # This task only runs within a named remote action.
     run_name = cast(str, flyte.ctx().action.run_name)
     try:
-        _union_identity.establish()
+        _union_identity.establish()  # before the run listing below, which acts as this identity
+        skipped = await _tick_guard.skip_reason(_deploy.DEPLOYER_TASK, project=PROJECT, domain=DOMAIN)
+        if skipped:
+            await flyte.report.replace.aio(_report_html(skipped), do_flush=True)
+            return skipped
         app = None
         if PROFILE.deploy.auto:
             app = _app()

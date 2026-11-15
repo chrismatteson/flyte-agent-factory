@@ -540,6 +540,7 @@ the session role definitions, the browser image files and the workspace template
 | `_factory_meters.py` | login meters, slot headroom and what the loop may spend |
 | `_factory_recreate.py` | recreating runs the deployer aborted, and the workspace a new run starts from |
 | `_factory_status.py` | reading an older project report's HTML for the timeline and activity |
+| `_tick_guard.py` | a scheduled tick skips itself while an earlier run of its task is live |
 | `_queue.py` | the launch queue's storage and the reserve file on the factory's state branch |
 | `_factory_mcp.py` | the factory MCP server: every stock tool, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
 

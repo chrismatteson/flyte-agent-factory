@@ -56,6 +56,13 @@ DEPLOYER_TASK = "factory-deployer.deploy_if_changed"
 DEPLOY_PAIR = "factory-deployer.deploy_pair"
 #: The reconciler's task, live hourly and not a project either.
 RECONCILE_TASK = "factory-reconcile.reconcile"
+#: The other scheduled tasks; each guards itself against an earlier live run (`_tick_guard`).
+SWEEP_TASK = "factory.sweep"
+GARDEN_TASK = "factory.garden_weekly"
+BACKLOG_TASK = "factory-loop.generate_backlog"
+COLLECT_LABELS_TASK = "factory-bench.collect_labels"
+#: The deployer's schedule, which exists only with `[deploy] auto`; a deploy with auto off deletes it.
+DEPLOY_TRIGGER = "deploy-on-merge"
 #: `(trigger, task)` of the schedules `factory-reconcile` replaced (state step 1). A deploy never
 #: removes an environment, so the old task version would keep running its trigger; each deploy deletes
 #: them (`delete_retired_triggers`).
@@ -406,7 +413,10 @@ def factory_envs(profile: _profile.Profile) -> frozenset[str]:
 
 
 def delete_retired_triggers(profile: _profile.Profile) -> None:
-    """Delete both retired schedules regardless of current settings; one already gone is fine.
+    """Delete the retired schedules, and the deployer's when `[deploy] auto` is off; one already gone is fine.
+
+    A deploy never removes a trigger the new task version no longer declares, so the schedule of an
+    earlier version keeps firing a tick that only says "off".
 
     Needs an initialised Flyte client (the factory deploy child has one). Authentication failures
     raise; other failures warn so cleanup cannot invalidate a recorded deployment.
@@ -415,7 +425,10 @@ def delete_retired_triggers(profile: _profile.Profile) -> None:
     from connectrpc.errors import ConnectError
     from flyte import remote
 
-    for name, task in RETIRED_TRIGGERS:
+    retired = (
+        RETIRED_TRIGGERS if profile.deploy.auto else (*RETIRED_TRIGGERS, (DEPLOY_TRIGGER, DEPLOYER_TASK))
+    )
+    for name, task in retired:
         try:
             remote.Trigger.delete(name=name, task_name=task)
         except ConnectError as exc:

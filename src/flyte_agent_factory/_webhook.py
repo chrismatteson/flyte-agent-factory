@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         _loop,
         _profile,
         _pull_requests,
+        _resources,
         _union_identity,
     )
     from ._errors import REMOTE_ERRORS
@@ -63,6 +64,7 @@ else:
         _loop,
         _profile,
         _pull_requests,
+        _resources,
         _union_identity,
     )
     from flyte_agent_factory._errors import REMOTE_ERRORS
@@ -262,7 +264,7 @@ _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 issues_env = flyte.TaskEnvironment(
     name="factory-issues",
     image=_image,
-    resources=flyte.Resources(cpu=1, memory="1Gi"),
+    resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     secrets=[
         *_factory_base.state_secrets(PROFILE),  # intake writes queue requests and its dedupe markers
         *(
@@ -281,7 +283,7 @@ env = flyte.app.AppEnvironment(
     name="factory-webhook",
     image=_image,
     requires_auth=False,
-    resources=flyte.Resources(cpu=1, memory="512Mi"),
+    resources=_resources.for_component(PROFILE, "webhook").to_flyte(),
     scaling=flyte.app.Scaling(replicas=1),
     secrets=[
         *(

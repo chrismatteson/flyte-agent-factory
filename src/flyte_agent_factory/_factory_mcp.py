@@ -26,7 +26,7 @@ from mcp.server.fastmcp import (
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
 
-from . import _factory, _grant_page, _profile, _union_identity
+from . import _factory, _grant_page, _profile, _resources, _union_identity
 from ._bridge import _ENDED_PHASES, _ended_on_server
 from ._bridge_common import parse_approval
 from ._errors import REMOTE_ERRORS
@@ -226,6 +226,8 @@ app = FlyteMCPAppEnvironment(
     allowed_origins=[_public_url] if _public_url else None,
     secrets=[*_QUEUE_SECRETS],
     env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
+    # Spelled out: the app defaults to 1 CPU / 512Mi when it gets None, and `mcp` asks for nothing.
+    resources=_resources.for_component(_profile.current(), "mcp").to_flyte(),
     scaling=flyte.app.Scaling(replicas=1),
     sdk_examples_path=f"{DOCS_DIR}/flyte-sdk/examples",
     docs_examples_path=f"{DOCS_DIR}/unionai-examples/v2",

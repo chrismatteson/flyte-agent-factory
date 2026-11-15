@@ -169,6 +169,15 @@ brand = "" # empty keeps inferred BRAND.md behaviour
 # escalate_on_regression = true       # a target's standards gate regressed since the last clean run: same
 # max_open_issues = 10                # more open `gardening` issues than this: same
 
+# Optional: what each component asks Kubernetes for (docs/small-nodes.md). The defaults fit one 4-CPU / 16 GiB
+# node with one live project. On a bigger cluster, raise them per component: cpu and memory are one quantity
+# (a request only) or [request, limit]; disk is one quantity (a request only). A key you leave out keeps its default.
+# Components: slot, subagent, setup, mcp, webhook, browser, ticks, deployer, scan, lanes, bench.
+# [resources.slot]
+# cpu = ["2", "8"]
+# memory = ["4Gi", "16Gi"]
+# disk = "50Gi"
+
 [planner]
 # Change only after the single-writer deployment and live smoke gates pass.
 admission = "legacy"

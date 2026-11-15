@@ -35,6 +35,8 @@ from . import (
     _profile,
     _pull_requests,
     _queue,
+    _resources,
+    _tick_guard,
     _union_identity,
 )
 from ._errors import REMOTE_ERRORS
@@ -64,7 +66,7 @@ _secrets.extend(_QUEUE_SECRETS)
 env = flyte.TaskEnvironment(
     name="factory-reconcile",
     image=agent_image(),
-    resources=flyte.Resources(cpu=1, memory="1Gi"),
+    resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     interruptible=True,
     secrets=_secrets,
     # As `factory`'s: the project and domain `_factory` lists runs in.
@@ -357,6 +359,15 @@ def heal_milestones(
 async def reconcile(completion_run: str = "") -> str:
     """Heal the board (with `[board]`) and the issue milestones (with the GitHub App)."""
     _union_identity.establish()
+    # Only the scheduled pass defers to an earlier live run. An event pass (`completion_run`) exists to
+    # heal that completion's runs, which a pass already under way may have listed before they ended, so
+    # skipping it would lose the work; it waits for the run to end and then does the pass itself.
+    if not completion_run:
+        skipped = await _tick_guard.skip_reason(
+            _deploy.RECONCILE_TASK, project=_factory.PROJECT, domain=_factory.DOMAIN
+        )
+        if skipped:
+            return skipped
     if completion_run:
         # Submitted by the project's last act, before Flyte has marked its run terminal.
         while True:

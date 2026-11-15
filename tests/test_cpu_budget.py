@@ -45,5 +45,7 @@ def test_an_unreadable_quota_leaves_the_visible_cpus(tmp_path):
 def test_the_xdist_hook_answers_with_the_budget(monkeypatch):
     import tests.conftest as conftest
 
+    # checks.sh sets the variable for the suite it runs, and a set variable wins over the hook.
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
     monkeypatch.setattr(_cpu_budget, "cpus", lambda **_: 3)
     assert conftest.pytest_xdist_auto_num_workers(None) == 3

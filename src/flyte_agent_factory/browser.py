@@ -52,6 +52,7 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
@@ -62,10 +63,10 @@ import flyte.app
 if TYPE_CHECKING:
     from kubernetes.client import V1PodSpec
 
-    from . import _names, _profile, _union_identity
+    from . import _names, _profile, _resources, _union_identity
     from ._images import browser_image
 else:
-    from flyte_agent_factory import _names, _profile, _union_identity
+    from flyte_agent_factory import _names, _profile, _resources, _union_identity
     from flyte_agent_factory._images import browser_image
 
 APP_NAME = "claude-browser"
@@ -84,7 +85,7 @@ browser_env = flyte.app.AppEnvironment(
     # Chromium is memory-hungry and the agent may drive several tabs at once;
     # shm matters because Chromium's default /dev/shm in a container is 64MB,
     # which crashes renderers on real pages.
-    resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="20Gi", shm="2Gi"),
+    resources=replace(_resources.for_component(_profile.current(), "browser").to_flyte(), shm="2Gi"),
     scaling=flyte.app.Scaling(replicas=(1, 1)),
     secrets=[*_QUEUE_SECRETS],
     env_vars={
@@ -159,7 +160,7 @@ def personal_app(
         image=browser_image(tailscale=bool(exit_node)),
         command=["/bin/bash", "/opt/browser/start.sh"],
         port=APP_PORT,
-        resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="20Gi", shm="2Gi"),
+        resources=replace(_resources.for_component(profile, "browser").to_flyte(), shm="2Gi"),
         scaling=flyte.app.Scaling(replicas=(1, 1)),
         env_vars={
             **queue_env,

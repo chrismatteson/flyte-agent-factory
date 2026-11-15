@@ -682,7 +682,8 @@ async def test_a_refusal_in_a_tick_is_a_failure_not_a_system_exit(world, monkeyp
 
 
 def test_the_task_runs_every_five_minutes_on_spot():
-    (trigger,) = _deployer.deploy_if_changed.triggers
+    # The test profile has `[deploy] auto` off, so the schedule is asked of an auto profile.
+    (trigger,) = _deployer._triggers(make_profile("file:///unused", auto=True))
     assert trigger.name == "deploy-on-merge"
     assert cast(flyte.FixedRate, trigger.automation).interval_minutes == 5
     assert trigger.auto_activate is True

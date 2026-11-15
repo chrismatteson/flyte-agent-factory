@@ -25,7 +25,16 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, TypedDict, cast
 
-from . import _git, _github, _names, _profile_policy, _profile_union, _standards, _state_store
+from . import (
+    _git,
+    _github,
+    _names,
+    _profile_policy,
+    _profile_resources,
+    _profile_union,
+    _standards,
+    _state_store,
+)
 from ._profile_policy import Gardening as Gardening
 from ._profile_policy import JudgementPolicy as JudgementPolicy
 
@@ -313,6 +322,8 @@ class Profile:
     loop: Loop = Loop()
     gardening: Gardening = Gardening()
     judgement: JudgementPolicy = JudgementPolicy()
+    # [resources.<component>] -> the keys it sets; `_resources.for_component` lays them over the defaults.
+    resources: Mapping[str, _profile_resources.Spec] = field(default_factory=lambda: MappingProxyType({}))
     # [repo] key -> its earlier URLs (a GitHub rename): requests and projects from before still name them.
     repo_aliases: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
     standards: _standards.Standards = field(default_factory=_standards.Standards)
@@ -760,6 +771,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             "loop",
             "gardening",
             "judgement",
+            "resources",
             "standards",
             "standards_payload",
         }
@@ -1116,7 +1128,8 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     try:
         gardening = _profile_policy.parse_gardening(_table(data, "gardening", where, required=False))
         judgement = _profile_policy.parse_judgement(_table(data, "judgement", where, required=False))
-    except _profile_policy.PolicyError as exc:
+        resources = _profile_resources.parse(_table(data, "resources", where, required=False))
+    except (_profile_policy.PolicyError, _profile_resources.ResourcesError) as exc:
         raise ProfileError(f"{where}: {exc}") from exc
 
     planner_fields = _fields(
@@ -1156,6 +1169,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         loop=loop,
         gardening=gardening,
         judgement=judgement,
+        resources=MappingProxyType(resources),
         repo_aliases=repo_aliases,
         standards=standards,
         standards_payload=payload,
