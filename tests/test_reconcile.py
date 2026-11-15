@@ -853,6 +853,8 @@ def test_retired_triggers_are_deleted_where_the_profile_deployed_them(monkeypatc
         board_profile(),
         board=board_profile().board if board else None,
         github=_profile.Github(webhook_secret="hook" if webhook else ""),
+        # With auto off the deployer's own schedule is deleted too (tests/test_tick_guard.py).
+        deploy=_profile.Deploy(auto=True),
     )
     _deploy.delete_retired_triggers(profile)
     assert len(calls) == deleted
@@ -1073,13 +1075,14 @@ def test_retired_trigger_cleanup_warns_except_for_auth(monkeypatch, caplog, code
         raise ConnectError(getattr(Code, code), "cleanup failed")
 
     monkeypatch.setattr(remote.Trigger, "delete", delete)
+    profile = dataclasses.replace(board_profile(), deploy=_profile.Deploy(auto=True))
     if code == "UNAVAILABLE":
-        _deploy.delete_retired_triggers(board_profile())
+        _deploy.delete_retired_triggers(profile)
         assert len(calls) == 2
         assert "retired trigger" in caplog.text
     else:
         with pytest.raises(ConnectError):
-            _deploy.delete_retired_triggers(board_profile())
+            _deploy.delete_retired_triggers(profile)
 
 
 async def test_board_remote_failure_does_not_skip_milestone_healing(world, monkeypatch):

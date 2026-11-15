@@ -72,6 +72,7 @@ from flyte_agent_factory import (
     _policy,
     _profile,
     _pull_requests,
+    _resources,
     _review,
     _reviewer,
     _router,
@@ -236,6 +237,7 @@ env = flyte.TaskEnvironment(
         "_factory_status.py",
         "_grants_cli.py",
         "_lane_shards.py",
+        "_tick_guard.py",
         # The gate launches this by name; importing it would also register its task environment.
         "_slow_lane.py",
     ),
@@ -249,20 +251,12 @@ env = flyte.TaskEnvironment(
         if _IN_POD_BROWSER
         else agent_image(browser=False)
     ),
-    # Disk was 30Gi while this pod mounted a Volume: that needs the
-    # `smarter-devices/fuse` device, which only some nodes advertise, and a
-    # large ephemeral-storage request narrowed an already tight subset -- a
-    # 100Gi request alone made it unschedulable. Volumes are gone, so that
-    # constraint is gone with them, and 30Gi turned out to be genuinely tight:
-    # a project that downloaded LJSpeech and VCTK had its first attempt killed
-    # with no application log at all, which is what disk-pressure eviction
-    # looks like from inside.
-    #
-    # Still modest on CPU and memory on purpose. Heavy work belongs in a child
-    # action with its own resources, not in the supervisor -- this pod's job is
-    # to hold a session alive, and `_warn_on_low_headroom` now says so in the
-    # report when either is running out.
-    resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "12Gi"), disk="120Gi"),
+    # Sized in `_resources` (see docs/small-nodes.md). Disk is 20Gi, a request only: it was raised from 30Gi
+    # after a project that downloaded LJSpeech and VCTK was evicted by node disk pressure with no application
+    # log, and it was 120Gi, which a 100GB boot disk cannot place. A Volume once made it a tight subset of
+    # nodes.
+    # Heavy work belongs in a child action; `_warn_on_low_headroom` says so when this pod runs short.
+    resources=_resources.for_component(_session_config._PROFILE, "slot").to_flyte(),
     # On-demand, deliberately. This pod holds the Claude Code session: a
     # preemption kills the conversation and the run restarts from the last
     # checkpoint. It is also the only thing that can fall *back* to on-demand
@@ -316,7 +310,7 @@ env._declaring_file = os.path.abspath(__file__)
 setup_env = flyte.TaskEnvironment(
     name="factory-setup",
     image=agent_image(),
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
+    resources=_resources.for_component(_session_config._PROFILE, "setup").to_flyte(),
     secrets=[*_project_secrets],
     env_vars={"PYTHONUNBUFFERED": "1", **_project_env, **_profile.pod_env()},
 )
@@ -329,7 +323,7 @@ setup_env = flyte.TaskEnvironment(
 subagent_env = flyte.TaskEnvironment(
     name=_SUBAGENT_ENV_NAME,
     image=agent_image(),
-    resources=flyte.Resources(cpu=(1, 4), memory=("2Gi", "8Gi"), disk="50Gi"),
+    resources=_resources.for_component(_session_config._PROFILE, "subagent").to_flyte(),
     secrets=[*_credentials_secret(), *_session_secrets],  # see `env` above: typed as `list[str | Secret]`
     env_vars={
         "PYTHONUNBUFFERED": "1",

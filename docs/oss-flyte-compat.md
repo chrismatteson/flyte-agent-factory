@@ -8,6 +8,10 @@ replacements. A first launch from GitHub is feasible without migrating Union run
 This is a source audit, dated 2026-10-28, for QA to validate against the deployment. It is not a successful
 factory migration or a live compatibility test.
 
+**Minimum node:** one 4 CPU / 16 GiB node (a GKE `e2-standard-4` with its default 100 GB boot disk) runs the factory and
+one live project with the default resources ([small-nodes.md](small-nodes.md)). `ops/deploy_factory.py` deploys `--ref`
+(default `origin/main`) from a clean worktree of that commit, not the working tree.
+
 ## Evidence and scope
 
 - Factory baseline: `ee05242229a61972d4f15ae156085d6e522bae8a`.
@@ -111,6 +115,8 @@ and automatic in-pod rebuilding outside that estimate. This document changes no 
 
 ## Not verified
 
+- OSS enforcement of `max_queued_time` is unverified, so scheduled ticks guard themselves through the run listing
+  and skip while an earlier run of the same task is live (`_tick_guard`; docs/triggers.md, "Ticks do not pile up").
 - No authenticated live backend/MCP probe was possible: only the supplied 401 observation is available. No factory task,
   app, condition, trigger, report or upload was executed on flyte-gke during this audit.
 - The running backend digest/configuration was not independently read from the cluster. Release source and the supplied

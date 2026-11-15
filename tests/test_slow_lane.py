@@ -22,7 +22,7 @@ import flyte.errors
 import pytest
 from flyte.extras import ContainerTask
 
-from flyte_agent_factory import _images, _scanners, _slow_lane, child
+from flyte_agent_factory import _images, _resources, _scanners, _slow_lane, child
 
 
 def _suites(path: Path) -> list[str]:
@@ -226,7 +226,7 @@ def test_the_spot_wait_is_bounded_short_and_the_request_fits_a_spot_node():
     assert _slow_lane.ON_DEMAND_QUEUE_BOUND == timedelta(minutes=3)
     assert _slow_lane.task.resources is not None
     # 2 CPUs placed in 5 s, 4 in 12 s and 8 in 160 s on spot; 8 was the size before sharding.
-    assert _slow_lane.task.resources.cpu == ("1500m", 2)
+    assert _slow_lane.task.resources.cpu == ("1500m", "2")
 
 
 def test_tree_tar_has_tracked_and_untracked_files_but_not_ignored_or_vcs(tmp_path):
@@ -577,7 +577,7 @@ def test_the_lane_task_is_a_raw_container_registered_in_its_own_environment():
     assert isinstance(task, ContainerTask)
     assert task.name == "test-lane"
     assert task._cmd == _slow_lane.LANE_COMMAND  # no public accessor for the command
-    assert task.resources == flyte.Resources(cpu=("1500m", 2), memory=("3Gi", "5Gi"))
+    assert task.resources == flyte.Resources(cpu=("1500m", "2"), memory=("3Gi", "5Gi"))
     assert task.interruptible is True  # `.override()` drops a ContainerTask's command: set at construction
     assert task.timeout == flyte.Timeout(
         max_queued_time=_slow_lane.QUEUE_BOUND, max_runtime=timedelta(minutes=30)
@@ -1745,7 +1745,7 @@ def test_the_lane_task_is_built_per_size_and_runtime_and_registered_in_its_own_e
     assert big is _slow_lane.make_lane_task(4, False, timedelta(minutes=12))  # built once
     assert big is not _slow_lane.make_lane_task(4, True, timedelta(minutes=12))
     assert big.name == "test-lane-4cpu-720s-on-demand"
-    assert big.resources == flyte.Resources(cpu=("3000m", 4), memory=("6Gi", "9Gi"))
+    assert big.resources == flyte.Resources(cpu=("3000m", "4"), memory=("6Gi", "9Gi"))
     assert big.timeout == flyte.Timeout(
         max_queued_time=_slow_lane.ON_DEMAND_QUEUE_BOUND, max_runtime=timedelta(minutes=12)
     )
@@ -1757,8 +1757,26 @@ def test_the_lane_task_is_built_per_size_and_runtime_and_registered_in_its_own_e
 @pytest.mark.parametrize(("cpus", "request_cpu"), [(1, "750m"), (2, "1500m"), (3, "2250m"), (4, "3000m")])
 def test_a_shards_cpu_request_is_three_quarters_of_its_limit(cpus, request_cpu):
     resources = _slow_lane.make_lane_resources(cpus)
-    assert resources.cpu == (request_cpu, cpus)
+    assert resources.cpu == (request_cpu, str(cpus))
     assert resources.memory == (f"{-(-3 * cpus // 2)}Gi", f"{2 * cpus + 1}Gi")
+
+
+@pytest.mark.parametrize("cpus", [1, 2, 4])
+def test_the_profiles_lanes_table_applies_on_top_of_every_shard_size(monkeypatch, cpus):
+    profile = '[resources.lanes]\ncpu = ["500m", "3"]\n'
+    monkeypatch.setenv(_resources.PROFILE_TOML_ENV, profile)
+    resources = _slow_lane.make_lane_resources(cpus)
+    assert resources.cpu == ("500m", "3")  # the table's key wins at every size
+    assert resources.memory == (f"{-(-3 * cpus // 2)}Gi", f"{2 * cpus + 1}Gi")  # a key it leaves out does not
+    monkeypatch.setenv(_resources.PROFILE_TOML_ENV, '[resources.lanes]\nmemory = ["1Gi", "12Gi"]\n')
+    assert _slow_lane._memory_limit(cpus) == "12Gi"  # what an out-of-memory message names
+    monkeypatch.setenv(_resources.PROFILE_TOML_ENV, '[resources.slot]\ncpu = "2"\n')
+    assert _slow_lane.make_lane_resources(cpus) == _resources.lane_shard(cpus).to_flyte()
+
+
+def test_the_lane_default_shard_size_is_the_one_the_budget_counts():
+    assert _slow_lane.CPUS_DEFAULT == _resources.LANE_CPUS_DEFAULT
+    assert _resources.DEFAULTS["lanes"] == _resources.lane_shard(_slow_lane.CPUS_DEFAULT)
 
 
 def _children(monkeypatch, outcomes, tmp_path):

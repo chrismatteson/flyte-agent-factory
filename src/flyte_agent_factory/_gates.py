@@ -144,15 +144,17 @@ _changed_paths = _gate_start.list_changed_paths  # the commit-path lister lives 
 
 #: Files that decide what a pytest run reports. The session can write them, so a junit `checks.sh` left is
 #: evidence only when the round changed none of them; otherwise the gate runs the tests itself.
-#: `_slow_lane.py` is what checks.sh runs to make slow.xml, `_lane_shards.py` plans and merges its shards; the
-#: package's `__init__.py`, `child.py`, `_names.py` load before it writes it. Python imports `sitecustomize`,
-#: `usercustomize` and `*.pth` files at start-up, a `pytest`, `_pytest` or `py` module anywhere on the path
-#: shadows the real one, `uv.lock` picks what is installed. `tests/test_gate_speed.py` checks the modules.
+#: `_slow_lane.py` is what checks.sh runs to make slow.xml, `_lane_shards.py` plans and merges its shards;
+#: the package's `__init__.py`, `child.py`, `_names.py`, `_resources.py` and `_profile_resources.py` load
+#: before it writes it. Python imports `sitecustomize`, `usercustomize` and `*.pth` files at start-up, a
+#: `pytest`, `_pytest` or `py` module anywhere on the path shadows the real one, `uv.lock` picks what is
+#: installed.
+#: `tests/test_gate_speed.py` checks the package modules against the launcher.
 _TEST_HARNESS = re.compile(
     r"(^|/)(checks\.sh|conftest\.py|pyproject\.toml|pytest\.ini|setup\.cfg|tox\.ini|uv\.lock"
     r"|sitecustomize\.py|usercustomize\.py|pytest\.py|py\.py|_slow_lane\.py|_lane_shards\.py)$"
     r"|(^|/)_pytest/|(^|/)(pytest|py)/__init__\.py$|\.pth$"
-    r"|(^|/)src/flyte_agent_factory/(__init__|child|_names)\.py$"
+    r"|(^|/)src/flyte_agent_factory/(__init__|child|_names|_resources|_profile_resources)\.py$"
     r"|(^|/)ops/package_skill\.py$"  # checks.sh runs its --check on the skill zips
 )
 

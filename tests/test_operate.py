@@ -651,7 +651,8 @@ def test_every_package_module_loads_with_the_agent():
         "_factory,_factory_base,_factory_envs,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
         "_factory_status,_grant_page,_grants_cli,_isolation_canary,_loop,_loop_flow,"
-        "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_slow_lane,_union_token,_webhook,voice"
+        "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_slow_lane,_tick_guard,_union_token,"
+        "_webhook,voice"
     )
 
 

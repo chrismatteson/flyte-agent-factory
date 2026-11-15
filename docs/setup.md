@@ -9,6 +9,9 @@ Start with [guided setup](quickstart.md): install the skills, run `/agent-factor
 and takes you from GitHub access to a first launch one step at a time; every secret is in
 [secrets.md](secrets.md). This page is the detail behind them.
 
+**Minimum cluster:** one node with 4 CPU and 16 GiB of memory runs the factory and one live project with the default
+resources; see [small-nodes.md](small-nodes.md) for the arithmetic and for raising it on a bigger cluster.
+
 ## The short path
 
 1. **Create the workspace repository.** It is the repository projects are pushed to (`[repo] project`). Create a
@@ -202,6 +205,8 @@ leave `AGENT_FACTORY_DEPLOY_KEY_ENV` and the key Union injects into pods (`_UNIO
 out of what they run, even when your shell has them set. Every `ops/` script puts `src` on the path itself:
 `PYTHONPATH=src` is needed only where a command imports the package itself (`python -m` on one of its modules, a
 `python -c` or a heredoc); `flyte run` and `flyte deploy` find `src` through `--root-dir src`, and carry it anyway.
+`ops/deploy_factory.py` deploys `--ref` (default `origin/main`) from a clean worktree of that commit, not your working
+tree, so a change must be pushed before it ships.
 
 Merged changes deploy themselves: with `[deploy] auto = true` in the profile, the `factory-deployer` task polls the
 default branch of `[deploy] repo` (default `[repo] factory`) every 5 minutes and ships a head whose CI passed, so a

@@ -60,6 +60,34 @@ deletes both old triggers. There are no other FixedRate definitions. The planner
 terminal-phase check observes a known active planner; it is not a periodic scan that starts task pods.
 Completion waits likewise observe one known project, and finish on its terminal phase.
 
+## Ticks do not pile up
+
+`flyte.Trigger` has no skip-if-running option, so each scheduled task checks for itself
+(`_tick_guard.skip_reason`, called right after `_union_identity.establish()` in `sweep`, `garden_weekly`, the scheduled `reconcile`,
+`deploy_if_changed`, `generate_backlog` and `collect_labels`). It lists the task's runs in a live phase
+(`_deploy.LIVE_PHASES`, oldest first) and, if one that was created before its own is still live, returns
+`{"skipped": "previous run <name> is <PHASE>"}` without doing any work; `deploy_if_changed` says so in its
+report, and `collect_labels` (whose result is a count) logs the reason and returns 0.
+
+- **Only an earlier run blocks.** Two ticks started together do not both skip: the older one finds no one
+  ahead of it. The SDK's `Run` omits creation time, so "earlier" is the server's `created_at` order.
+- **A stuck run stops blocking after `STALE_AFTER` (3 hours).** No guarded tick runs that long, so an
+  older live run is stuck: a pod Pending on a cluster that does not enforce `max_queued_time`, or one left
+  by an earlier deploy that asked for more CPU than the node has. Pending pods already queued still drain
+  one by one, each exiting at once when it starts; the lean requests (`docs/small-nodes.md`) are what let
+  them start.
+- **It fails open.** If the listing raises, the tick logs a warning and runs: a broken listing must not
+  stop the queue. Authentication and permission errors are raised, as in `delete_retired_triggers`.
+- **It is not mutual exclusion.** Run listings are not known to be consistent
+  (`_deployer.RUN_LISTING_CONSISTENT`), so two ticks may still overlap; the deployer's lease stays.
+- **An event `reconcile` (`completion_run` set) is not guarded.** It exists to heal that completion's runs,
+  which a pass already under way may have listed before they ended, so skipping it would lose the work.
+  A scheduled pass does skip while an event pass is live, since that pass does the same work.
+
+With `[deploy] auto = false` the `deploy-on-merge` schedule is not declared, and every factory deploy
+deletes one that an earlier version left (`_deploy.delete_retired_triggers`). The webhook still submits
+`deploy_if_changed` directly.
+
 ## Failure modes and recovery
 
 Normal events reach dispatch within delivery/submission time, without waiting for a timer. PR and CI

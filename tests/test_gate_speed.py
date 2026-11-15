@@ -512,6 +512,18 @@ def test_every_package_module_the_slow_lane_launcher_imports_is_test_harness():
         assert _gates._TEST_HARNESS.search(path.as_posix()), path
 
 
+def test_the_slot_ships_every_package_module_the_slow_lane_launcher_imports():
+    """The gate runs the launcher in the slot pod: a module it imports must ship, eagerly or in `include`."""
+    from flyte_agent_factory import agent
+
+    launcher = _modules_imported_by("-m", "flyte_agent_factory._slow_lane", "--help")
+    eager = _modules_imported_by("-c", "import flyte_agent_factory.agent")
+    shipped = {f"flyte_agent_factory.{Path(name).stem}" for name in agent.env.include}
+    assert {"flyte_agent_factory._lane_shards", "flyte_agent_factory._slow_lane"} <= shipped
+    assert "flyte_agent_factory._tick_guard" in shipped  # the scheduled ticks' guard, reached lazily
+    assert launcher - eager - shipped == set()
+
+
 def test_checks_sh_sends_both_lanes_through_the_launcher_when_asked_for_child_actions(tmp_path):
     """With AGENT_FACTORY_SLOW_LANE=child the fast lane is a child action too.
 

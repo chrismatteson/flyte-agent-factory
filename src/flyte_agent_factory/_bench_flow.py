@@ -64,7 +64,9 @@ if TYPE_CHECKING:
         _meter,
         _profile,
         _pull_requests,
+        _resources,
         _router,
+        _tick_guard,
         _union_identity,
     )
     from . import (
@@ -90,7 +92,9 @@ else:
         _meter,
         _profile,
         _pull_requests,
+        _resources,
         _router,
+        _tick_guard,
         _union_identity,
     )
     from flyte_agent_factory import (
@@ -123,7 +127,7 @@ env = flyte.TaskEnvironment(
     name="factory-bench",
     image=agent_image(),
     # Polling, git fetches and the deploy subprocesses that submit image builds: nothing heavy.
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
+    resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     # The App fetches the engine and each case's branch; it never reaches a deploy child or a check.
     secrets=[
         *(
@@ -1452,4 +1456,7 @@ def _collect_labels() -> int:
 async def collect_labels() -> int:
     """Publish new production labels to the direction repository's results branch."""
     _union_identity.establish()
+    skipped = await _tick_guard.skip_reason(_deploy.COLLECT_LABELS_TASK, project=PROJECT, domain=DOMAIN)
+    if skipped:
+        return 0  # the reason is logged; the task's result is a count
     return await asyncio.to_thread(_collect_labels)

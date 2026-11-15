@@ -27,6 +27,7 @@ from . import (
     _bench_store,
     _board,
     _dashboard,
+    _deploy,
     _factory,
     _factory_base,
     _factory_meters,
@@ -36,8 +37,10 @@ from . import (
     _profile,
     _pull_requests,
     _queue,
+    _resources,
     _router,
     _state_store,
+    _tick_guard,
     _union_identity,
 )
 from ._images import agent_image
@@ -47,7 +50,7 @@ _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="factory-loop",
     image=agent_image(),
-    resources=flyte.Resources(cpu=1, memory="1Gi"),
+    resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     # TaskEnvironment accepts mixed secret lists; this list contains only Secret instances.
     secrets=cast(
         list[str | flyte.Secret],
@@ -559,6 +562,11 @@ def _generate_backlog(app: _github.GithubApp) -> str:
 async def generate_backlog() -> str:
     """Generate at most five improvement issues daily, only when the loop is enabled."""
     _union_identity.establish()
+    skipped = await _tick_guard.skip_reason(
+        _deploy.BACKLOG_TASK, project=_factory.PROJECT, domain=_factory.DOMAIN
+    )
+    if skipped:
+        return skipped
     if not PROFILE.loop.enabled:
         return "skip"
     return await asyncio.to_thread(_generate_backlog, _app(_BACKLOG_SCOPE))

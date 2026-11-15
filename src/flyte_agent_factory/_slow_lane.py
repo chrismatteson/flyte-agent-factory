@@ -88,7 +88,6 @@ import importlib.util
 import inspect
 import io
 import json
-import math
 import os
 import shlex
 import subprocess
@@ -110,7 +109,7 @@ from flyte.extras import ContainerTask
 from flyte.io import File
 from obstore.exceptions import BaseError as ObstoreError
 
-from flyte_agent_factory import _lane_shards
+from flyte_agent_factory import _lane_shards, _resources
 
 #: Same name as `_gate_tests.SLOW_LANE_ENV`, which sets it for the pre-review.
 ENV_VAR = "AGENT_FACTORY_SLOW_LANE"
@@ -157,7 +156,7 @@ MODE_COMMAND = "command"
 _EXCLUDED_DIRS = {".git", ".venv"}
 
 #: The lane's knobs: each variable, its default and its minimum.
-CPUS_VAR, CPUS_DEFAULT, CPUS_MIN = "AGENT_FACTORY_LANE_CPUS", 2, 1
+CPUS_VAR, CPUS_DEFAULT, CPUS_MIN = "AGENT_FACTORY_LANE_CPUS", _resources.LANE_CPUS_DEFAULT, 1
 MAX_SHARDS_VAR, MAX_SHARDS_DEFAULT, MAX_SHARDS_MIN = "AGENT_FACTORY_LANE_MAX_SHARDS", 8, 1
 TARGET_S_VAR, TARGET_S_DEFAULT, TARGET_S_MIN = "AGENT_FACTORY_LANE_TARGET_S", 300, 30
 BUDGET_S_VAR, BUDGET_S_DEFAULT, BUDGET_S_MIN = "AGENT_FACTORY_LANE_BUDGET_S", 1100, 120
@@ -280,23 +279,23 @@ LANE_COMMAND = ["bash", "-c", _LANE_SCRIPT, "test-lane"]
 
 
 def _memory_limit(cpus: int) -> str:
-    """Return a shard's memory limit; the one place it is computed, so a message cannot drift from it."""
-    return f"{2 * cpus + 1}Gi"
+    """Return a shard's memory limit; the one place it is read, so a message cannot drift from it."""
+    return _lane_spec(cpus).memory_limit or "unlimited"
+
+
+def _lane_spec(cpus: int) -> _resources.Spec:
+    # The profile's text, not `_profile`: the launcher may import only test-harness modules
+    # (`_gates._TEST_HARNESS`).
+    return _resources.for_lane_shard(os.environ.get(_resources.PROFILE_TOML_ENV, ""), cpus)
 
 
 def make_lane_resources(cpus: int) -> flyte.Resources:
-    """Return a shard's resources: the limit is `cpus` (the quota a test sees), the request 3/4 of it.
+    """Return a `cpus`-CPU shard's resources: `_resources.lane_shard` under the profile's `[resources.lanes]`.
 
-    A node's allocatable CPU is below its size (system pods hold some), so a request of the whole size can
-    never place on a node of exactly that size: 2 CPUs requested stay unplaced on a 2-CPU node, 1.5 place.
-    Memory: 1.5 GiB per CPU requested, 2 per CPU plus 1 as the limit, so one xdist worker per CPU, each with
-    its own Terraform and pytest-in-pytest children, fits. A guess to be tuned from the peak memory every
-    shard prints at the end of its tail.
+    By default the limit is `cpus` (the quota a test sees) and the request 3/4 of it, because a request of a
+    node's whole size never places on a node of that size; see `_resources.lane_shard` for memory.
     """
-    return flyte.Resources(
-        cpu=(f"{round(0.75 * cpus * 1000)}m", cpus),
-        memory=(f"{math.ceil(1.5 * cpus)}Gi", _memory_limit(cpus)),
-    )
+    return _lane_spec(cpus).to_flyte()
 
 
 def _name_task(cpus: int, interruptible: bool, max_runtime: timedelta) -> tuple[str, str]:
