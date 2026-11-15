@@ -25,5 +25,6 @@ profiles/*.toml
 
 profiles/.default
 
-# The run context the supervisor writes for child actions (checks.sh links the workspace root's here).
-/.flyte
+# The run context the supervisor writes for child actions (checks.sh links the workspace root's here),
+# or a link to it in a project folder; never committed.
+.flyte

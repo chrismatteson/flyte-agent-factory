@@ -646,6 +646,7 @@ async def _pump(
                             list(_inbox._directions),
                             work,
                             _session_config._project_repo,
+                            _session_config._project_folder,
                         )
                         if work.junit_dir:
                             shutil.rmtree(work.junit_dir, ignore_errors=True)

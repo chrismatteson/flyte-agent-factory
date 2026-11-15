@@ -236,6 +236,7 @@ def _project_memory(
     branch_problem: str = "",
     engine: str = "claude",
     personal_browsers: Sequence[str] = (),
+    folder: str | None = None,
 ) -> str:
     root = layout == "root"
     workspace = layout == "workspace"
@@ -368,8 +369,9 @@ def _project_memory(
         else ""
     )
     acceptance = _session_config._acceptance_rel(name)
-    checks = _session_config._checks_rel(name, layout)
-    project_rel = _gate_base.project_rel(name, layout)
+    folder = _session_config._project_folder if folder is None else folder  # the launch's, unless named
+    checks = _session_config._checks_rel(name, layout, folder)
+    project_rel = _gate_base.project_rel(name, layout, folder)
     delivery_note = (
         "- **This project delivers to another repo, so two criteria are always on that list:** "
         '"target repo CI green locally (the commands `factory:target-ci` runs)" and "100% branch '

@@ -223,6 +223,11 @@ _project_repo = ""
 
 _project_brief = ""
 
+#: The `projects/<folder>/` this project's files are judged in, set once from the launch by
+#: `_session_setup._prepare_workspace` (`_project_folder.route`): "" means the project's name. Never read from
+#: a file the project can edit.
+_project_folder = ""
+
 
 def _safe_project_dir(name: str) -> bool:
     return bool(name) and not Path(name).is_absolute() and ".." not in Path(name).parts and name != "."
@@ -243,9 +248,11 @@ def _layout() -> str:
     return layout
 
 
-def _checks_rel(name: str, layout: str = "sandbox") -> str:
+def _checks_rel(name: str, layout: str = "sandbox", folder: str | None = None) -> str:
     # Keep the script with the project's tracked files so reviewers see the same checks.
-    return _gate_base.checks_rel(name, layout) if _safe_project_dir(name) else _CHECKS_SCRIPT
+    # `folder` defaults to this launch's: a caller naming another project's script passes its own.
+    folder = _project_folder if folder is None else folder
+    return _gate_base.checks_rel(name, layout, folder) if _safe_project_dir(name) else _CHECKS_SCRIPT
 
 
 def _acceptance_rel(name: str) -> str:
@@ -524,9 +531,10 @@ _demo_kind = ""
 def _project_dir() -> Path:
     """Return what the project owns in its workspace.
 
-    `<name>/` in the sandbox repo, `projects/<name>/` in a workspace, the repo root otherwise.
+    `<name>/` in the sandbox repo, `projects/<folder>/` (the name unless the launch routed it) in a
+    workspace, the repo root otherwise.
     """
-    project: Path = _gate_base.project_dir(WORKSPACE, _project_name, _layout())
+    project: Path = _gate_base.project_dir(WORKSPACE, _project_name, _layout(), _project_folder)
     return project
 
 

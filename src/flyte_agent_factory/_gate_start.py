@@ -166,6 +166,56 @@ def _take_upstream(workspace: Path, checkout: Path, tip: str, paths: list[str]) 
         _extract(workspace, tip, checkout, kept)
 
 
+def make_start_folder(start: Path, relative: str) -> Path:
+    """Return the project's folder (`relative` to the workspace) inside the start tree `start`.
+
+    A project the start tree does not hold (brand new) gets an empty folder, so every module it adds
+    is new rather than judged against nothing at all.
+    """
+    folder = start / relative
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def find_upstream_start(workspace: Path) -> str | None:
+    """Return the newest default-branch (`origin/HEAD`) commit HEAD holds, or None without one.
+
+    A workspace project's branch only ever merges the default branch, so this is everything upstream gave
+    the project and nothing the project wrote: a merge commit the project authored cannot carry its own
+    additions into the start, as it could into HEAD with the project's non-merge commits reversed.
+    """
+    code, output = _gate_base._run(["git", "merge-base", "HEAD", "origin/HEAD"], workspace)
+    return output.strip() if code == 0 and output.strip() else None
+
+
+def list_paths_since(workspace: Path, upstream: str) -> tuple[int, list[str]]:
+    """Return the exit code and every path HEAD changes from `upstream` (`find_upstream_start`).
+
+    Every commit's paths, a merge's own additions included, where a walk over the project's non-merge
+    commits would miss what a merge commit it authored added.
+    """
+    code, output = _gate_base._run(
+        ["git", "diff", "--name-only", "--no-renames", "-z", upstream, "HEAD"], workspace
+    )
+    return (code, [output]) if code else (0, sorted(p for p in output.split("\0") if p))
+
+
+def list_foreign_commits(workspace: Path, base: str, attributed: list[str]) -> list[str]:
+    """List `<sha> <author email>` for each commit since `base` that is neither the project's nor upstream's.
+
+    The start tree reverse-applies only `attributed` commits, so any other commit would count as debt the
+    project inherited: a commit made with `--author` someone else would launder its own additions. Commits
+    the default branch (`origin/HEAD`) already has, merged in from upstream, are not the project's.
+    """
+    code, output = _gate_base._run(
+        ["git", "log", "--no-merges", "--format=%H %ae", f"{base}..HEAD", "--not", "origin/HEAD"], workspace
+    )
+    if code:
+        raise _GateError(f"cannot list the commits since the base: {output.strip()}")
+    own = set(attributed)
+    return [line for line in output.splitlines() if line.split(" ", 1)[0] not in own]
+
+
 def _extract(workspace: Path, ref: str, checkout: Path, paths: list[str] | None = None) -> None:
     archive = _git_bytes(["archive", ref, "--", *(paths or [])], workspace)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:

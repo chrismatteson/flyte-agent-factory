@@ -75,7 +75,7 @@ give the same bytes in any clone.
 ## Recreating a diff
 
 ```
-python -m flyte_agent_factory._judge_inputs recreate --report snapshot.json --round 2 --judge craft \
+PYTHONPATH=src python -m flyte_agent_factory._judge_inputs recreate --report snapshot.json --round 2 --judge craft \
     --repo path/to/clone --out round2.patch [--which project|round]
 ```
 

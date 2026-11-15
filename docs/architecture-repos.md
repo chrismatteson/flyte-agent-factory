@@ -43,6 +43,41 @@ follow it:
 The scope check judges writes against the project's directory. The code and the example profile still call
 `[repo] project` the sandbox; with the workspace template it is the workspace.
 
+#### A launch that works in another project's folder
+
+A launch's name is its identity (harness directory, branch `factory/<name>`, base commit, commit identity). In a
+workspace the gates judge `projects/<name>/` by default. A launch that edits an imported folder under another
+name, such as `fix-x` working in `projects/engine/`, says so with a line in the brief it is launched with
+(a list item or bold key works too; only the first word after the key is read):
+
+    Project folder: projects/engine/
+
+Every launch carries its brief, so the line works for direct, factory and queued launches alike. The value
+must be one directory name under `projects/` (no `/`, `.`, `..` or absolute path), or the launch is refused
+naming it. It comes from the launch only: a `Project folder:` line
+added to `.claude-flyte/BRIEF.md` in the working tree changes nothing. Scope, fail-to-pass, `checks.sh`, the
+uncommitted-work check and `promote.toml` protection then all use `projects/engine/`; everything keyed by the
+name stays on the name.
+
+Without a `Project folder:` line, a launch is refused when `projects/<name>/` does not exist and the brief's `May edit:` paths name
+another existing `projects/<x>/`. The error names both folders: add `Project folder: projects/<x>/` to the
+brief, or `Project folder: projects/<name>/` if this really is a new project.
+A routed folder that does not exist in the workspace is refused too, unless it is the launch's own name.
+
+A workspace project is judged against its start tree: the newest default-branch (`origin/HEAD`) commit its
+branch holds (`git merge-base HEAD origin/HEAD`), narrowed to its folder, so debt it inherited passes and what it
+adds or grows fails. Everything not on the default branch is the project's, a merge commit it authored included,
+so a merge cannot carry new code into the start, and `scope` judges every path that differs from it. (Without `origin/HEAD`, the start is HEAD with the project's
+own commits reverse-applied, as in the root layout.) A non-merge commit since
+the base that is neither attributed to the launch nor on the default branch (`origin/HEAD`) fails
+`attribution`, so a commit made under another `--author` cannot pass the project's additions off as debt.
+
+Lanes started from a project folder attach to the run through `AGENT_FACTORY_RUN_CONTEXT`, which the engine sets
+to the workspace root's `.flyte` (the directory or its `run_context.json`), so a project needs no `.flyte` of its
+own. When the variable is unset, or names no context, `attach` looks in the working directory and then its
+ancestors. Finding none, it fails naming the variable's state and every path it searched, and the lane runs
+locally with that message.
+
 ### Credentials
 
 `[secrets] deploy_key` is the deploy key of the `[repo] project` repository. `[repo_keys]` adds one deploy key per

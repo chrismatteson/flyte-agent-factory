@@ -27,18 +27,39 @@ def _glob_match(path: str, pattern: str) -> bool:
     return re.fullmatch(regex, path) is not None
 
 
-def _manifest_path(name: str, layout: str) -> str:
+def _manifest_path(name: str, layout: str, folder: str = "") -> str:
     """Where the project's `promote.toml` is in the repository.
 
     The operator's import wrote it: it names the target and the commit the review's diff starts at, so a
     session that could edit it could choose its own diff.
     """
-    prefix = {"workspace": f"projects/{name}/", "sandbox": f"{name}/"}.get(layout, "")
+    prefix = {"workspace": f"projects/{folder or name}/", "sandbox": f"{name}/"}.get(layout, "")
     return prefix + _delivery.FILE
 
 
+def list_may_edit_paths(brief: str) -> list[str]:
+    """Return the paths the brief's `May edit:` lines grant, without any that could escape the project."""
+    permissions = " ".join(
+        re.findall(r"^[ \t]*(?:[-*][ \t]*)?May edit:[ \t]*(.*)$", brief, re.MULTILINE | re.IGNORECASE)
+    )
+    try:
+        named = shlex.split(permissions.replace(",", " "))
+    except ValueError:
+        named = []  # Malformed quoting must not grant scope accidentally.
+    return [
+        str(PurePosixPath(p.strip("`")))
+        for p in named
+        if ".." not in PurePosixPath(p).parts and not PurePosixPath(p).is_absolute()
+    ]
+
+
 def _classify_scope(
-    path: str, name: str, brief: str, owned: set[str] | None = None, layout: str = "sandbox"
+    path: str,
+    name: str,
+    brief: str,
+    owned: set[str] | None = None,
+    layout: str = "sandbox",
+    folder: str = "",
 ) -> str:
     """`ok`, `flag` (advisory) or `block` for one changed path.
 
@@ -52,20 +73,9 @@ def _classify_scope(
     """
     if path in (_waivers.FILE, _gardening.FILE) or PurePosixPath(path).parts[:1] == (STANDARDS_DIR,):
         return "block"
-    if path == _manifest_path(name, layout):
+    if path == _manifest_path(name, layout, folder):
         return "block"
-    permissions = " ".join(
-        re.findall(r"^[ \t]*(?:[-*][ \t]*)?May edit:[ \t]*(.*)$", brief, re.MULTILINE | re.IGNORECASE)
-    )
-    try:
-        named = shlex.split(permissions.replace(",", " "))
-    except ValueError:
-        named = []  # Malformed quoting must not grant scope accidentally.
-    allowed = [
-        str(PurePosixPath(p.strip("`")))
-        for p in named
-        if ".." not in PurePosixPath(p).parts and not PurePosixPath(p).is_absolute()
-    ]
+    allowed = list_may_edit_paths(brief)
     parts = PurePosixPath(path).parts
     if (
         any(path == a or path.startswith(a + "/") or _glob_match(path, a) for a in allowed)
@@ -76,7 +86,7 @@ def _classify_scope(
     if layout == "root":
         return "block"
     if layout == "workspace":
-        return "ok" if parts[:2] == ("projects", name) and len(parts) > 2 else "block"
+        return "ok" if parts[:2] == ("projects", folder or name) and len(parts) > 2 else "block"
     if path == name or path.startswith(name + "/"):
         return "ok"
     if len(parts) > 1:
@@ -90,14 +100,24 @@ def _classify_scope(
 
 
 def scope_violations(
-    changes: list[str], name: str, brief: str, owned: set[str] | None = None, layout: str = "sandbox"
+    changes: list[str],
+    name: str,
+    brief: str,
+    owned: set[str] | None = None,
+    layout: str = "sandbox",
+    folder: str = "",
 ) -> list[str]:
     """Edits to owned directories or shared root files without explicit permission."""
-    return [p for p in changes if _classify_scope(p, name, brief, owned, layout) == "block"]
+    return [p for p in changes if _classify_scope(p, name, brief, owned, layout, folder) == "block"]
 
 
 def scope_flagged(
-    changes: list[str], name: str, brief: str, owned: set[str] | None = None, layout: str = "sandbox"
+    changes: list[str],
+    name: str,
+    brief: str,
+    owned: set[str] | None = None,
+    layout: str = "sandbox",
+    folder: str = "",
 ) -> list[str]:
     """Other out-of-scope files: worth a reviewer's glance, not worth bouncing DONE."""
-    return [p for p in changes if _classify_scope(p, name, brief, owned, layout) == "flag"]
+    return [p for p in changes if _classify_scope(p, name, brief, owned, layout, folder) == "flag"]

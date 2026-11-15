@@ -190,6 +190,8 @@ def _reset_workspace_env(monkeypatch):
     the workspace an earlier test on the same worker exported.
     """
     monkeypatch.delenv("AGENT_FACTORY_WORKSPACE", raising=False)
+    # `child.write_context` exports the run context the same way.
+    monkeypatch.delenv("AGENT_FACTORY_RUN_CONTEXT", raising=False)
 
 
 @pytest.fixture
