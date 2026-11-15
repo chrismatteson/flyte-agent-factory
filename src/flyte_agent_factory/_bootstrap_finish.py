@@ -29,8 +29,10 @@ from ._bootstrap_steps import commit_paths, describe_unclean_or_unpushed
 #: Polls of the App installation, `_POLL_SECONDS` apart: ten minutes to find the install button and click it.
 _POLLS, _POLL_SECONDS = 120, 5
 _GAP = (
-    "open-source Flyte stops here: the deploy needs Union-only parts (API keys, the remote image builder and "
-    "MCP authentication); see docs/oss-flyte-compat.md. Everything above is done and stays valid"
+    "open-source Flyte stops here: this script's deploy assumes Union (API keys, the remote image builder "
+    "and MCP authentication). Deploy by hand with the OSS profile keys, the two secrets and the commands in "
+    'docs/oss-flyte-compat.md ("Running the factory on OSS Flyte"), with the factory MCP behind an '
+    "authenticating proxy. Everything above is done and stays valid"
 )
 # The one next action when the install cannot happen (an organization the person does not own, say) is the
 # second sentence: the App is not written to the profile, so `--no-app` on a rerun leaves nothing to undo.

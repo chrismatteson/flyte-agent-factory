@@ -10,6 +10,10 @@ Starting out on a personal plan? Copy one of these here instead; both are minima
 [example-codex-personal.toml](example-codex-personal.toml) (ChatGPT Plus/Pro). The steps are in
 [../docs/quickstart.md](../docs/quickstart.md), the secrets in [../docs/secrets.md](../docs/secrets.md).
 
+On open-source Flyte (`[backend] kind = "oss"`, no Union API keys) start from
+[oss-example.toml](oss-example.toml); its `[backend]` and `[mcp]` keys are explained in
+[../docs/oss-flyte-compat.md](../docs/oss-flyte-compat.md#running-the-factory-on-oss-flyte).
+
 Guided setup (`ops/bootstrap.py`, see [../docs/quickstart.md](../docs/quickstart.md)) needs none of this: it writes
 `profile.toml` at the root of your workspace and deploys with `--profile <clone>/profile.toml`. The `profiles/<name>.toml`
 form below is for an engine checkout you deploy by hand.
@@ -59,9 +63,12 @@ deployed task. Environment variables that already existed (`OPERATE_PROJECT`, `O
 | Table / key | Required | Meaning |
 |---|---|---|
 | `name` | yes | Profile name. |
-| `[backend]` `kind` | yes | `union` or `oss`. Recorded for docs and guards. |
+| `[backend]` `kind` | yes | `union` or `oss`. Selects the identity, image builder, pod endpoint and MCP auth defaults ([OSS keys](../docs/oss-flyte-compat.md#1-the-profile)). |
 | `[backend]` `endpoint`, `project`, `domain` | yes | Flyte endpoint host, project, domain. |
 | `[backend]` `org`, `console_host`, `signin_host`, `config` | no | Org; console host (reports, console login in the browser); its sign-in host; the Flyte config file passed to the CLI. |
+| `[backend]` `internal_endpoint` | yes, for `kind = "oss"` without `[union]` keys | The in-cluster URL pods reach Flyte at, set on every deployed environment as `_U_EP_OVERRIDE`. Deploy and pod start raise `ProfileError` without it. |
+| `[backend]` `insecure` | no | `true` when `internal_endpoint` is plain HTTP (sets `_U_INSECURE=true` on the pods). Default `false`. |
+| `[backend]` `image_builder` | no | `local`, `local-podman` or `remote`. Default `local` on `oss`, `remote` on `union`. |
 | `[union]` `project_key`, `deployer_key` | yes, for `kind = "union"` | Names of Union secrets that each hold an API key. `project_key`: slot supervisors and setup tasks. `deployer_key`: the deployer and its deploy children; it has no default, so which identity deploys is a deliberate choice, and it may equal `project_key`. [Details](#union). |
 | `[union]` `session_key`, `queue_key` | no | `session_key`: every claude process, sub-agents, delegates, reviewers and their `attach()` children. `queue_key`: the factory, gardening scan, loop, reconcile, issues, webhook, factory-mcp, bench, browser and voice. Each defaults to `project_key`. |
 | `[repo]` `project` | yes | The workspace: the repository projects are pushed to by default. `[secrets] deploy_key` reaches only this one; another `[repo]` entry needs a `[repo_keys]` key. |
@@ -93,7 +100,8 @@ deployed task. Environment variables that already existed (`OPERATE_PROJECT`, `O
 | `[loop]` `enabled`, `repo`, `path`, `merge`, `daily_usd`, `weekly_usd`, `owner_floor_pct` | no | The PR loop ([below](#loop)); `merge = "on"` is the one case where the factory merges. |
 | `[resources.<component>]` `cpu`, `memory`, `disk` | no | Raise or lower what a component asks Kubernetes for ([docs/small-nodes.md](../docs/small-nodes.md)). `<component>` is one of `slot`, `subagent`, `setup`, `mcp`, `webhook`, `browser`, `ticks` (`factory`, `factory-reconcile`, `factory-loop`, `factory-issues`, `factory-bench`), `deployer`, `scan` (`gardening-scan`), `lanes` (test-lane children) or `bench` (`factory-bench-check`). `cpu` and `memory` are one quantity (a request only) or `[request, limit]`; `disk` is one quantity (a request only). A key the table sets replaces that key's default, request and limit; keys it leaves out keep theirs. Quantities are Kubernetes' (`500m`, `2`, `1536Mi`, `8Gi`); an unknown component or key, a non-positive or unparsable quantity or a request above its limit is an error. The defaults fit one 4-CPU / 16 GiB node; the table is carried into the pods with the rest of the profile. |
 | `[gardening]` `min_runs_per_week`, `max_days_between`, `escalate_on_regression`, `max_open_issues` | no | The weekly gardening project ([below](#gardening)). |
-| `[mcp]` `public_url`, `repos` | no | Public URL (`FACTORY_MCP_PUBLIC_URL` in the shell wins); the `[repo]` keys whose URLs chat may pass to `run_task` as `repo` (default `["project"]`). Access is Union sign-in and Union RBAC per call; there is no user allowlist. |
+| `[mcp]` `public_url`, `repos` | no | Public URL (`FACTORY_MCP_PUBLIC_URL` in the shell wins); the `[repo]` keys whose URLs chat may pass to `run_task` as `repo` (default `["project"]`). With `auth = "union"`, access is Union sign-in and Union RBAC per call; there is no user allowlist. |
+| `[mcp]` `auth` | no | `union` (default on `union`): the app checks a Union token. `proxy` (default on `oss`): the app does no authentication and no resource requests, and MUST sit behind an authenticating (OAuth) proxy, never exposed on its own. |
 
 Unknown keys are errors, so a typo cannot silently fall back to a default.
 

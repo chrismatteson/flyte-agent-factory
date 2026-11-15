@@ -36,10 +36,12 @@ from flyte import remote
 if TYPE_CHECKING:
     from . import (
         _deploy,
+        _factory_base,
         _github,
         _github_mode,
         _isolation_canary,
         _profile,
+        _profile_oss,
         _pull_requests,
         _resources,
         _standards,
@@ -51,10 +53,12 @@ if TYPE_CHECKING:
 else:
     from flyte_agent_factory import (
         _deploy,
+        _factory_base,
         _github,
         _github_mode,
         _isolation_canary,
         _profile,
+        _profile_oss,
         _pull_requests,
         _resources,
         _standards,
@@ -88,6 +92,8 @@ def _tier_mounts(profile: _profile.Profile) -> dict[str, str]:
     `<KEY_ENV>_<TIER>` for reporting client ids and for the isolation canary; a tier that shares a secret
     with an earlier one is not mounted twice.
     """
+    if _profile_oss.keyless(profile):
+        return {}  # no keys to mount
     mounts = {profile.union.key_for("deployer"): _union_identity.KEY_ENV}
     for tier in ("project", "session", "queue"):
         mounts.setdefault(profile.union.key_for(tier), f"{_union_identity.KEY_ENV}_{tier.upper()}")
@@ -97,6 +103,8 @@ def _tier_mounts(profile: _profile.Profile) -> dict[str, str]:
 def tier_secrets_and_env(profile: _profile.Profile) -> tuple[list[flyte.Secret], dict[str, str]]:
     """Return the secrets for every tier key, and the setting that points children at the deployer's own."""
     secrets, env_vars = _union_identity.pod_spec(profile, "deployer")
+    if _profile_oss.keyless(profile):
+        return secrets, env_vars  # no key to point children at: `init_for_script` uses the endpoint
     secrets += [
         flyte.Secret(key=secret, as_env_var=var)
         for secret, var in _tier_mounts(profile).items()
@@ -253,7 +261,7 @@ def _pair_labels(
 
 
 class _RunFilters(TypedDict):
-    with_labels: NotRequired[dict[str, str]]
+    labels: NotRequired[dict[str, str]]
     in_phase: NotRequired[tuple[str, ...]]
     sort_by: NotRequired[tuple[str, Literal["asc", "desc"]]]
     limit: NotRequired[int]
@@ -276,16 +284,13 @@ class DeployOutput(TypedDict):
 
 
 async def _runs(profile: _profile.Profile, **kwargs: Unpack[_RunFilters]) -> list[remote.Run]:
-    return [
-        run
-        async for run in remote.Run.listall.aio(
-            task_name=_deploy.DEPLOY_PAIR,
-            project=PROJECT,
-            domain=DOMAIN,
-            with_labels=kwargs.pop("with_labels", release_labels(profile)),
-            **kwargs,
-        )
-    ]
+    return await _factory_base.list_runs_aio(
+        kwargs.pop("labels", release_labels(profile)),
+        task_name=_deploy.DEPLOY_PAIR,
+        project=PROJECT,
+        domain=DOMAIN,
+        **kwargs,
+    )
 
 
 async def deployed_pair(profile: _profile.Profile) -> tuple[remote.Run, tuple[str, str]] | None:
@@ -296,11 +301,11 @@ async def deployed_pair(profile: _profile.Profile) -> tuple[remote.Run, tuple[st
     number of them may follow a release, so this pages until it finds one (labels are fixed at
     submission, so a deploy cannot be told from a stand-down by label).
     """
-    async for run in remote.Run.listall.aio(
+    async for run in _factory_base.iter_runs_aio(
+        release_labels(profile),
         task_name=_deploy.DEPLOY_PAIR,
         project=PROJECT,
         domain=DOMAIN,
-        with_labels=release_labels(profile),
         in_phase=("SUCCEEDED",),
         sort_by=("created_at", "desc"),
         limit=1000000,
@@ -335,11 +340,11 @@ async def _failed_attempts(profile: _profile.Profile, labels: dict[str, str], la
     # The SDK's Run protobuf omits creation time. Traverse server creation order to the
     # success boundary instead of substituting start_time (queued runs can start out of order).
     failures = 0
-    async for candidate in remote.Run.listall.aio(
+    async for candidate in _factory_base.iter_runs_aio(
+        release_labels(profile),
         task_name=_deploy.DEPLOY_PAIR,
         project=PROJECT,
         domain=DOMAIN,
-        with_labels=release_labels(profile),
         sort_by=("created_at", "desc"),
         limit=1000000,
     ):
@@ -462,7 +467,7 @@ async def _read_secrets_last_waited_for(
 ) -> dict[str, list[str]]:
     """Return the secrets the newest finished attempt at these heads waited for; none if it did not wait."""
     for run in await _runs(
-        profile, with_labels=labels, in_phase=("SUCCEEDED",), sort_by=("created_at", "desc"), limit=1
+        profile, labels=labels, in_phase=("SUCCEEDED",), sort_by=("created_at", "desc"), limit=1
     ):
         try:
             (output,) = await run.outputs.aio()
@@ -879,6 +884,9 @@ def _push_mode(profile: _profile.Profile) -> tuple[str, list[str]]:
     """
     if not profile.github.configured:
         return "deploy_key", []
+    if _profile_oss.keyless(profile):
+        # The canary launches a task as the session tier's key; OSS has no keys to measure with.
+        return "deploy_key", ["OSS backend: sessions have no separate identity, so isolation is not measured"]
     try:
         verdict = _isolation_canary.check(profile, launch_canary)
     except (_union_identity.IdentityMissing, *_DEPLOY_ERRORS) as exc:

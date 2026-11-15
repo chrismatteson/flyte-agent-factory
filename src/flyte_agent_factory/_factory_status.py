@@ -8,7 +8,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
-from flyte_agent_factory import _dashboard, _github_mode, _profile_union
+from flyte_agent_factory import _dashboard, _github_mode, _profile_oss, _profile_union
 from flyte_agent_factory._profile import IDENTITIES_ENV, Profile
 
 _HTML_ROW = re.compile(r"<tr><td><code>([^<]*)</code></td><td>([^<]*)</td><td>(.*?)</td></tr>", re.DOTALL)
@@ -45,6 +45,8 @@ def union_fields(profile: Profile, deploy_output: Mapping[str, Any] | None = Non
     A row carries the client id the latest successful deploy's outputs recorded for it
     (`deploy_output["identities"]`) when there is one.
     """
+    if _profile_oss.keyless(profile):
+        return {"union": []}  # no tiers and no keys on OSS
     recorded = deploy_output.get("identities") if deploy_output else None
     clients = {
         (row.get("tier"), row.get("secret")): row.get("client_id")

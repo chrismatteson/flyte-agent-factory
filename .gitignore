@@ -22,6 +22,7 @@ profiles/*.toml
 !profiles/example.toml
 !profiles/example-claude-personal.toml
 !profiles/example-codex-personal.toml
+!profiles/oss-example.toml
 
 profiles/.default
 

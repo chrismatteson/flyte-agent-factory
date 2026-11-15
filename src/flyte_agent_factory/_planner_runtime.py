@@ -115,17 +115,14 @@ class Backend:
         if correlation:
             labels[CORRELATION] = correlation
         with _union_identity.denied("listing planner runs"):
-            runs = [
-                run
-                async for run in remote.Run.listall.aio(
-                    task_name=TASK,
-                    project=_factory.PROJECT,
-                    domain=_factory.DOMAIN,
-                    with_labels=labels,
-                    limit=1000000,
-                    **({} if correlation else {"in_phase": _deploy.LIVE_PHASES}),
-                )
-            ]
+            runs = await _factory_base.list_runs_aio(
+                labels,
+                task_name=TASK,
+                project=_factory.PROJECT,
+                domain=_factory.DOMAIN,
+                limit=1000000,
+                **({} if correlation else {"in_phase": _deploy.LIVE_PHASES}),
+            )
         return [SimpleNamespace(name=r.name, correlation=r.pb2.labels[CORRELATION], run=r) for r in runs]
 
     async def submit(self, correlation: str) -> SimpleNamespace:
@@ -167,13 +164,8 @@ def _intents(app: _github.GithubApp, repo: str, base: str) -> list[tuple[_admiss
 
 def _matches(correlation: str) -> list[remote.Run]:
     with _union_identity.denied("listing runs of a launch intent"):
-        return list(
-            remote.Run.listall(
-                project=_factory.PROJECT,
-                domain=_factory.DOMAIN,
-                with_labels={CORRELATION: correlation},
-                limit=1000000,
-            )
+        return _factory_base.list_runs(
+            {CORRELATION: correlation}, project=_factory.PROJECT, domain=_factory.DOMAIN, limit=1000000
         )
 
 
@@ -392,7 +384,7 @@ def execute(
         # Terminal runs remain the durable generation history after intent cleanup.
         identity = hashlib.sha256(f"{node}:{gen}".encode()).hexdigest()[:32]
         with _union_identity.denied("listing runs of a generation"):
-            started = list(remote.Run.listall(with_labels={"factory-work": identity}, limit=1))
+            started = _factory_base.list_runs({"factory-work": identity}, limit=1)
         if started:
             continue
         slot = next(

@@ -10,6 +10,11 @@ Considered and rejected: overwriting the injected variable early (too late for t
 builds, and it keeps the name in our code), and `init_from_api_key` in every entry point (cannot reach a
 controller or an app the runtime builds). When a tier's key is missing the process fails; it never falls
 back to the injected key, which is another tier's identity.
+
+On an OSS backend (`[backend] kind = "oss"`) whose profile lists no `[union]` keys there is no identity.
+OSS Flyte has no API-key service and its API is unauthenticated: the network is the trust boundary (tailnet,
+network policy, an OAuth proxy in front of the MCP). Pods mount no key and set no auth variables, and
+`establish` returns `OSS_IDENTITY`. Anything that can reach the internal endpoint can act as the factory.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import _profile_union
+from . import _profile_oss, _profile_union
 
 if TYPE_CHECKING:
     import flyte
@@ -43,6 +48,7 @@ TOKEN_COMMAND = '["python", "-m", "flyte_agent_factory._union_token"]'
 #: Union injects these into task pods. The only place the factory names them: to drop them.
 INJECTED_VARS = ("_UNION_EAGER_API_KEY", "EAGER_API_KEY")
 
+
 _MISSING = (
     "no Union identity for tier {tier}: secret {secret} is not mounted as AGENT_FACTORY_UNION_KEY. Create "
     "the key and store it with `python ops/bootstrap.py --union-keys` (or docs/setup.md#union-keys). The "
@@ -57,6 +63,17 @@ class Identity:
     client_id: str  # never the key
 
 
+#: What `establish` returns on an OSS backend: no tier, secret or client; the network is the identity.
+OSS_IDENTITY = Identity(tier="oss", secret="", client_id="oss")
+
+
+def describe_identity(identity: Identity) -> str:
+    """Return a line saying who the process acts as, for a timeline; no key."""
+    if identity is OSS_IDENTITY:
+        return "OSS backend: no Union identity; the network is the credential"
+    return f"Union: tier {identity.tier}, secret {identity.secret}, client {identity.client_id}"
+
+
 class IdentityMissing(RuntimeError):
     """The pod has no key for its tier."""
 
@@ -69,6 +86,8 @@ def pod_spec(profile: Profile, tier: str) -> tuple[list[flyte.Secret], dict[str,
     """Return the secrets and environment a pod of `tier` needs to act as that tier's key."""
     import flyte
 
+    if _profile_oss.keyless(profile):
+        return [], {}
     union = profile.union
     secret = union.key_for(tier)  # raises on an unknown tier
     if not secret:
@@ -88,7 +107,7 @@ def pod_spec(profile: Profile, tier: str) -> tuple[list[flyte.Secret], dict[str,
 
 def pod_for(profile: Profile | None, tier: str) -> tuple[list[flyte.Secret], dict[str, str]]:
     """`pod_spec`, or nothing where there is no profile or no `[union]` key (a backend without Union keys)."""
-    if profile is None or not profile.union.key_for(tier):
+    if profile is None or _profile_oss.keyless(profile) or not profile.union.key_for(tier):
         return [], {}
     return pod_spec(profile, tier)
 
@@ -108,6 +127,17 @@ def client_id_of(key: str) -> str:
     return _decode(key)
 
 
+def _load_profile_or_none() -> Profile | None:
+    """Return the selected profile; None when none is selected or it does not parse."""
+    from . import _profile
+
+    # A profile that does not parse is not an OSS one: the union path then fails closed as it always did.
+    try:
+        return _profile.current()
+    except _profile.ProfileError:
+        return None
+
+
 def _probe() -> None:
     """One cheap call that needs read access in our own project and domain."""
     import flyte.remote
@@ -116,9 +146,15 @@ def _probe() -> None:
 
 
 def establish(probe: bool = True) -> Identity:
-    """Take the pod's tier key as its identity or raise `IdentityMissing`; `probe` checks Union accepts it."""
+    """Take the pod's tier key as its identity or raise `IdentityMissing`; `probe` checks Union accepts it.
+
+    On an OSS backend there is no key: the result is `OSS_IDENTITY` and nothing is probed.
+    """
     for var in INJECTED_VARS:  # children inherit the scrubbed environment
         os.environ.pop(var, None)
+    profile = _load_profile_or_none()
+    if profile is not None and _profile_oss.keyless(profile):
+        return OSS_IDENTITY
     tier = os.environ.get(TIER_ENV, "unknown")
     secret = os.environ.get(SECRET_ENV, "unknown")
     key = os.environ.get(KEY_ENV, "")
@@ -199,11 +235,25 @@ def init_for_script(profile: Profile, key_env: str = "", **init_kwargs: Any) -> 
     hand deploy needs no API key at all, and no laptop ever needs the pod's injected one. `init_kwargs` go to
     the SDK's init (`project` and `domain` override the profile's; a deploy child adds `root_dir` and
     `image_builder`).
+
+    On an OSS backend `key_env` is ignored (OSS has no keys) and, in a pod or when the profile names no config
+    file, the SDK connects to the internal endpoint directly (a laptop's config path does not exist in a pod).
     """
     import flyte
 
+    oss = _profile_oss.keyless(profile)
+    if oss:  # fail the deploy here, not in a pod that cannot reach Flyte
+        _profile_oss.endpoint_for_pods(profile.backend)
     init_kwargs = {"project": profile.backend.project, "domain": profile.backend.domain, **init_kwargs}
-    if not key_env:
+    if not key_env or oss:  # OSS has no API keys: a `key_env` is ignored, the network is the credential
+        if oss and (not profile.backend.config or os.environ.get("FLYTE_INTERNAL_EXECUTION_ID")):
+            # In a pod (the deployer) there is no CLI config; the internal endpoint is the way in.
+            flyte.init(
+                endpoint=_profile_oss.endpoint_for_pods(profile.backend),
+                insecure=profile.backend.insecure,
+                **init_kwargs,
+            )
+            return
         config = str(Path(profile.backend.config).expanduser()) if profile.backend.config else None
         flyte.init_from_config(config, **init_kwargs)
         return
@@ -216,7 +266,7 @@ def init_for_script(profile: Profile, key_env: str = "", **init_kwargs: Any) -> 
 def controller_kwargs() -> dict[str, Any]:
     """Return `init_in_cluster`'s result: what `create_remote_controller` needs to act as this pod.
 
-    Raises `IdentityMissing` when the pod has no tier key.
+    Raises `IdentityMissing` when the pod has no tier key (never on an OSS backend, which has none).
     """
     import flyte
 
@@ -224,9 +274,17 @@ def controller_kwargs() -> dict[str, Any]:
     # configured, so a pod without its tier key would quietly act as another identity (#183).
     # `establish` refuses that pod and scrubs the injected key, leaving no fallback to take.
     establish(probe=False)
+    profile = _load_profile_or_none()
+    if profile is not None and _profile_oss.keyless(profile):
+        # Explicit, though `pod_env` sets the same two variables: the controller must not depend on them.
+        return flyte.init_in_cluster(
+            endpoint=_profile_oss.endpoint_for_pods(profile.backend), insecure=profile.backend.insecure
+        )
     return flyte.init_in_cluster()
 
 
 def describe(profile: Profile) -> list[dict[str, str]]:
-    """Each tier and the secret it acts as, for status and reports. No keys, no client ids."""
+    """Each tier and the secret it acts as, for status and reports. No keys, no client ids. None on OSS."""
+    if _profile_oss.keyless(profile):
+        return []
     return [{"tier": tier, "secret": profile.union.key_for(tier)} for tier in _profile_union.TIERS]

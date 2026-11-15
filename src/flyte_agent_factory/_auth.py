@@ -117,7 +117,8 @@ def own_client_id() -> str:
     from . import _union_identity
 
     try:
-        return _union_identity.current().client_id
+        identity = _union_identity.current()
+        return "" if identity is _union_identity.OSS_IDENTITY else identity.client_id
     except _union_identity.IdentityMissing:
         return ""
 
