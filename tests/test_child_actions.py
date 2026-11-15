@@ -256,6 +256,50 @@ def test_attach_records_what_is_submitted_afterwards(monkeypatch, tmp_path):
     assert child.recorded_children(tmp_path, "a0") == ["kid9"]
 
 
+def test_attach_from_a_project_folder_finds_the_context_at_the_workspace_root(monkeypatch, tmp_path):
+    """A workspace project's checks run in projects/<name>/; the context is at the workspace root (#209)."""
+    from types import SimpleNamespace
+
+    import flyte
+    from flyte._internal import controllers
+
+    root = tmp_path / "workspace"
+    project = root / "projects" / "demo"
+    project.mkdir(parents=True)
+    child.context_path(root).parent.mkdir()
+    child.context_path(root).write_text("{}")
+    loaded = []
+
+    def load(path=None):
+        loaded.append(path)
+        return SimpleNamespace(action=SimpleNamespace(name="a0", run_name="run-1"))
+
+    monkeypatch.setattr(flyte, "load_interactive_ctx", load)
+    monkeypatch.setattr(controllers, "get_controller", lambda: "existing")
+    monkeypatch.chdir(project)
+    child.attach()
+    assert loaded == [child.context_path(root)]
+    child.notify_submitted("kid7")
+    assert child.recorded_children(root, "a0") == ["kid7"], "the record lives beside the context"
+    assert not child.children_path(project).exists()
+
+
+def test_find_base_without_a_context_anywhere_is_the_start(tmp_path):
+    assert child.find_base(tmp_path / "a") == tmp_path / "a"
+
+
+def test_cli_abort_from_a_project_folder_uses_the_workspace_root(caller, capsys, monkeypatch):
+    """The abort CLI finds the context and the record above it, as `attach` does."""
+    seen = []
+    monkeypatch.setattr(child, "attach", lambda base_dir=None: seen.append(base_dir))
+    child.context_path(caller.base).write_text("{}")
+    project = caller.base / "projects" / "demo"
+    project.mkdir(parents=True)
+    monkeypatch.chdir(project)
+    assert child.main(["abort", "--reason", "mine", "ab12"]) == 0
+    assert seen == [caller.base] and caller.aborted == [("run-1", "ab12", "mine")]
+
+
 def test_the_shell_cannot_abort_by_listing_or_name_a0():
     """Best effort (the Python client is reachable some other way), but the known shapes are denied."""
     from flyte_agent_factory import _auth

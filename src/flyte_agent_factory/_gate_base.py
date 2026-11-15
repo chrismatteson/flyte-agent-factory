@@ -7,7 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import _secret_env
+from . import _lane_shards, _secret_env
 
 
 class Status(enum.Enum):
@@ -28,6 +28,9 @@ class Status(enum.Enum):
     #: The check could not be run here (a toolchain that cannot be installed), so nothing is known: neither
     #: the project's failure nor a pass. The reason is in the output.
     NOT_RUN = "not run"
+    #: The test lanes could not be placed on the cluster (see `_capacity`): nothing is known about the
+    #: project's change, so it blocks review like a gap, but it is not the project's failure.
+    NO_CAPACITY = "no capacity"
     #: A FAIL the owner accepted in `waivers.toml`. It does not block.
     WAIVED = "WAIVED"
     #: The factory could not do its part of the check (it could not compute the project's changes), which is
@@ -43,7 +46,12 @@ class Status(enum.Enum):
 
     @property
     def blocks(self) -> bool:
-        return self in {Status.FAIL, Status.TOOL_UNAVAILABLE}
+        return self in {Status.FAIL, Status.TOOL_UNAVAILABLE, Status.NO_CAPACITY}
+
+    @property
+    def fails(self) -> bool:
+        """Blocks because of the project, as opposed to the cluster: `NO_CAPACITY` is reported separately."""
+        return self.blocks and self is not Status.NO_CAPACITY
 
     @property
     def holds(self) -> bool:
@@ -67,6 +75,23 @@ _MAX_TOOL_TIMEOUT = 7200
 
 
 _OUTPUT_TAIL = 12000
+
+
+_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
+
+
+def read_cpu_allowance() -> int:
+    """CPUs this process may really use: the cgroup quota (`cpu.max`) when lower than the affinity set.
+
+    `os.cpu_count()` is the node's, which is 16 on a 4-CPU-quota pod: pytest-xdist's `-n auto` would start
+    16 workers there. The launcher's reading (`_lane_shards`, standard library only), so both agree.
+    """
+    return _lane_shards.read_cpu_allowance(_CPU_MAX)
+
+
+def set_xdist_env(env: dict[str, str]) -> dict[str, str]:
+    """`env` with xdist's `auto` worker count set to `read_cpu_allowance()`, unless the caller chose one."""
+    return {"PYTEST_XDIST_AUTO_NUM_WORKERS": str(read_cpu_allowance()), **env}
 
 
 def _run(

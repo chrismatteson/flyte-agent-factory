@@ -235,6 +235,7 @@ env = flyte.TaskEnvironment(
         "_factory_recreate.py",
         "_factory_status.py",
         "_grants_cli.py",
+        "_lane_shards.py",
         # The gate launches this by name; importing it would also register its task environment.
         "_slow_lane.py",
     ),

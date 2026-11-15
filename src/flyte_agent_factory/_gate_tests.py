@@ -16,11 +16,12 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 from xml.etree import ElementTree
 
 import flyte_agent_factory
 
-from . import _gate_base, _gate_start, _secret_env, _vendored
+from . import _capacity, _gate_base, _gate_start, _secret_env, _vendored
 
 
 def _is_test(path: str) -> bool:
@@ -211,8 +212,10 @@ def read_junit(directory: Path, since: float, head: str) -> JunitRun | None:
         if any(f.stat().st_mtime < since for f in files):
             return None
         cases = [case for f in files for case in parse_junit(f)]
-        slow = ElementTree.parse(files[1]).getroot().find("testsuite")
-        seconds = float(slow.get("time", 0)) if slow is not None else 0.0
+        # A sharded lane has a `<testsuite>` per concurrent shard: the lane took as long as the longest.
+        root = ElementTree.parse(files[1]).getroot()
+        suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+        seconds = max((float(s.get("time", 0)) for s in suites), default=0.0)
     except (OSError, ValueError, ElementTree.ParseError):
         return None
     return JunitRun(cases, seconds)
@@ -234,6 +237,18 @@ def _changed_tests_pass(cases: list[JunitCase], relative: list[str]) -> bool:
     return True
 
 
+class LaneRun(NamedTuple):
+    """How one lane of the head run ended: its exit code, output and seconds."""
+
+    code: int
+    output: str
+    seconds: float
+    #: pytest is not installed in the project's environment.
+    no_pytest: bool
+    #: Why the lane was not run (`_capacity`), else "".
+    capacity: str
+
+
 @dataclasses.dataclass
 class HeadRun:
     """The head tree's full pytest run: exit code, output, and the tests (None when no junit came out)."""
@@ -242,11 +257,37 @@ class HeadRun:
     output: str
     cases: list[JunitCase] | None
     slow_seconds: float = 0.0
+    #: Why a lane was not run: the cluster had no room for it (`_capacity`). It was not run here either, so
+    #: the run is incomplete; its `code` is that of the lanes that did run.
+    capacity: str = ""
+
+
+def judge_shared_run(shared: HeadRun | None, code: int) -> _gate_base.Status:
+    """Return the status of a rule that judged the shared head run: NO_CAPACITY when it is only incomplete."""
+    if shared is not None and shared.capacity and not code:
+        return _gate_base.Status.NO_CAPACITY
+    return _gate_base.Status.from_exit(code)
 
 
 #: What `_slow_lane.main` exits with under `--no-local` when the lane did not run in a child action
 #: (`_slow_lane.NOT_RUN`, copied for the reason `SLOW_LANE_ENV` gives).
 _LANE_NOT_RUN = 75
+#: What it exits with when its children were placed but could not set up the lane
+#: (`_slow_lane.SETUP_UNAVAILABLE`).
+_LANE_SETUP_UNAVAILABLE = 78
+#: Set to "1", a lane the child actions could not run for a reason that is not capacity, setup or the change
+#: (no image looked up, a launcher that could not attach or crashed) runs on this pod, labelled `ran here`,
+#: even in a run. Off by default: on a 2- or 4-CPU pod the whole lane overruns the limits it was sent from.
+RUN_HERE_ENV = "AGENT_FACTORY_LANE_RUN_HERE"
+
+
+def _runs_here_when_not_run() -> bool:
+    """Return whether a lane the child actions could not run is to run here (`RUN_HERE_ENV`)."""
+    return os.environ.get(RUN_HERE_ENV) == "1"
+
+
+#: The launcher's plan, its first line: never the reason a lane did not run.
+_LANE_PLAN = re.compile(r"slow lane: \d+ test files, ")
 
 
 #: Prints `image=<the image this run's root action runs on>`. In the supervisor `FLYTE_INTERNAL_IMAGE` names
@@ -294,7 +335,6 @@ def _launcher_command(
     workspace's harness files are what the gate does not trust. `-P` keeps the project (the cwd) off
     `sys.path`, and `PYTHONPATH` names only the package's own directory.
     """
-    package_root = Path(flyte_agent_factory.__file__).resolve().parent.parent
     command = [
         sys.executable,
         "-P",
@@ -306,9 +346,17 @@ def _launcher_command(
         *(["--result", str(result)] if result is not None else []),
         *lane_args,
     ]
-    # The scrubbed environment is what `checks.sh` gets (`_session_setup._session_env`, same function), and
-    # it keeps what the launcher needs to attach to the run.
-    return command, _secret_env.child_env(PYTHONPATH=str(package_root), **{SLOW_LANE_ENV: "child"})
+    return command, _launcher_env()
+
+
+def _launcher_env() -> dict[str, str]:
+    """Return the environment the launcher runs in: scrubbed, with only the engine's package importable.
+
+    The scrubbed environment is what `checks.sh` gets (`_session_setup._session_env`, same function), and it
+    keeps what the launcher needs to attach to the run.
+    """
+    package_root = Path(flyte_agent_factory.__file__).resolve().parent.parent
+    return _secret_env.child_env(PYTHONPATH=str(package_root), **{SLOW_LANE_ENV: "child"})
 
 
 def write_lane_launcher(directory: Path, image: str = "") -> Path:
@@ -321,7 +369,10 @@ def write_lane_launcher(directory: Path, image: str = "") -> Path:
 
     `image` is the run's own image (`_run_image`): the child must use it, as `FLYTE_INTERNAL_IMAGE` here is
     the plain Flyte image without git. Without it the child would fail setup, so the launcher does not offer
-    the child and runs the lane here. Only the image name is written: no credential or other env value.
+    the child: in a run it exits `_LANE_NOT_RUN` without running the lane, and outside one it runs it here.
+    With an image, in a run, the launcher passes `--no-local`: if it cannot attach, the lane is not run here.
+    `RUN_HERE_ENV` set to "1" opts back into running such a lane here, labelled, as outside a run.
+    Only the image name is written: no credential or other env value.
     """
     package_root = Path(flyte_agent_factory.__file__).resolve().parent.parent
     code = (
@@ -330,13 +381,30 @@ def write_lane_launcher(directory: Path, image: str = "") -> Path:
     )
     directory.mkdir(parents=True, exist_ok=True)
     launcher = directory / "test-lane"
+    flags = ""
     if image:
         mode = f"AGENT_FACTORY_SLOW_LANE=child FLYTE_INTERNAL_IMAGE={shlex.quote(image)}"
         setup = ""
+        if os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") and not _runs_here_when_not_run():
+            # In a run, a launcher that then cannot attach (no controller in the interpreter, no run context)
+            # does not take the lane onto this pod either: it exits `_LANE_NOT_RUN`, as the gate's does.
+            flags = "--no-local "
+    elif os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") and not _runs_here_when_not_run():
+        # A run is attached, so this pod is the one whose limits a whole lane overran: the lane is not run
+        # here either. It ends with `_LANE_NOT_RUN`, which no pytest run exits with, and says why.
+        notice = "the run's image could not be looked up, so this lane is not run in a child action, nor here"
+        mode, setup = "", f"echo {shlex.quote('test lane: ' + notice)} >&2\nexit {_LANE_NOT_RUN}\n"
     else:
-        mode, setup = "", "unset AGENT_FACTORY_SLOW_LANE\n"
+        # No run to attach to (CI, a laptop), or `RUN_HERE_ENV` opted in: the lane runs here, not silently.
+        why = (
+            "the run's image could not be looked up"
+            if os.environ.get("FLYTE_INTERNAL_EXECUTION_ID")
+            else "no run to look the image up in"
+        )
+        notice = f"{why}, so this lane runs here, not in a child action"
+        mode, setup = "", f"unset AGENT_FACTORY_SLOW_LANE\necho {shlex.quote('test lane: ' + notice)} >&2\n"
     launcher.write_text(
-        f'#!/bin/sh\n{setup}{mode} exec {shlex.quote(sys.executable)} -P -c {shlex.quote(code)} "$@"\n'
+        f'#!/bin/sh\n{setup}{mode} exec {shlex.quote(sys.executable)} -P -c {shlex.quote(code)} {flags}"$@"\n'
     )
     launcher.chmod(0o755)
     return launcher
@@ -348,10 +416,16 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
     A project with a slow lane runs it beside the rest in a second process: the two share the CPUs but
     not a queue, so the Terraform and benchmark tests no longer run after everything else. With
     `child_lanes`, a project that has a slow lane, a `uv.lock` and `tests/` sends each lane to a child
-    action first (the deployed launcher), and runs here only a lane the launcher could not place.
+    action first (the deployed launcher). A lane the cluster had no room for is not run here: the run says
+    so in `capacity`. A launcher that failed for any other reason (a failed upload, a crash) fails its lane
+    without running it here. Only a run with no child lanes (none attached, no slow marker)
+    runs its lanes here, and the output says so; a run with no image looked up runs nothing. With
+    `RUN_HERE_ENV` set to "1", a lane not run for those other reasons runs here instead, labelled `ran here`.
     Returns None when pytest is not installed, which the rules report as an image defect themselves.
     """
-    env = _secret_env.child_env(PYTHONPATH=str(project / "src") + os.pathsep + str(project))
+    env = _gate_base.set_xdist_env(
+        _secret_env.child_env(PYTHONPATH=str(project / "src") + os.pathsep + str(project))
+    )
     python = project / ".venv/bin/python"
     interpreter = str(python) if python.is_file() else sys.executable
     pyproject = project / "pyproject.toml"
@@ -363,13 +437,22 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
     image = ""
     skipped_children = ""
     if in_children:
-        image = _run_image(project, _launcher_command(Path(), [])[1])
+        image = _run_image(project, _launcher_env())
+        if not image and os.environ.get("FLYTE_INTERNAL_EXECUTION_ID") and not _runs_here_when_not_run():
+            # A run is attached: its lanes are not run on this pod either (`write_lane_launcher` alike).
+            failure = "child lanes not run (the run's image could not be looked up); not run here either\n"
+            return HeadRun(_LANE_NOT_RUN, failure, None)
         if not image:
             in_children = False
-            skipped_children = "child lanes not used (the run's image could not be looked up): ran here\n"
+            why = (
+                "the run's image could not be looked up"
+                if os.environ.get("FLYTE_INTERNAL_EXECUTION_ID")
+                else "no run to look the image up in"
+            )
+            skipped_children = f"child lanes not used ({why}): ran here\n"
     with tempfile.TemporaryDirectory(prefix="factory-junit-") as scratch:
 
-        def lane(number: int) -> tuple[int, str, float, bool]:
+        def run_lane(number: int) -> LaneRun:
             started = time.monotonic()
             junit = Path(scratch) / f"{number}.xml"
             note = skipped_children
@@ -377,6 +460,8 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
                 result = Path(scratch) / f"{number}.json"
                 launcher, launcher_env = _launcher_command(junit, lanes[number], result)
                 launcher_env["FLYTE_INTERNAL_IMAGE"] = image
+                # Leaves the launcher time to report before `TEST_TIMEOUT` kills it.
+                launcher_env[_capacity.LANE_BUDGET_ENV] = str(_gate_base.TEST_TIMEOUT - 100)
                 try:
                     code, output = _gate_base._run(
                         launcher, project, env=launcher_env, timeout=_gate_base.TEST_TIMEOUT, tail=None
@@ -387,6 +472,20 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
                 # cannot distinguish a pytest failure from an import failure in the launcher.
                 try:
                     completion = json.loads(result.read_text())
+                    if (
+                        isinstance(completion, dict)
+                        and completion.get("completed") is False
+                        # A record with no outcome name is not one the launcher writes: it is invalid below.
+                        and completion.get("outcome") not in (None, "", "capacity")
+                    ):
+                        # The lane ended for a reason that is not the cluster's (the change made a shard slow
+                        # or big, or the environment cannot set up): the suite here would fail the same way.
+                        failure = f"child lane failed: {completion.get('reason') or 'a shard did not run'}"
+                        lane_code = completion.get("code")
+                        if type(lane_code) is not int or lane_code == 0:
+                            lane_code = 1
+                        note = f"{failure}; not run here either\n"
+                        return LaneRun(lane_code, note + output, time.monotonic() - started, False, "")
                     if (
                         not isinstance(completion, dict)
                         or completion.get("completed") is not True
@@ -399,37 +498,76 @@ def _run_head_pytest(project: Path, child_lanes: bool = False) -> HeadRun | None
                 except (OSError, ValueError):
                     evidence = "invalid pytest completion"
                 else:
-                    return completion["code"], output, time.monotonic() - started, False
-                # The launcher's own first `slow lane:` line is the reason (cannot attach, no capacity, setup
-                # failed); the Flyte controller logs ahead of it.
-                said = [line for line in output.splitlines() if line.startswith("slow lane:")]
+                    return LaneRun(completion["code"], output, time.monotonic() - started, False, "")
+                # No capacity is not a launcher failure: running the lane here is what overran the limits.
+                # The launcher ran nothing locally and wrote no result; its reason file says why.
+                reason = _capacity.read_reason(junit)
+                if code == _capacity.LANE_NO_CAPACITY or reason:
+                    reason = reason or f"no capacity: the launcher exited {code} without saying why"
+                    reason = f"{'fast' if lanes[number] == ['-m', 'not slow'] else 'slow'} lane: {reason}"
+                    note = f"child lane not run ({reason}); not run here either\n"
+                    return LaneRun(
+                        _capacity.LANE_NO_CAPACITY, note + output, time.monotonic() - started, False, reason
+                    )
+                said = [
+                    line
+                    for line in output.splitlines()
+                    if line.startswith("slow lane:") and not _LANE_PLAN.match(line)
+                ]
+                if code == _LANE_SETUP_UNAVAILABLE:
+                    # The children ran and could not build the lane: the environment, neither capacity nor
+                    # the change. The whole suite on this pod is what overran the limits, so it fails here.
+                    note = "child lane could not set up its environment; not run here either\n"
+                    return LaneRun(code, note + output, time.monotonic() - started, False, "")
+                # The launcher's own first `slow lane:` line after its plan is the reason (cannot attach,
+                # upload failed); the Flyte controller logs ahead of it.
                 reason = said[0] if said else (output.strip().splitlines() or ["no output"])[-1]
                 if code != _LANE_NOT_RUN:
                     reason = f"exit {code}: {reason}"
                     reason += f"; {evidence}"
-                note = f"child lane not run ({reason}): ran here\n"
-                # A failed launcher can leave a partial report; only the local run may supply evidence now.
+                # A lane runs on the session pod only when no run is attached. Here one is, so the suite on
+                # this pod is what overran the limits before: the lane fails without running, and it is
+                # neither capacity nor a pass. Keep the launcher's own code when it is a failure of its own.
+                # A failed launcher can leave a partial report: it is not evidence of any run.
                 junit.unlink(missing_ok=True)
+                if not _runs_here_when_not_run():
+                    note = f"child lane not run ({reason}); not run here either\n"
+                    lane_code = code if code not in range(6) else 1
+                    return LaneRun(lane_code, note + output, time.monotonic() - started, False, "")
+                # Opted in (`RUN_HERE_ENV`): the lane runs below, on this pod, and says so.
+                note = f"child lane not run ({reason}): ran here\n"
             command = [interpreter, "-m", "pytest", "-q", f"--junitxml={junit}", *lanes[number]]
             code, output = _gate_base._run(
                 command, project, env=env, timeout=_gate_base.TEST_TIMEOUT, tail=None
             )
-            return code, note + output, time.monotonic() - started, "No module named pytest" in output
+            return LaneRun(
+                code, note + output, time.monotonic() - started, "No module named pytest" in output, ""
+            )
 
         with concurrent.futures.ThreadPoolExecutor(len(lanes)) as pool:
-            runs = list(pool.map(lane, range(len(lanes))))
+            runs = list(pool.map(run_lane, range(len(lanes))))
         try:
             cases = [
                 case for number in range(len(lanes)) for case in parse_junit(Path(scratch) / f"{number}.xml")
             ]
         except (OSError, ElementTree.ParseError):
             cases = None
-    output = "\n".join(output for _, output, _, _ in runs)
-    if cases is None and any(missing for _, _, _, missing in runs):
+    output = "\n".join(run.output for run in runs)
+    if cases is None and any(run.no_pytest for run in runs):
         return None
-    # pytest exits 5 when a lane selects nothing, which is not a failure while the other lane ran.
-    codes = [code for code, _, _, _ in runs if code != 5]
-    return HeadRun(max(codes, default=5), output, cases, runs[1][2] if slow_lane else 0.0)
+    capacity = "; ".join(run.capacity for run in runs if run.capacity)
+    if capacity:
+        output += f"\n{_capacity.explain(capacity)}\n"
+    # pytest exits 5 when a lane selects nothing, which is not a failure while the other lane ran. A lane
+    # without capacity did not run at all: it says nothing, but `capacity` makes the whole run incomplete.
+    codes = [run.code for run in runs if run.code not in {5, _capacity.LANE_NO_CAPACITY}]
+    return HeadRun(
+        max(codes, default=0 if capacity else 5),
+        output,
+        cases,
+        runs[1].seconds if slow_lane else 0.0,
+        capacity,
+    )
 
 
 @dataclasses.dataclass
@@ -457,6 +595,8 @@ class GateWork:
     harness_faults: list[str] = dataclasses.field(default_factory=list)
     seconds: dict[str, float] = dataclasses.field(default_factory=lambda: {"gate": 0.0, "base": 0.0})
     slow_seconds: float = 0.0
+    #: Why the shared head run is incomplete for want of cluster capacity ("" when it is not).
+    capacity: str = ""
     pytest_reused: bool = False
     base_runs: int = 0
     base_hits: int = 0
@@ -481,6 +621,7 @@ class GateWork:
         if self.share_pytest:
             self._head = _run_head_pytest(project, self.child_lanes)
             self.slow_seconds = self._head.slow_seconds if self._head else 0.0
+            self.capacity = self._head.capacity if self._head else ""
         return self._head
 
 
@@ -632,7 +773,9 @@ def _judge_tests(
         )
     relative = [os.path.relpath(workspace / p, project) for p in tests]
     # The session wrote these tests: they run with what the session has, never the supervisor's secrets.
-    env = _secret_env.child_env(PYTHONPATH=str(project / "src") + os.pathsep + str(project))
+    env = _gate_base.set_xdist_env(
+        _secret_env.child_env(PYTHONPATH=str(project / "src") + os.pathsep + str(project))
+    )
     python = project / ".venv/bin/python"
     interpreter = str(python) if python.is_file() else sys.executable
     command = [interpreter, "-m", "pytest", "-q", *relative]
@@ -647,6 +790,9 @@ def _judge_tests(
     # The head tree's tests may already have run (checks.sh, or the one run a pytest rule shares): the changed
     # tests' outcomes are read from it rather than run again.
     shared = work.head_pytest(project) if work is not None and python_tests else None
+    if shared is not None and shared.capacity and not shared.code:
+        # Running the changed tests here is not a substitute for the suite, and was what overran the limits.
+        return _gate_base.Status.NO_CAPACITY, _capacity.explain(shared.capacity)
     if shared is None or shared.cases is None or not _changed_tests_pass(shared.cases, relative):
         code, output = _gate_base._run(
             command, project if python_tests else workspace, env=env, timeout=_gate_base.TEST_TIMEOUT
@@ -662,7 +808,9 @@ def _judge_tests(
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(workspace / path, target)
     base_project = _gate_base.project_dir(start, name, layout, folder)
-    env = _secret_env.child_env(PYTHONPATH=str(base_project / "src") + os.pathsep + str(base_project))
+    env = _gate_base.set_xdist_env(
+        _secret_env.child_env(PYTHONPATH=str(base_project / "src") + os.pathsep + str(base_project))
+    )
     base_command = command
     if not python_tests:
         # The head runner is test infrastructure; its relative paths must resolve inside base.

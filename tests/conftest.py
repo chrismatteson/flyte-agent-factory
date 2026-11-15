@@ -14,8 +14,13 @@ from tests._git import git
 sys.modules.setdefault("tests.conftest", sys.modules[__name__])
 
 
-def pytest_xdist_auto_num_workers(config: pytest.Config | None) -> int:
-    """Return the `-n auto` worker count: the CPUs the cgroup quota grants, not those the node has."""
+def pytest_xdist_auto_num_workers(config: pytest.Config | None) -> int | None:
+    """Return the `-n auto` worker count: the CPUs the cgroup quota grants, not those the node has.
+
+    A set `PYTEST_XDIST_AUTO_NUM_WORKERS` wins, as in xdist's own default.
+    """
+    if os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS"):
+        return None
     return _cpu_budget.cpus(visible=_cpu_budget.visible())
 
 
@@ -28,6 +33,7 @@ if str(SRC) not in sys.path:
 # Subprocesses (`sys.executable -c ...`) get it too: pytest's `pythonpath` setting only changes this
 # process, and a slot pod's PYTHONPATH points at the deployed copy of the package.
 os.environ["PYTHONPATH"] = os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])])
+
 
 # The deployment profile the whole suite runs against, selected before any module that reads
 # it at import. Neutral placeholder values (the owner's real profile is private); the profile
@@ -176,6 +182,8 @@ def clean_env(monkeypatch):
     # A project pod's own Union key: `_auth.own_client_id` would hand the live client id to the tests.
     for var in ("_UNION_EAGER_API_KEY", "EAGER_API_KEY"):
         monkeypatch.delenv(var, raising=False)
+    # The pod's own run: with it, the checks step looks up the run's image on the live cluster.
+    monkeypatch.delenv("FLYTE_INTERNAL_EXECUTION_ID", raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -1,0 +1,28 @@
+scenario: gate-64cpu (gate, 64-CPU shards)
+measured: 2026-11-14T16:19:13Z
+commit: c0926fa6868f7e63b07344881276dc859727ddfc (code last changed at 80c25bc5335695834c93e4de0eab7433085030c1)
+run: small-node-checks-w-3-0-2gj89m
+limit: 1200 s
+wall: 331 s
+outcome: NO_CAPACITY (exit 0)
+junit cases: 0, failed: 0
+capacity: fast lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand; slow lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand
+ran here (session pod): no
+child actions launched: 1hc8vgf1x239tmo1y1xobafw2 3cajw5vv6ay9dz68hz90256pz 5udktrwg29stxlz10y5kywx6d ei9gnah6r9ubl2trlr1n7nypr
+
+--- lane verdict and shard lines ---
+child lane not run (fast lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand); not run here either
+=== lane verdict: exit 69 ===
+shard 1/1 (on-demand, child action ?): did not run: not placed within 2m spot + 3m on-demand
+slow lane: shard 1/1: no spot capacity within 0:02:00
+slow lane: shard 1/1: no on-demand capacity within 0:03:00
+slow lane: shard 1/1 (tests/fixtures/bench/docskit_ref/tests/test_docskit.py tests/fixtures/bench/docskit_start/tests/test_docskit.py tests/fixtures/bench/expiry_ref/tests/test_import.py and 193 more) did not run: not placed within 2m spot + 3m on-demand
+slow lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand; the lane did not run to the end, and is not run here
+child lane not run (slow lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand); not run here either
+=== lane verdict: exit 69 ===
+shard 1/1 (on-demand, child action ?): did not run: not placed within 2m spot + 3m on-demand
+slow lane: shard 1/1: no spot capacity within 0:02:00
+slow lane: shard 1/1: no on-demand capacity within 0:03:00
+slow lane: shard 1/1 (tests/fixtures/bench/docskit_ref/tests/test_docskit.py tests/fixtures/bench/docskit_start/tests/test_docskit.py tests/fixtures/bench/expiry_ref/tests/test_import.py and 193 more) did not run: not placed within 2m spot + 3m on-demand
+slow lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand; the lane did not run to the end, and is not run here
+fast lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand; slow lane: no capacity: 1 of 1 shards (64 CPUs) not placed within 2m spot + 3m on-demand. The test lanes could not be placed on the cluster; this is not a failure of the project's change, and the full suite ...

@@ -13,9 +13,11 @@ from typing import Any
 import pytest
 
 from flyte_agent_factory import (
+    _capacity,
     _gate_base,
     _gate_tests,
     _gates,
+    _lane_shards,
     _session_config,
     _supervise_support,
     _timeline,
@@ -305,6 +307,46 @@ def test_checks_sh_runs_both_lanes_at_once_and_leaves_their_junit(tmp_path):
     assert [c.split()[3:5] for c in calls if "ruff" in c] == [["ruff", "check"], ["ruff", "format"]]
 
 
+def test_checks_sh_ends_with_each_lanes_verdict_whichever_lane_finished_last(tmp_path):
+    """A failed fast lane's reason is in the last 12 KB (all the supervisor keeps) after a long slow lane."""
+    repo = Path(__file__).resolve().parents[1]
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"not slow"* ]]; then\n'
+        "  echo 'FAILED tests/test_a.py::t - AssertionError'\n"
+        "  echo '=== 1 failed, 9 passed in 2.00s ==='; exit 1\n"
+        "fi\n"
+        'if [[ "$*" == *pytest* ]]; then\n'
+        "  sleep 1; head -c 40000 /dev/zero | tr '\\0' x; echo; echo '=== 7 passed in 9.00s ==='\n"
+        "fi\n"
+    )
+    uv.chmod(0o755)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("AGENT_FACTORY_SLOW_LANE", _gate_tests.PYTEST_JUNIT_ENV)
+    }
+    env.update(PATH=f"{uv.parent}{os.pathsep}{os.environ['PATH']}", AGENT_FACTORY_RUN_SLOW="1")
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 1
+    tail = run.stdout[-12000:]
+    assert tail.index("=== factory-improvement/checks.sh: fast lane exit 1 ===") < tail.index(
+        "=== factory-improvement/checks.sh: slow lane exit 0 ==="
+    )
+    assert "FAILED tests/test_a.py::t - AssertionError\n=== 1 failed, 9 passed in 2.00s ===" in tail
+    assert tail.endswith(
+        "=== factory-improvement/checks.sh: slow lane exit 0 ===\n=== 7 passed in 9.00s ===\n"
+    )
+
+
 def test_checks_sh_leaves_the_slow_lane_to_ci_unless_asked(tmp_path):
     """By default only `not slow` runs here: the benchmark lane would hold a 4-CPU pod past its limit."""
     repo = Path(__file__).resolve().parents[1]
@@ -473,8 +515,8 @@ def test_every_package_module_the_slow_lane_launcher_imports_is_test_harness():
 def test_checks_sh_sends_both_lanes_through_the_launcher_when_asked_for_child_actions(tmp_path):
     """With AGENT_FACTORY_SLOW_LANE=child the fast lane is a child action too.
 
-    Each lane has its own marker. The fast lane, the dearer one on a 4-CPU pod, goes on-demand when spot has
-    no room and leaves the fallback to checks.sh; the slow lane tries spot, then the launcher runs it here.
+    Each lane has its own marker. The fast lane, the dearer one on a 4-CPU pod, is asked with --no-local, so
+    that running it here when there is no run to attach to is checks.sh's decision.
     """
     repo = Path(__file__).resolve().parents[1]
     log = tmp_path / "uv.log"
@@ -540,8 +582,69 @@ def test_checks_sh_runs_the_slow_lane_here_when_asked_and_keeps_the_ask_from_the
     assert uv_calls and all(c.endswith(" here=") for c in uv_calls), uv_calls
 
 
-def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_capacity(tmp_path):
-    """A launcher that cannot place the fast lane (exit 75, --no-local) is asked twice; then it runs here."""
+def _checks_sh_with_a_launcher_that_cannot_send_the_lane(tmp_path: Path, **env_vars: str):
+    """Run checks.sh with a launcher that exits 75 when told not to run here; return the run and calls."""
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n')
+    uv.chmod(0o755)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    lane = tmp_path / "test-lane"
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\n[[ " $* " != *" --no-local "* ]] || exit 75\n')
+    lane.chmod(0o755)
+    env = {
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k not in {"FLYTE_INTERNAL_EXECUTION_ID", _gate_tests.RUN_HERE_ENV}
+        },
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.PYTEST_JUNIT_ENV: str(junit),
+        _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
+        **env_vars,
+    }
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return run, log.read_text().splitlines(), junit
+
+
+def test_checks_sh_does_not_run_the_fast_lane_here_in_a_run_when_the_launcher_could_not_send_it(tmp_path):
+    """In a run, exit 75 twice fails the checks without running the lane on this pod, and says why."""
+    run, calls, junit = _checks_sh_with_a_launcher_that_cannot_send_the_lane(
+        tmp_path, FLYTE_INTERNAL_EXECUTION_ID="run-1"
+    )
+    assert run.returncode == 1
+    fast = f"lane --on-demand --no-local --junit {junit}/fast.xml -m not slow"
+    assert [c for c in calls if c.startswith("lane ") and "-m not slow" in c] == [fast, fast]
+    assert not [c for c in calls if "-m not slow" in c and "-m pytest" in c], "the fast lane ran here"
+    assert "fast lane: not run here either" in run.stderr and "running here" not in run.stderr
+
+
+def test_checks_sh_runs_the_fast_lane_here_in_a_run_when_opted_in(tmp_path):
+    run, calls, junit = _checks_sh_with_a_launcher_that_cannot_send_the_lane(
+        tmp_path, FLYTE_INTERNAL_EXECUTION_ID="run-1", **{_gate_tests.RUN_HERE_ENV: "1"}
+    )
+    assert run.returncode == 0, run.stderr
+    here = [c for c in calls if "-m pytest" in c]
+    assert len(here) == 1 and f"-m not slow --junitxml {junit}/fast.xml" in here[0], here
+    assert "fast lane: running here, the launcher could not send it to a child action" in run.stderr
+
+
+def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_a_run_to_attach_to(tmp_path):
+    """A launcher with no run to attach to (exit 75, --no-local) is asked twice; then the fast lane runs here.
+
+    In a run, a lane without capacity exits 69 instead, and is never run here: see
+    test_checks_sh_fails_without_running_here_when_the_fast_lane_finds_no_capacity.
+    """
     repo = Path(__file__).resolve().parents[1]
     log = tmp_path / "uv.log"
     uv = tmp_path / "bin" / "uv"
@@ -555,7 +658,12 @@ def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_capacity(tmp
     lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\n[[ " $* " != *" --no-local "* ]] || exit 75\n')
     lane.chmod(0o755)
     env = {
-        **os.environ,
+        # No run: in one, a lane the launcher could not send is not run here (the test above).
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k not in {"FLYTE_INTERNAL_EXECUTION_ID", _gate_tests.RUN_HERE_ENV}
+        },
         "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
         _gate_tests.PYTEST_JUNIT_ENV: str(junit),
         _gate_tests.SLOW_LANE_ENV: "child",
@@ -574,7 +682,7 @@ def test_checks_sh_runs_the_fast_lane_here_after_two_rounds_without_capacity(tmp
     assert [c for c in calls if c.startswith("lane ") and "-m not slow" in c] == [fast, fast]
     here = [c for c in calls if "-m pytest" in c]
     assert len(here) == 1 and f"-m not slow --junitxml {junit}/fast.xml" in here[0], here
-    assert "fast lane: running here, the child action could not be placed" in run.stderr
+    assert "fast lane: running here, the launcher could not send it to a child action" in run.stderr
 
 
 def test_checks_sh_fails_when_the_fast_lane_fails_in_its_child_action(tmp_path):
@@ -599,6 +707,37 @@ def test_checks_sh_fails_when_the_fast_lane_fails_in_its_child_action(tmp_path):
     calls = log.read_text().splitlines()
     assert len([c for c in calls if c.startswith("lane ") and "-m not slow" in c]) == 1
     assert not [c for c in calls if "-m not slow" in c and "-m pytest" in c]
+
+
+def test_checks_sh_fails_without_running_here_when_the_fast_lane_finds_no_capacity(tmp_path):
+    """A launcher whose shards found no room exits 69: checks fail; the lane is not retried or run here."""
+    repo = Path(__file__).resolve().parents[1]
+    log = tmp_path / "uv.log"
+    uv = tmp_path / "bin" / "uv"
+    uv.parent.mkdir()
+    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n')
+    uv.chmod(0o755)
+    lane = tmp_path / "test-lane"
+    lane.write_text(f'#!/bin/bash\necho "lane $*" >> {log}\nexit {_capacity.LANE_NO_CAPACITY}\n')
+    lane.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{uv.parent}{os.pathsep}{os.environ['PATH']}",
+        _gate_tests.SLOW_LANE_ENV: "child",
+        _gate_tests.TEST_LANE_ENV: str(lane),
+    }
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 1
+    calls = log.read_text().splitlines()
+    assert len([c for c in calls if c.startswith("lane ") and "-m not slow" in c]) == 1
+    assert not [c for c in calls if "-m pytest" in c], "a lane ran here"
+    assert "running here" not in run.stderr
 
 
 def test_checks_sh_runs_both_lanes_here_when_no_launcher_is_given(tmp_path):
@@ -645,6 +784,8 @@ class LaneProcesses(list[dict[str, Any]]):
     #: What the run-image lookup prints and exits with; its calls are kept apart from the lanes'.
     image_lookup: tuple[int, str] = (0, "DEBUG controller noise\nimage=registry.example/agent:run-image\n")
     lookups: list[dict[str, Any]]
+    #: The lanes `no_capacity_lanes` lets run; the others have no capacity.
+    full: set[str]
 
 
 @pytest.fixture
@@ -702,16 +843,18 @@ def test_child_lanes_send_both_lanes_through_the_deployed_launcher(tmp_path, lan
     assert sorted(lanes) == ["not slow", "slow"]
 
 
-def test_a_lane_the_launcher_did_not_run_runs_here_and_says_why(tmp_path, lane_processes):
+def test_a_lane_the_launcher_did_not_run_fails_without_running_here_and_says_why(tmp_path, lane_processes):
     project = _child_lane_project(tmp_path)
     lane_processes.launcher_code = _SLOW_NOT_RUN
 
     run = _gate_tests._run_head_pytest(project, child_lanes=True)
 
-    assert run is not None and run.code == 0 and run.cases is not None and len(run.cases) == 2
-    local = [c["args"] for c in lane_processes if "flyte_agent_factory._slow_lane" not in c["args"]]
-    assert len(local) == 2 and all(a[1:3] == ["-m", "pytest"] for a in local)
+    # Changed requirement (#209): a run is attached, so a lane the launcher could not run is not run here.
+    assert run is not None and run.code == _SLOW_NOT_RUN and run.cases is None and not run.capacity
+    assert _local_pytests(lane_processes) == []
     assert run.output.count("child lane not run (") == 2 and "no spot capacity" in run.output
+    assert run.output.count("; not run here either") == 2 and "ran here" not in run.output
+    assert _gate_tests.judge_shared_run(run, run.code) is _gate_base.Status.FAIL
 
 
 def test_the_reason_is_the_launchers_own_line_not_the_controller_log_ahead_of_it(tmp_path, lane_processes):
@@ -725,9 +868,19 @@ def test_the_reason_is_the_launchers_own_line_not_the_controller_log_ahead_of_it
 
     run = _gate_tests._run_head_pytest(project, child_lanes=True)
 
-    assert run is not None
+    assert run is not None and _local_pytests(lane_processes) == []
     assert run.output.count("child lane not run (slow lane: running locally, cannot attach") == 2
-    assert "DEBUG" not in run.output
+    # The launcher's own output is kept for the reader now that nothing runs here in its place, but the
+    # reason is exactly its own first line: none of the controller's log.
+    reasons = [line for line in run.output.splitlines() if line.startswith("child lane not run")]
+    assert (
+        reasons
+        == [
+            "child lane not run (slow lane: running locally, cannot attach to a Flyte run (no run context)); "
+            "not run here either"
+        ]
+        * 2
+    )
 
 
 def test_child_lanes_run_on_the_runs_own_image_looked_up_once(tmp_path, lane_processes):
@@ -744,15 +897,28 @@ def test_child_lanes_run_on_the_runs_own_image_looked_up_once(tmp_path, lane_pro
     ] * 2
 
 
-def test_without_the_runs_image_both_lanes_run_here_and_say_why(tmp_path, lane_processes):
+def test_in_a_run_without_its_image_neither_lane_runs_here_and_the_run_says_why(tmp_path, lane_processes):
     project = _child_lane_project(tmp_path)
     lane_processes.image_lookup = (1, "FileNotFoundError: No run context file found\n")
 
     run = _gate_tests._run_head_pytest(project, child_lanes=True)
 
+    # A run is attached: running the suite on this pod is what overran its limits (#209).
+    assert run is not None and run.code == _gate_tests._LANE_NOT_RUN and run.cases is None
+    assert not list(lane_processes) and not run.capacity
+    assert "the run's image could not be looked up); not run here either" in run.output
+
+
+def test_outside_a_run_both_lanes_run_here_and_say_why(tmp_path, monkeypatch, lane_processes):
+    project = _child_lane_project(tmp_path)
+    monkeypatch.delenv("FLYTE_INTERNAL_EXECUTION_ID", raising=False)
+
+    run = _gate_tests._run_head_pytest(project, child_lanes=True)
+
     assert run is not None and run.code == 0
     assert lane_processes and all("flyte_agent_factory._slow_lane" not in c["args"] for c in lane_processes)
-    assert "child lanes not used (the run's image could not be looked up)" in run.output
+    assert not lane_processes.lookups
+    assert "child lanes not used (no run to look the image up in): ran here" in run.output
 
 
 def test_a_launcher_that_reports_pytests_own_result_is_used_as_is(tmp_path, lane_processes):
@@ -815,7 +981,7 @@ def test_the_pre_review_runs_the_gates_own_pytest_in_child_lanes():
         (0, "launcher exited without reporting\n"),
     ],
 )
-def test_launcher_infrastructure_failure_runs_local_pytest(
+def test_launcher_infrastructure_failure_fails_the_lane_without_running_it_here(
     tmp_path, monkeypatch, lane_processes, code, output
 ):
     fake_run = _gate_base._run
@@ -828,14 +994,53 @@ def test_launcher_infrastructure_failure_runs_local_pytest(
     monkeypatch.setattr(_gate_base, "_run", run)
     result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
 
-    assert result is not None and result.code == 0
-    assert result.cases is not None and {case.name for case in result.cases} == {"fast", "slow"}
-    assert len(lane_processes) == 2
+    # Changed requirement (#209): with a run attached no lane runs on the session pod, whatever happened.
+    assert result is not None and result.cases is None and not result.capacity
+    assert result.code == (code if code not in range(6) else 1)
+    assert _local_pytests(lane_processes) == []
     assert result.output.count("child lane not run (") == 2
+    assert result.output.count("; not run here either") == 2 and "ran here" not in result.output
     assert output.strip().splitlines()[-1] in result.output
+    # Never PASS and never "no capacity" (127 keeps its own status: the launcher could not start).
+    assert _gate_tests.judge_shared_run(result, result.code).fails
 
 
-def test_launcher_os_error_runs_local_pytest(tmp_path, monkeypatch, lane_processes):
+def test_a_failed_upload_fails_the_lane_without_running_it_here(tmp_path, monkeypatch, lane_processes):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return 74, "slow lane: upload failed: connection reset\n"
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 74 and result.cases is None and not result.capacity
+    assert _local_pytests(lane_processes) == []
+    assert "(exit 74: slow lane: upload failed: connection reset" in result.output
+    assert result.output.count("; not run here either") == 2
+
+
+def test_a_launcher_that_exits_1_without_a_completion_file_fails_the_lane_without_running_it_here(
+    tmp_path, monkeypatch, lane_processes
+):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return 1, "launcher failed\n"
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 1 and result.cases is None and not result.capacity
+    assert _local_pytests(lane_processes) == []
+    assert "missing pytest completion" in result.output and "not run here either" in result.output
+
+
+def test_launcher_os_error_fails_the_lane_without_running_it_here(tmp_path, monkeypatch, lane_processes):
     fake_run = _gate_base._run
 
     def run(args, cwd, **kw):
@@ -846,13 +1051,15 @@ def test_launcher_os_error_runs_local_pytest(tmp_path, monkeypatch, lane_process
     monkeypatch.setattr(_gate_base, "_run", run)
     result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
 
-    assert result is not None and result.code == 0 and result.cases is not None
-    assert len(lane_processes) == 2
-    assert "launcher cannot execute" in result.output
+    assert result is not None and result.code == 127 and result.cases is None
+    assert _local_pytests(lane_processes) == []
+    assert "launcher cannot execute" in result.output and "not run here either" in result.output
 
 
 @pytest.mark.parametrize("report", ["", "<broken", "<testsuites/>"])
-def test_launcher_without_pytest_evidence_runs_here(tmp_path, monkeypatch, lane_processes, report):
+def test_launcher_without_pytest_evidence_fails_the_lane_without_running_it_here(
+    tmp_path, monkeypatch, lane_processes, report
+):
     fake_run = _gate_base._run
 
     def run(args, cwd, **kw):
@@ -864,9 +1071,9 @@ def test_launcher_without_pytest_evidence_runs_here(tmp_path, monkeypatch, lane_
     monkeypatch.setattr(_gate_base, "_run", run)
     result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
 
-    assert result is not None and result.code == 0
-    assert result.cases is not None and {case.name for case in result.cases} == {"fast", "slow"}
-    assert len(lane_processes) == 2
+    assert result is not None and result.code == 1 and result.cases is None
+    assert _local_pytests(lane_processes) == []
+    assert "not run here either" in result.output
 
 
 @pytest.mark.parametrize("code", range(6))
@@ -896,24 +1103,21 @@ def test_child_pytest_results_and_junit_are_preserved(tmp_path, monkeypatch, lan
     assert "child pytest output" in result.output and "ran here" not in result.output
 
 
-@pytest.mark.parametrize("code", [0, 1, 5])
-def test_local_fallback_uses_only_its_own_result_and_report(tmp_path, monkeypatch, lane_processes, code):
+def test_a_failed_launchers_partial_report_is_not_evidence(tmp_path, monkeypatch, lane_processes):
     fake_run = _gate_base._run
 
     def run(args, cwd, **kw):
         if "flyte_agent_factory._slow_lane" in args:
             _junit_for(args[args.index("--junit") + 1], "stale child")
             return 70, "launcher infrastructure failed\n"
-        if "pytest" in args:
-            return code, "local pytest output\n"
         return fake_run(args, cwd, **kw)
 
     monkeypatch.setattr(_gate_base, "_run", run)
     result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
 
-    assert result is not None and result.code == code
-    assert result.cases is None
-    assert "local pytest output" in result.output and "launcher infrastructure failed" in result.output
+    assert result is not None and result.code == 70 and result.cases is None
+    assert _local_pytests(lane_processes) == []
+    assert "launcher infrastructure failed" in result.output
 
 
 def test_child_lane_with_no_selected_tests_preserves_empty_junit(tmp_path, monkeypatch, lane_processes):
@@ -977,7 +1181,9 @@ def test_completed_child_without_junit_keeps_pytest_code(
         '{"completed": true, "code": -1}',
     ],
 )
-def test_invalid_child_completion_falls_back_even_with_junit(tmp_path, monkeypatch, lane_processes, record):
+def test_invalid_child_completion_fails_the_lane_even_with_junit(
+    tmp_path, monkeypatch, lane_processes, record
+):
     fake_run = _gate_base._run
 
     def run(args, cwd, **kw):
@@ -990,10 +1196,9 @@ def test_invalid_child_completion_falls_back_even_with_junit(tmp_path, monkeypat
     monkeypatch.setattr(_gate_base, "_run", run)
     result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
 
-    assert result is not None and result.code == 0
-    assert result.cases is not None and {c.name for c in result.cases} == {"fast", "slow"}
-    assert len(lane_processes) == 2
-    assert "invalid pytest completion" in result.output
+    assert result is not None and result.code == 1 and result.cases is None
+    assert _local_pytests(lane_processes) == []
+    assert "invalid pytest completion" in result.output and "not run here either" in result.output
 
 
 @pytest.mark.parametrize(
@@ -1047,3 +1252,647 @@ def test_real_pytest_failure_without_junit_is_not_rerun(tmp_path, monkeypatch, l
     assert result is not None and result.code == 1 and result.cases is None
     assert "1 failed" in result.output and "ran here" not in result.output
     assert not lane_processes
+
+
+# --- no capacity: a lane the cluster had no room for is not run here, and is not a failure ---
+
+
+_LANE_NO_CAPACITY = 69
+_CAPACITY_REASON = "no capacity: 2 of 5 shards (2 CPUs) not placed within 2m spot + 3m on-demand"
+
+
+@pytest.fixture
+def no_capacity_lanes(monkeypatch: pytest.MonkeyPatch, lane_processes: LaneProcesses) -> LaneProcesses:
+    """Launchers exit 69 with a `.capacity` reason and no result; `lane_processes.full` names the lanes."""
+    lane_processes.full = {"not slow", "slow"}
+    fake = _gate_base._run
+
+    def run(args: list[str], cwd: Path, **kw: Any) -> tuple[int, str]:
+        if "flyte_agent_factory._slow_lane" in args:
+            lane = args[args.index("-m", 4) + 1] if "-m" in args[4:] else "slow"
+            if lane in lane_processes.full:
+                lane_processes.append({"args": args, "cwd": cwd, "env": kw.get("env") or {}})
+                junit = args[args.index("--junit") + 1]
+                Path(junit + ".capacity").write_text(_CAPACITY_REASON + "\n")
+                return _LANE_NO_CAPACITY, "slow lane: gave up\n"
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    return lane_processes
+
+
+def _local_pytests(calls: LaneProcesses) -> list[dict[str, Any]]:
+    return [c for c in calls if "flyte_agent_factory._slow_lane" not in c["args"]]
+
+
+def test_a_lane_without_capacity_is_not_run_here(tmp_path, no_capacity_lanes):
+    run = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert run is not None and _local_pytests(no_capacity_lanes) == []
+    assert len(no_capacity_lanes) == 2
+    assert _CAPACITY_REASON in run.capacity and run.cases is None and run.code == 0
+    assert "ran here" not in run.output and "not a failure of the project's change" in run.output
+
+
+def test_only_the_lane_without_capacity_is_missing_from_the_run(tmp_path, no_capacity_lanes):
+    no_capacity_lanes.full = {"slow"}
+
+    run = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert run is not None and _local_pytests(no_capacity_lanes) == []
+    assert _CAPACITY_REASON in run.capacity and run.code == 0
+
+
+def test_a_real_failure_in_the_other_lane_is_still_a_failure(tmp_path, no_capacity_lanes):
+    no_capacity_lanes.full = {"slow"}
+    no_capacity_lanes.launcher_code = 1
+
+    run = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert run is not None and run.code == 1 and run.capacity
+    assert _gate_tests.judge_shared_run(run, run.code) is _gate_base.Status.FAIL
+
+
+def test_exit_69_without_a_reason_file_is_still_no_capacity(tmp_path, monkeypatch, lane_processes):
+    fake = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return _LANE_NO_CAPACITY, ""
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and "exited 69" in result.capacity and _local_pytests(lane_processes) == []
+
+
+def test_a_reason_file_without_a_result_is_no_capacity_whatever_the_exit(
+    tmp_path, monkeypatch, lane_processes
+):
+    fake = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            Path(args[args.index("--junit") + 1] + ".capacity").write_text("no capacity: none\n")
+            return 1, "killed\n"
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and "no capacity: none" in result.capacity
+    assert _local_pytests(lane_processes) == []
+
+
+def test_the_launcher_gets_a_wall_budget_below_the_test_timeout(tmp_path, lane_processes):
+    _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    budgets = {c["env"]["AGENT_FACTORY_LANE_BUDGET_S"] for c in lane_processes}
+    assert budgets == {str(_gate_base.TEST_TIMEOUT - 100)} and _gate_base.TEST_TIMEOUT == 1200
+
+
+def test_local_pytest_is_limited_to_the_cpu_allowance(tmp_path, monkeypatch, lane_processes):
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.setattr(_gate_base, "read_cpu_allowance", lambda: 4)
+
+    _gate_tests._run_head_pytest(_child_lane_project(tmp_path))
+
+    assert [c["env"]["PYTEST_XDIST_AUTO_NUM_WORKERS"] for c in lane_processes] == ["4", "4"]
+
+
+def test_a_chosen_xdist_worker_count_is_kept(monkeypatch):
+    monkeypatch.setattr(_gate_base, "read_cpu_allowance", lambda: 4)
+
+    assert (
+        _gate_base.set_xdist_env({"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"})["PYTEST_XDIST_AUTO_NUM_WORKERS"]
+        == "2"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cpu_max", "expected"),
+    [
+        ("400000 100000\n", 4),
+        ("max 100000\n", None),
+        ("150000 100000\n", 2),
+        ("10000 100000\n", 1),
+        ("x y\n", None),
+    ],
+)
+def test_cpu_allowance_reads_the_cgroup_quota(tmp_path, monkeypatch, cpu_max, expected):
+    (tmp_path / "cpu.max").write_text(cpu_max)
+    monkeypatch.setattr(_gate_base, "_CPU_MAX", tmp_path / "cpu.max")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)))
+
+    assert _gate_base.read_cpu_allowance() == (expected or 16)
+
+
+def test_the_gate_and_the_launcher_count_a_half_cpu_quota_alike(tmp_path, monkeypatch):
+    """One reading of the quota: 2.5 CPUs is 3 workers in the gate as in the lane's own local run."""
+    (tmp_path / "cpu.max").write_text("250000 100000\n")
+    monkeypatch.setattr(_gate_base, "_CPU_MAX", tmp_path / "cpu.max")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)))
+
+    assert _gate_base.read_cpu_allowance() == _lane_shards.read_cpu_allowance(tmp_path / "cpu.max") == 3
+
+
+def test_without_a_cgroup_file_the_affinity_set_is_the_allowance(tmp_path, monkeypatch):
+    monkeypatch.setattr(_gate_base, "_CPU_MAX", tmp_path / "missing")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2})
+
+    assert _gate_base.read_cpu_allowance() == 3
+
+
+def capacity_work() -> _gate_tests.GateWork:
+    """A gate whose shared head run found no room for its lanes."""
+    work = _gate_tests.GateWork(share_pytest=True)
+    work._head = _gate_tests.HeadRun(0, _capacity.explain(_CAPACITY_REASON), None, 0.0, _CAPACITY_REASON)
+    work._head_done = True
+    return work
+
+
+def test_pr_005_and_eng_004_report_no_capacity_and_it_blocks(workspace, pytest_runs):
+    work = capacity_work()
+    problem = gate(workspace, work)
+
+    results = json.loads((workspace / ".claude-flyte/app/standards-results.json").read_text())
+    by_rule = {r["rule"]: r for r in results}
+    for rule in ("TESTS-1", "factory:fail-to-pass"):
+        assert by_rule[rule]["status"] == "no capacity", by_rule[rule]
+        assert _CAPACITY_REASON in by_rule[rule]["output"]
+    assert (
+        "not a failure of the project's change"
+        in by_rule["TESTS-1"]["output"] + by_rule["factory:fail-to-pass"]["output"]
+    )
+    assert _gate_base.Status.NO_CAPACITY.blocks and not _gate_base.Status.NO_CAPACITY.fails
+    head = work.head_pytest(workspace / "app")
+    assert problem == "" and head is not None and head.capacity  # the supervisor reads work.capacity
+    assert on_head(pytest_runs, workspace) == []  # the changed tests were not run here either
+
+
+def test_gate_work_exposes_the_capacity_of_its_head_run(tmp_path, lane_processes, monkeypatch):
+    work = _gate_tests.GateWork(share_pytest=True, child_lanes=True)
+    monkeypatch.setattr(
+        _gate_tests,
+        "_run_head_pytest",
+        lambda project, child_lanes=False: _gate_tests.HeadRun(0, "", None, 0.0, "no capacity: x"),
+    )
+
+    work.head_pytest(tmp_path)
+
+    assert work.capacity == "no capacity: x"
+
+
+def test_a_lane_whose_change_ran_out_is_a_failure_and_is_not_run_here(tmp_path, monkeypatch, lane_processes):
+    """A shard that ran out of its own time is the change: running the suite here would only time out."""
+    fake = _gate_base._run
+    reason = "shard 2/5 (tests/test_b.py) ran out of its 960s in its own 2-CPU child"
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            record = {"completed": False, "outcome": "ran out", "code": 1, "reason": reason}
+            Path(args[args.index("--result") + 1]).write_text(json.dumps(record))
+            return 1, "slow lane: shard 2/5 ran out\n"
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 1 and not result.capacity
+    assert f"child lane failed: {reason}; not run here either" in result.output
+    assert "ran here" not in result.output and _local_pytests(lane_processes) == []
+    assert _gate_tests.judge_shared_run(result, result.code) is _gate_base.Status.FAIL
+
+
+def test_a_lane_whose_change_ran_out_of_memory_is_a_failure_and_is_not_run_here(
+    tmp_path, monkeypatch, lane_processes
+):
+    """Whatever name a non-capacity outcome has, the record decides: the suite is not run here instead."""
+    fake = _gate_base._run
+    reason = "shard 2/5 (tests/test_b.py) ran out of its 5Gi memory in its own 2-CPU child"
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            record = {"completed": False, "outcome": "out of memory", "code": 1, "reason": reason}
+            Path(args[args.index("--result") + 1]).write_text(json.dumps(record))
+            return 1, "slow lane: shard 2/5 ran out of memory\n"
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 1 and not result.capacity
+    assert f"child lane failed: {reason}; not run here either" in result.output
+    assert "ran here" not in result.output and _local_pytests(lane_processes) == []
+    assert _gate_tests.judge_shared_run(result, result.code) is _gate_base.Status.FAIL
+
+
+def _checks_script(tmp_path: Path, text: str) -> Path:
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    checks.write_text(text)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    return junit
+
+
+async def test_a_lane_that_ran_out_beside_a_capacity_file_makes_the_checks_a_failure(tmp_path):
+    """One lane ran out of its own time (the change), the other found no room: the change wins."""
+    record = '{"completed": false, "outcome": "ran out", "code": 1, "reason": "shard 1/2 ran out"}'
+    junit = _checks_script(
+        tmp_path,
+        f'echo "{_CAPACITY_REASON}" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/fast.xml.capacity"\n'
+        f"echo '{record}' > \"$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.result\"; exit 1\n",
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    assert not isinstance(problem, _capacity.ChecksNoCapacity) and "failed with exit code 1" in problem
+
+
+async def test_a_lane_that_completed_with_failures_but_no_junit_makes_the_checks_a_failure(tmp_path):
+    """pytest's code is the evidence when its report is missing: failed tests are not capacity."""
+    junit = _checks_script(
+        tmp_path,
+        f'echo "{_CAPACITY_REASON}" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/fast.xml.capacity"\n'
+        'echo \'{"completed": true, "code": 1}\' > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.result"\n'
+        "exit 1\n",
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    assert not isinstance(problem, _capacity.ChecksNoCapacity) and "failed with exit code 1" in problem
+
+
+async def test_a_passing_lane_beside_a_lane_with_no_capacity_is_still_capacity(tmp_path):
+    passed = '{"completed": true, "code": 0}'
+    nothing = '{"completed": false, "outcome": "capacity", "code": 69, "reason": "none"}'
+    junit = _checks_script(
+        tmp_path,
+        f'echo "{_CAPACITY_REASON}" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.capacity"\n'
+        f"echo '{nothing}' > \"$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.result\"\n"
+        f"echo '{passed}' > \"$AGENT_FACTORY_PYTEST_JUNIT_DIR/fast.xml.result\"; exit 1\n",
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    assert isinstance(problem, _capacity.ChecksNoCapacity)
+    assert problem.capacity == f"slow lane: {_CAPACITY_REASON}"
+
+
+async def test_a_failing_checks_script_that_left_a_capacity_file_is_no_capacity(tmp_path):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    checks.write_text(
+        f'echo "{_CAPACITY_REASON}" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.capacity"; exit 1\n'
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+    capacity = getattr(problem, "capacity", "")
+
+    assert capacity == f"slow lane: {_CAPACITY_REASON}"
+    assert "no capacity" in problem and "not a failure of the project's change" in problem
+
+
+async def test_a_lane_that_ran_and_failed_beside_a_capacity_file_is_an_ordinary_failure(tmp_path):
+    """A failing test in the lane that did run is the project's failure, whatever the other lane found."""
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    failing = '<testsuite><testcase classname="tests.test_x" name="test_y"><failure/></testcase></testsuite>'
+    checks.write_text(
+        f'echo "{_CAPACITY_REASON}" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/slow.xml.capacity"\n'
+        f"echo '{failing}' > \"$AGENT_FACTORY_PYTEST_JUNIT_DIR/fast.xml\"; exit 1\n"
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    assert getattr(problem, "capacity", "") == "" and "failed with exit code 1" in problem
+
+
+async def test_a_failing_checks_script_without_a_capacity_file_is_an_ordinary_failure(tmp_path):
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    checks.write_text("exit 1\n")
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+    capacity = getattr(problem, "capacity", "")
+
+    assert capacity == "" and "failed with exit code 1" in problem and "no capacity" not in problem
+
+
+async def test_a_timed_out_checks_script_with_a_capacity_file_is_no_capacity(tmp_path, monkeypatch):
+    monkeypatch.setattr(_supervise_support, "_CHECKS_TIMEOUT_S", 1)
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    junit = tmp_path / "junit"
+    junit.mkdir()
+    checks.write_text(
+        'echo "no capacity: late" > "$AGENT_FACTORY_PYTEST_JUNIT_DIR/fast.xml.capacity"; sleep 30\n'
+    )
+
+    problem = await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+    capacity = getattr(problem, "capacity", "")
+
+    assert capacity == "fast lane: no capacity: late" and "timed out" in problem
+
+
+async def test_checks_sh_gets_the_lane_budget_and_the_xdist_worker_count(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.setattr(_gate_base, "read_cpu_allowance", lambda: 4)
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    seen = tmp_path / "seen.txt"
+    checks.write_text(f'echo "$AGENT_FACTORY_LANE_BUDGET_S $PYTEST_XDIST_AUTO_NUM_WORKERS" > {seen}')
+    junit = tmp_path / "junit"
+    junit.mkdir()
+
+    await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    assert seen.read_text() == f"{_supervise_support._CHECKS_TIMEOUT_S - 120} 4\n"
+
+
+def test_the_pre_review_row_mentions_no_capacity():
+    work = _gate_tests.GateWork(capacity=_CAPACITY_REASON)
+
+    assert _supervise_support._pre_review_row(10, 5, work).endswith(", no capacity")
+
+
+def test_a_capacity_reason_names_its_lane_and_says_no_capacity_once(tmp_path, monkeypatch, lane_processes):
+    fake = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args and "not slow" in args:
+            Path(args[args.index("--junit") + 1] + ".capacity").write_text("no capacity: 1 of 1 shards\n")
+            return 69, ""
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.capacity == "fast lane: no capacity: 1 of 1 shards"
+    assert _capacity.explain(result.capacity).count("no capacity") == 1
+
+
+def test_a_lane_whose_children_could_not_set_up_fails_says_so_and_is_not_run_here(
+    tmp_path, monkeypatch, lane_processes
+):
+    # The children were placed and ran but could not build the lane (an image without git): running the whole
+    # suite here instead is what overran the limits, and it is neither capacity nor the change.
+    fake = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return 78, (
+                "slow lane: 12 test files, about 300s, in 2 shards of 2 CPUs (budget 1100s)\n"
+                "slow lane: setup failed: 2 of 2 shards could not set up the lane in their child action, "
+                "even on a retry on-demand (git: command not found); the lane did not run, "
+                "and is not run here\n"
+            )
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code != 0 and not result.capacity
+    assert _local_pytests(lane_processes) == []
+    assert "slow lane: setup failed: 2 of 2 shards" in result.output and "ran here" not in result.output
+    assert _gate_tests.judge_shared_run(result, result.code) == _gate_base.Status.FAIL
+
+
+def test_the_reason_a_lane_ran_here_is_not_the_launchers_plan(tmp_path, monkeypatch, lane_processes):
+    fake = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return 74, (
+                "slow lane: 12 test files, about 300s, in 2 shards of 2 CPUs (budget 1100s)\n"
+                "slow lane: the tree could not be uploaded (timeout)\n"
+            )
+        return fake(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and "exit 74: slow lane: the tree could not be uploaded" in result.output
+
+
+async def test_checks_sh_lanes_get_the_runs_own_image(tmp_path, monkeypatch):
+    # The supervisor's FLYTE_INTERNAL_IMAGE is the plain Flyte image, without git: every shard's setup failed.
+    monkeypatch.setenv("FLYTE_INTERNAL_IMAGE", "plain-flyte:1")
+    monkeypatch.setenv("FLYTE_INTERNAL_EXECUTION_ID", "run-1")
+    monkeypatch.setattr(_gate_tests, "_run_image", lambda project, env: "run-image:7")
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    seen = tmp_path / "seen.txt"
+    checks.write_text(f'echo "$AGENT_FACTORY_TEST_LANE" > {seen}')
+    junit = tmp_path / "junit"
+    junit.mkdir()
+
+    await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    # The lanes get it through the launcher (#202), which the child is started from.
+    assert seen.read_text().strip() == str(junit / "lane" / "test-lane")
+    assert "FLYTE_INTERNAL_IMAGE=run-image:7" in (junit / "lane" / "test-lane").read_text()
+
+
+async def test_checks_sh_lanes_do_not_run_here_when_the_runs_image_cannot_be_looked_up(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLYTE_INTERNAL_IMAGE", "plain-flyte:1")
+    monkeypatch.setenv("FLYTE_INTERNAL_EXECUTION_ID", "run-1")
+    monkeypatch.setattr(_gate_tests, "_run_image", lambda project, env: "")
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    seen = tmp_path / "seen.txt"
+    checks.write_text(f'"$AGENT_FACTORY_TEST_LANE" -- bash -c \'echo "$FLYTE_INTERNAL_IMAGE"\' > {seen} 2>&1')
+    junit = tmp_path / "junit"
+    junit.mkdir()
+
+    await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    # No child is offered the plain image (its setup fails there), and a run is attached: the lane is not
+    # run here either (#209), and says so.
+    said = seen.read_text()
+    assert "plain-flyte:1" not in said
+    assert "could not be looked up, so this lane is not run in a child action, nor here" in said
+
+
+# Opting back into running a lane here (`RUN_HERE_ENV`): what every lane the launcher could not run did before
+# a run's lanes stopped falling back to its pod. The default, tested above, runs none of them here.
+@pytest.fixture
+def run_here(monkeypatch):
+    monkeypatch.setenv(_gate_tests.RUN_HERE_ENV, "1")
+
+
+def test_a_lane_the_launcher_did_not_run_runs_here_and_says_why(run_here, tmp_path, lane_processes):
+    project = _child_lane_project(tmp_path)
+    lane_processes.launcher_code = _SLOW_NOT_RUN
+
+    run = _gate_tests._run_head_pytest(project, child_lanes=True)
+
+    assert run is not None and run.code == 0 and run.cases is not None and len(run.cases) == 2
+    local = [c["args"] for c in lane_processes if "flyte_agent_factory._slow_lane" not in c["args"]]
+    assert len(local) == 2 and all(a[1:3] == ["-m", "pytest"] for a in local)
+    assert run.output.count("child lane not run (") == 2 and "no spot capacity" in run.output
+
+
+def test_without_the_runs_image_both_lanes_run_here_and_say_why(run_here, tmp_path, lane_processes):
+    project = _child_lane_project(tmp_path)
+    lane_processes.image_lookup = (1, "FileNotFoundError: No run context file found\n")
+
+    run = _gate_tests._run_head_pytest(project, child_lanes=True)
+
+    assert run is not None and run.code == 0
+    assert lane_processes and all("flyte_agent_factory._slow_lane" not in c["args"] for c in lane_processes)
+    assert "child lanes not used (the run's image could not be looked up)" in run.output
+
+
+@pytest.mark.parametrize(
+    ("code", "output"),
+    [
+        (1, "No module named flyte_agent_factory._slow_lane\n"),
+        (1, "Traceback (most recent call last):\nModuleNotFoundError: No module named 'dependency'\n"),
+        (1, "No module named pytest\n"),
+        (127, "launcher not found\n"),
+        (124, "command timed out after 1200 seconds\n"),
+        (-9, "launcher killed\n"),
+        (70, "launcher setup failed\n"),
+        (0, "launcher exited without reporting\n"),
+    ],
+)
+def test_launcher_infrastructure_failure_runs_local_pytest(
+    run_here, tmp_path, monkeypatch, lane_processes, code, output
+):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            return code, output
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 0
+    assert result.cases is not None and {case.name for case in result.cases} == {"fast", "slow"}
+    assert len(lane_processes) == 2
+    assert result.output.count("child lane not run (") == 2
+    assert output.strip().splitlines()[-1] in result.output
+
+
+def test_launcher_os_error_runs_local_pytest(run_here, tmp_path, monkeypatch, lane_processes):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            raise PermissionError("launcher cannot execute")
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 0 and result.cases is not None
+    assert len(lane_processes) == 2
+    assert "launcher cannot execute" in result.output
+
+
+@pytest.mark.parametrize("report", ["", "<broken", "<testsuites/>"])
+def test_launcher_without_pytest_evidence_runs_here(run_here, tmp_path, monkeypatch, lane_processes, report):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            Path(args[args.index("--junit") + 1]).write_text(report)
+            return 1, "launcher failed before pytest\n"
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 0
+    assert result.cases is not None and {case.name for case in result.cases} == {"fast", "slow"}
+    assert len(lane_processes) == 2
+
+
+@pytest.mark.parametrize("code", [0, 1, 5])
+def test_local_fallback_uses_only_its_own_result_and_report(
+    run_here, tmp_path, monkeypatch, lane_processes, code
+):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            _junit_for(args[args.index("--junit") + 1], "stale child")
+            return 70, "launcher infrastructure failed\n"
+        if "pytest" in args:
+            return code, "local pytest output\n"
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == code
+    assert result.cases is None
+    assert "local pytest output" in result.output and "launcher infrastructure failed" in result.output
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "",
+        "{",
+        "[]",
+        "null",
+        "{}",
+        '{"completed": false, "code": 1}',
+        '{"completed": true}',
+        '{"completed": true, "code": true}',
+        '{"completed": true, "code": "1"}',
+        '{"completed": true, "code": 70}',
+        '{"completed": 1, "code": 1}',
+        '{"completed": true, "code": -1}',
+    ],
+)
+def test_invalid_child_completion_falls_back_even_with_junit(
+    run_here, tmp_path, monkeypatch, lane_processes, record
+):
+    fake_run = _gate_base._run
+
+    def run(args, cwd, **kw):
+        if "flyte_agent_factory._slow_lane" in args:
+            Path(args[args.index("--result") + 1]).write_text(record)
+            _junit_for(args[args.index("--junit") + 1], "untrusted")
+            return 1, "launcher stopped\n"
+        return fake_run(args, cwd, **kw)
+
+    monkeypatch.setattr(_gate_base, "_run", run)
+    result = _gate_tests._run_head_pytest(_child_lane_project(tmp_path), child_lanes=True)
+
+    assert result is not None and result.code == 0
+    assert result.cases is not None and {c.name for c in result.cases} == {"fast", "slow"}
+    assert len(lane_processes) == 2
+    assert "invalid pytest completion" in result.output
+
+
+async def test_checks_sh_keeps_its_image_when_the_runs_cannot_be_looked_up(tmp_path, monkeypatch, run_here):
+    monkeypatch.setenv("FLYTE_INTERNAL_IMAGE", "plain-flyte:1")
+    monkeypatch.setenv("FLYTE_INTERNAL_EXECUTION_ID", "run-1")
+    monkeypatch.setattr(_gate_tests, "_run_image", lambda project, env: "")
+    checks = tmp_path / _session_config._checks_rel(_session_config._project_name)
+    checks.parent.mkdir(parents=True, exist_ok=True)
+    seen = tmp_path / "seen.txt"
+    checks.write_text(f'"$AGENT_FACTORY_TEST_LANE" -- bash -c \'echo "$FLYTE_INTERNAL_IMAGE"\' > {seen} 2>&1')
+    junit = tmp_path / "junit"
+    junit.mkdir()
+
+    await _supervise_support._run_declared_checks(tmp_path, _timeline._Timeline(), junit)
+
+    # No child is offered the plain image (its setup fails there); the lane runs here, and says so.
+    said = seen.read_text()
+    assert "plain-flyte:1" in said
+    assert "the run's image could not be looked up, so this lane runs here" in said

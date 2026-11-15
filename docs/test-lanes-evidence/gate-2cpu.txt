@@ -1,0 +1,66 @@
+scenario: gate-2cpu (gate, 2-CPU shards)
+measured: 2026-11-14T16:03:24Z
+commit: c0926fa6868f7e63b07344881276dc859727ddfc (code last changed at 80c25bc5335695834c93e4de0eab7433085030c1)
+run: small-node-checks-w-3-0-2gj89m
+limit: 1200 s
+wall: 584 s
+outcome: PASS (exit 0)
+junit cases: 8261, failed: 0
+capacity: -
+ran here (session pod): no
+child actions launched: 1gud1lnxsoyqhuaw6km05i3ge 1l6vl72d59x8fxgyrmlw95hqx 1p0phfz4o2ks52letf1b1v9pi 2cpvsd6ygn8s4k5m2alhto07t 2jzdkehmewkdsofx0v3stxp0 3zcfhhy0pf6w8bo2v86l18w2o 6y61cgb28vipr0r1xelgyoyke 7sr6c7eehy05o9pfw7kpmbyus 853fd4pnduwico32qvzz4rtqz 8zv66nh9sh1ovnu8hzekmji1x 98t7elbzb0y0mhjyvn8v5nd7x 9c8b84pml1hxorp843bmctp8b 9ika2fqwoqswh0g98xz45opl5 ae74y5jalh7ywuk90ov6oga5q cik2w3rpe4x4rzhmmxhoy27yh czeaz0rnbswyvl7731udl4kzm ehzzkth6qw1xyfxplpqa7h6m xlazu47u8kcv9ibsn46031qs
+
+--- lane verdict and shard lines ---
+=== shard 1/5 (on-demand, child action czeaz0rnbswyvl7731udl4kzm) ===
+test-lane: wall 132s, peak memory 1489 MiB, 2 workers
+=== shard 2/5 (on-demand, child action 1l6vl72d59x8fxgyrmlw95hqx) ===
+test-lane: wall 148s, peak memory 1380 MiB, 2 workers
+=== shard 3/5 (spot, child action 7sr6c7eehy05o9pfw7kpmbyus) ===
+test-lane: wall 165s, peak memory 1516 MiB, 2 workers
+=== shard 4/5 (spot, child action 853fd4pnduwico32qvzz4rtqz) ===
+test-lane: wall 316s, peak memory 1469 MiB, 2 workers
+=== shard 5/5 (spot, child action 2jzdkehmewkdsofx0v3stxp0) ===
+test-lane: wall 199s, peak memory 1346 MiB, 2 workers
+=== lane verdict: exit 0 ===
+shard 1/5 (on-demand, child action czeaz0rnbswyvl7731udl4kzm): exit 0: 1781 passed, 17 skipped, 8 warnings in 115.70s (0:01:55)
+shard 2/5 (on-demand, child action 1l6vl72d59x8fxgyrmlw95hqx): exit 0: 1572 passed, 6 skipped, 8 warnings in 129.14s (0:02:09)
+shard 3/5 (spot, child action 7sr6c7eehy05o9pfw7kpmbyus): exit 0: 1492 passed, 1 skipped, 12 warnings in 144.72s (0:02:24)
+shard 4/5 (spot, child action 853fd4pnduwico32qvzz4rtqz): exit 0: 1699 passed, 9 warnings in 236.21s (0:03:56)
+shard 5/5 (spot, child action 2jzdkehmewkdsofx0v3stxp0): exit 0: 1528 passed, 4 skipped, 8 warnings in 166.81s (0:02:46)
+slow lane: shard 1/5: no spot capacity within 0:02:00
+slow lane: shard 2/5: no spot capacity within 0:02:00
+slow lane: shard 3/5 spot child action 7sr6c7eehy05o9pfw7kpmbyus 218s code 0
+slow lane: shard 5/5 spot child action 2jzdkehmewkdsofx0v3stxp0 246s code 0
+slow lane: shard 1/5 on-demand child action czeaz0rnbswyvl7731udl4kzm 138s code 0
+slow lane: shard 2/5 on-demand child action 1l6vl72d59x8fxgyrmlw95hqx 153s code 0
+slow lane: shard 4/5 spot child action 853fd4pnduwico32qvzz4rtqz 335s code 0
+=== shard 1/6 (on-demand, child action ae74y5jalh7ywuk90ov6oga5q) ===
+test-lane: wall 424s, peak memory 1910 MiB, 2 workers
+=== shard 2/6 (spot, child action 8zv66nh9sh1ovnu8hzekmji1x) ===
+test-lane: wall 192s, peak memory 1162 MiB, 2 workers
+=== shard 3/6 (on-demand, child action 6y61cgb28vipr0r1xelgyoyke) ===
+test-lane: wall 202s, peak memory 1159 MiB, 2 workers
+=== shard 4/6 (on-demand, child action 9ika2fqwoqswh0g98xz45opl5) ===
+test-lane: wall 74s, peak memory 1398 MiB, 2 workers
+=== shard 5/6 (on-demand, child action 1gud1lnxsoyqhuaw6km05i3ge) ===
+test-lane: wall 154s, peak memory 1259 MiB, 2 workers
+=== shard 6/6 (on-demand, child action 2cpvsd6ygn8s4k5m2alhto07t) ===
+test-lane: wall 66s, peak memory 1226 MiB, 2 workers
+=== lane verdict: exit 0 ===
+shard 1/6 (on-demand, child action ae74y5jalh7ywuk90ov6oga5q): exit 0: 35 passed, 8 warnings in 398.48s (0:06:38)
+shard 2/6 (spot, child action 8zv66nh9sh1ovnu8hzekmji1x): exit 0: 43 passed, 8 warnings in 116.71s (0:01:56)
+shard 3/6 (on-demand, child action 6y61cgb28vipr0r1xelgyoyke): exit 0: 18 passed, 8 warnings in 160.36s (0:02:40)
+shard 4/6 (on-demand, child action 9ika2fqwoqswh0g98xz45opl5): exit 0: 1 passed, 8 warnings in 42.67s
+shard 5/6 (on-demand, child action 1gud1lnxsoyqhuaw6km05i3ge): exit 0: 18 passed, 1 xpassed, 8 warnings in 110.79s (0:01:50)
+shard 6/6 (on-demand, child action 2cpvsd6ygn8s4k5m2alhto07t): exit 0: 45 passed, 8 warnings in 45.31s
+slow lane: shard 6/6: no spot capacity within 0:02:00
+slow lane: shard 3/6: no spot capacity within 0:02:00
+slow lane: shard 4/6: no spot capacity within 0:02:00
+slow lane: shard 5/6: no spot capacity within 0:02:00
+slow lane: shard 1/6: no spot capacity within 0:02:00
+slow lane: shard 6/6 on-demand child action 2cpvsd6ygn8s4k5m2alhto07t 76s code 0
+slow lane: shard 4/6 on-demand child action 9ika2fqwoqswh0g98xz45opl5 79s code 0
+slow lane: shard 5/6 on-demand child action 1gud1lnxsoyqhuaw6km05i3ge 161s code 0
+slow lane: shard 2/6 spot child action 8zv66nh9sh1ovnu8hzekmji1x 311s code 0
+slow lane: shard 3/6 on-demand child action 6y61cgb28vipr0r1xelgyoyke 212s code 0
+slow lane: shard 1/6 on-demand child action ae74y5jalh7ywuk90ov6oga5q 430s code 0

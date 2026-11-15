@@ -1191,6 +1191,7 @@ def test_status_values_are_the_labels_in_standards_results_json():
         "TOOL_UNAVAILABLE": "tool unavailable",
         "WAIVED": "WAIVED",
         "NOT_RUN": "not run",
+        "NO_CAPACITY": "no capacity",
         "HARNESS_FAULT": "harness fault",
     }
 
@@ -1211,6 +1212,11 @@ def test_status_from_exit(code, status):
 
 def test_only_a_failure_blocks():
     assert {s for s in _gate_base.Status if s.blocks} == {
+        _gate_base.Status.FAIL,
+        _gate_base.Status.TOOL_UNAVAILABLE,
+        _gate_base.Status.NO_CAPACITY,  # blocks review, but is not `fails`
+    }
+    assert {s for s in _gate_base.Status if s.fails} == {
         _gate_base.Status.FAIL,
         _gate_base.Status.TOOL_UNAVAILABLE,
     }
