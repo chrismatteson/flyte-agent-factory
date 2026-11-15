@@ -1,4 +1,4 @@
-"""Remembered limits shared by pods through the state uri: a clear found by one reaches the others (#195)."""
+"""Remembered limits shared by pods through the state store: a clear found by one reaches the rest (#195)."""
 
 from __future__ import annotations
 
@@ -27,11 +27,13 @@ from flyte_agent_factory import (
     _reviewer,
     _router,
     _session_config,
+    _state_store,
     _supervise_support,
     _timeline,
     _usage,
 )
 from tests._wait import wait_for
+from tests.state_git import make_store
 from tests.test_inbox_engine_direction import inbox, loop, paused_session, stop_loop  # noqa: F401 -- fixtures used by name
 
 T0 = 1_800_000_000.0
@@ -41,14 +43,14 @@ POLL = _limit_share.LIMIT_SHARE_POLL_S
 
 
 class Pods:
-    """Pods that share one state uri and one fake wall clock."""
+    """Pods that share one state root and one fake wall clock."""
 
-    def __init__(self, tmp_path: Path, uri: str) -> None:
+    def __init__(self, tmp_path: Path, root: str) -> None:
         self.now = {"t": T0}
-        self.uri, self.tmp_path = uri, tmp_path
+        self.root, self.tmp_path = root, tmp_path
 
     def pod(self, name: str) -> _meter.MeterStore:
-        share = _limit_share.LimitShare(self.uri, clock=lambda: self.now["t"])
+        share = _limit_share.LimitShare(self.root, clock=lambda: self.now["t"])
         return _meter.MeterStore(self.tmp_path / name, clock=lambda: self.now["t"], share=share)
 
     def advance(self, seconds: float) -> None:
@@ -56,8 +58,8 @@ class Pods:
 
 
 @pytest.fixture
-def pods(tmp_path, state_uri) -> Pods:
-    return Pods(tmp_path, f"{state_uri}/pods")
+def pods(tmp_path, state_store) -> Pods:
+    return Pods(tmp_path, f"{_state_store.ROOT}/pods")
 
 
 def routed(store: _meter.MeterStore, now: float) -> _router.Decision:
@@ -181,7 +183,7 @@ def test_a_success_soon_after_another_pods_limit_still_publishes_the_clear(pods)
 def test_a_record_with_null_times_still_takes_and_publishes_the_clear(pods, capsys):
     """A `null` time in the store reads as absent, not malformed, and the clear still reaches pod B."""
     a, b = pods.pod("a"), pods.pod("b")
-    path = _limit_share.LimitShare(pods.uri)._account_path(X)
+    path = _limit_share.LimitShare(pods.root)._account_path(X)
     _queue.write_json(path, {"engine": "claude", "limited_until": None, "noted_at": None, "cleared_at": None})
     b.note_limit("claude", T0 + 12 * H, X)  # publish must not copy the null cleared_at forward
     pods.advance(10)
@@ -222,13 +224,10 @@ def test_a_manual_clear_for_the_engine_reaches_every_account_noted_before_it(pod
 
 def test_the_shared_files_hold_hashes_and_times_never_the_account_or_a_token(pods):
     pods.pod("b").note_limit("claude", T0 + H, X)
-    files = (
-        list((Path(pods.uri.removeprefix("file://")) / "limits").glob("*.json"))
-        if pods.uri.startswith("file://")
-        else []
-    )
-    if files:  # the local-directory run; the fake object store is checked through `_queue`
-        text = files[0].read_text()
+    files = _queue.listing(f"{pods.root}/limits")
+    assert files, "the limit was never written to the store"
+    for path in files:
+        text = json.dumps(_queue.read_json(path))
         assert "work" not in text and "0123456789ab" not in text
         assert set(json.loads(text)) == {"engine", "limited_until", "noted_at", "cleared_at"}
     assert not any(X in str(p) for p in files)
@@ -341,7 +340,7 @@ def test_a_codex_success_on_another_slots_login_leaves_a_codex_limit(pods, codex
     pods.advance(POLL)
     assert not a.poll_shared()
     assert a.readings[limited].limited_until == T0 + 12 * H
-    share = _limit_share.LimitShare(pods.uri)
+    share = _limit_share.LimitShare(pods.root)
     record = share._read(share._account_path(limited), fresh=True)
     assert record["limited_until"] == T0 + 12 * H
     assert "login" not in json.dumps(record) and limited not in json.dumps(record), "hashes and times only"
@@ -366,6 +365,13 @@ def test_a_codex_clear_reaches_a_pod_noting_before_it_has_a_reading(pods, monkey
 
 
 def test_without_a_state_uri_limits_stay_local(tmp_path, monkeypatch):
+    """A profile without `[state] uri` shares limits on the state branch; with no profile they stay local."""
+    assert _factory_base.PROFILE.state.uri == ""
+    monkeypatch.setattr(_session_config, "_PROFILE", _factory_base.PROFILE)
+    shared = _usage.open_meters(tmp_path / "shared")
+    assert shared.share is not None and shared.share.root == _state_store.ROOT
+    shared.note_limit("claude", T0 + H, X)
+    assert _queue.listing(f"{_state_store.ROOT}/limits"), "a profile without [state] uri still shares"
     monkeypatch.setattr(_session_config, "_PROFILE", None)
     store = _usage.open_meters(tmp_path / "meters")
     assert store.share is None
@@ -549,7 +555,7 @@ async def test_the_dashboards_child_report_read_dates_a_refusal_by_when_the_chil
 
 
 def test_the_factory_task_writes_the_engine_wide_clear_and_the_dashboard_applies_it(queue_state):
-    uri = _factory_base.PROFILE.state.uri
+    root = _state_store.ROOT
     now = time.time()  # the task stamps the clear with the real clock
     held = _meter.Meter(
         "claude work#0123456789ab",
@@ -564,14 +570,14 @@ def test_the_factory_task_writes_the_engine_wide_clear_and_the_dashboard_applies
 
     reply = json.loads(asyncio.run(_factory.clear_limit.func("claude")))
     assert reply == {"engine": "claude", "status": "cleared"}
-    assert _queue.read_json(f"{uri}/limits/engine-claude.json")["cleared_at"] >= now
+    assert _queue.read_json(f"{root}/limits/engine-claude.json")["cleared_at"] >= now
     _factory_meters._apply_shared_clears(found, now)
     assert held.limited_until is None, "the dashboard no longer shows the cleared account as limited"
 
 
 def test_a_newer_reading_of_a_limited_account_keeps_when_the_limit_was_noted(queue_state, monkeypatch):
     """A reading that inherits `limited_until` inherits `limit_noted_at`: a later hand clear applies."""
-    uri = _factory_base.PROFILE.state.uri
+    root = _state_store.ROOT
     now = time.time()
     noted = _meter.Meter(
         X, "limit-text", now - H, limited_until=now + 12 * H, limit_noted_at=now - H
@@ -579,7 +585,7 @@ def test_a_newer_reading_of_a_limited_account_keeps_when_the_limit_was_noted(que
     newer = _meter.Meter(X, "oauth-usage", now - 60)  # a `read_login_meter` run, a minute old
     run = SimpleNamespace(outputs=lambda: (json.dumps(newer.to_dict()),))
     monkeypatch.setattr(remote.Run, "listall", staticmethod(lambda **kwargs: [run]))
-    _limit_share.LimitShare(uri).clear_engine("claude", at=now - H / 2)  # cleared by hand, after the limit
+    _limit_share.LimitShare(root).clear_engine("claude", at=now - H / 2)  # cleared by hand, after the limit
 
     found = _factory_meters.login_meters(reports={"slot": [noted]}, now=now, raw=True, bench=False)
     assert found[X].observed_at == now - 60, "the newer reading is the one shown"
@@ -605,11 +611,40 @@ def test_the_factory_task_ignores_the_engines_case(queue_state):
 
 
 def test_the_factory_task_without_a_state_uri_fails_saying_so(monkeypatch):
+    """With no `[state] uri` the clear goes to the state branch; if it cannot be written the reply says so."""
     monkeypatch.setattr(
         _factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, state=_profile.State(uri=""))
     )
-    with pytest.raises(ValueError, match=r"\[state\] uri"):
-        asyncio.run(_factory.clear_limit.func("claude"))
+    assert json.loads(asyncio.run(_factory.clear_limit.func("claude")))["status"] == "cleared"
+
+    def refused(*args):
+        raise _state_store.StateError("push rejected")
+
+    monkeypatch.setattr(_queue, "write_json", refused)
+    reply = json.loads(asyncio.run(_factory.clear_limit.func("claude")))
+    assert reply["status"] == "not cleared"
+    assert "state branch" in reply["error"] and "[state] uri" not in reply["error"]
+
+
+def test_two_stores_on_one_remote_see_each_others_clears(tmp_path, state_store):
+    """Pods have their own cache of the one remote branch; a clear written by one is read by the other."""
+    remote = Path(state_store.remote)
+    stores = {
+        "a": make_store(tmp_path, remote=remote, name="a"),
+        "b": make_store(tmp_path, remote=remote, name="b"),
+    }
+    share = _limit_share.LimitShare(clock=lambda: T0)
+
+    def on(pod: str) -> _limit_share.LimitShare:
+        _state_store.configure(stores[pod])  # what a pod's `current()` is
+        return share
+
+    on("a").clear_engine("claude", at=T0 + 5)
+    assert on("b").read_cleared_at("claude", X) == T0 + 5
+    share.publish("claude", X, T0 + H, T0)
+    share.succeeded("claude", X, at=T0 + 10)
+    share._cache.clear()  # not the 5 s record cache: the other store's own copy is what is under test
+    assert on("a").read_cleared_at("claude", X) == T0 + 10
 
 
 def test_the_factory_task_rejects_an_unknown_engine(queue_state):
@@ -636,11 +671,20 @@ def test_the_chat_may_run_the_clear_limit_task():
     ],
 )
 def test_a_malformed_record_is_no_clear_for_the_dashboard_or_the_pods(queue_state, record, logged, capsys):
-    uri = _factory_base.PROFILE.state.uri
+    root = _state_store.ROOT
     now = time.time()
-    _queue.write_json(f"{uri}/limits/engine-claude.json", record)
+    _queue.write_json(f"{root}/limits/engine-claude.json", record)
     held = _meter.Meter(X, "limit-text", now - 60, limited_until=now + 12 * H, limit_noted_at=now - 60)
     _factory_meters._apply_shared_clears({X: held}, now)
     assert held.limited_until == now + 12 * H
-    assert _limit_share.LimitShare(uri).read_cleared_at("claude", X) == 0.0
+    assert _limit_share.LimitShare(root).read_cleared_at("claude", X) == 0.0
     assert ("[limits] shared read failed" in capsys.readouterr().err) is logged
+
+
+def test_a_project_pod_mounts_the_deploy_key_the_limit_share_pushes_with():
+    """`agent.project` builds a `LimitShare` (`_usage.open_meters`); its pod must carry the store's key."""
+    pairs = dict(item.split("=", 1) for item in _factory_base.PROFILE.agent_secrets.split(","))
+    assert pairs[_factory_base.PROFILE.secrets.deploy_key] == "GIT_DEPLOY_KEY"
+    assert [s.key for s in _factory_base.state_secrets(_factory_base.PROFILE)] == [
+        _factory_base.PROFILE.secrets.deploy_key
+    ]

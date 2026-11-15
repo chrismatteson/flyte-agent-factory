@@ -264,6 +264,7 @@ issues_env = flyte.TaskEnvironment(
     image=_image,
     resources=flyte.Resources(cpu=1, memory="1Gi"),
     secrets=[
+        *_factory_base.state_secrets(PROFILE),  # intake writes queue requests and its dedupe markers
         *(
             [flyte.Secret(key=PROFILE.github.private_key_secret, as_env_var=_pull_requests.KEY_ENV_VAR)]
             if PROFILE.github.private_key_secret
@@ -294,6 +295,8 @@ env = flyte.app.AppEnvironment(
             else []
         ),
         *_QUEUE_SECRETS,
+        # The planner runs in this app: it reads the queue and the reserves and writes the wait reasons.
+        *(_factory_base.state_secrets(PROFILE) if PROFILE.planner.admission == "planner" else []),
     ],
     env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     depends_on=[
@@ -344,8 +347,6 @@ async def process(event: str, payload: str) -> str:
         # `eligible` is False without a [board].
         token = _board.take_token(cast("_profile.Board", PROFILE.board).pat_secret)
         await asyncio.to_thread(_board_events.process, PROFILE, token, app, event, data)
-    if not PROFILE.state.uri and _issues.accept_event(PROFILE, event, data):
-        raise flyte.errors.NonRecoverableError("GitHub issue intake requires [state] uri")
     try:
         result = await asyncio.to_thread(_issues.process_event, PROFILE, event, data, app=app)
     except ValueError as exc:
@@ -449,8 +450,6 @@ async def _intake(kind: str, event: dict[str, Any]) -> Response:
     # The public endpoint has no App key. The private task authenticates the bot before any launch.
     if accepted is None and not (kind == "issues" and _issues.loop_creation(PROFILE, payload)):
         return Response(status_code=204)
-    if not PROFILE.state.uri:
-        raise HTTPException(status_code=503, detail="Intake state unavailable")
     await _submit_issue_event(kind, event)
     return Response(status_code=202)
 

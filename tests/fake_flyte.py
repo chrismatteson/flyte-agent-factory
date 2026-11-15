@@ -1,6 +1,6 @@
 """The Flyte remote edge for the queue tests: runs that exist, listings, run creation.
 
-Everything below the edge is real (`_queue` and `_factory` against a `file://` state directory).
+Everything below the edge is real (`_queue` and `_factory` against a local git state store).
 The fake behaves as measured on the Union tenant: creating a run under a name that exists REPLACES it
 (there is no RunAlreadyExistsError), a listing filters on phase, task and labels like the server, and an
 abort reason reads back as None. Who aborted a run is on its root action's details (GetActionDetails of
@@ -18,6 +18,16 @@ from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from flyteidl2.common import identifier_pb2, identity_pb2  # type: ignore[import-untyped]  # no py.typed marker
 from flyteidl2.workflow import run_definition_pb2  # type: ignore[import-untyped]  # no py.typed marker
+
+
+def status_report(**fields: Any) -> str:
+    """A run's report as a project pod publishes it: the page with the status snapshot embedded as JSON.
+
+    `fields` are what the pod's snapshot carries; the factory reads `checkpoint` and `app` from it.
+    """
+    from flyte_agent_factory import _dashboard
+
+    return f"<div>report</div>{_dashboard.status_script({'schema': _dashboard.SCHEMA, **fields})}"
 
 
 class _Status:
@@ -66,6 +76,7 @@ class FakeRun:
         abort_reason="",
         seq=0,
         aborted_by="",
+        report="",
     ):
         self.name = name
         self.task = task
@@ -82,7 +93,7 @@ class FakeRun:
             start_time=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=seq)
         )
         self.url = f"https://console.example/runs/{name}"
-        self.report = ""  # None: a run that never wrote one
+        self.report = report  # None: a run that never wrote one
         self.task_version = ""  # the version of the task it was created from, fixed for the run's life
 
     def get_report(self):

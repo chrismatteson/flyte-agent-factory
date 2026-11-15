@@ -1393,7 +1393,8 @@ def test_auto_deploy_defaults_to_off_and_other_profiles_have_no_state():
 
 def test_example_documents_the_auto_deploy_tables():
     p = _profile.load(str(EXAMPLE))
-    assert (p.deploy.auto, p.state.uri.startswith("s3://"), p.github.app_id.isdigit()) == (False, True, True)
+    # `[state] uri` is retired: the example shows `branch` (commented) and no bucket.
+    assert (p.deploy.auto, p.state.uri, p.github.app_id.isdigit()) == (False, "", True)
     assert p.github.private_key_secret
 
 
@@ -1405,6 +1406,11 @@ def _auto_text() -> str:
     )
 
 
+def _with_old_state_uri(uri: str) -> str:
+    """The example as a profile written before the state moved to git: it still sets `[state] uri`."""
+    return EXAMPLE.read_text() + f'\n[state]\nuri = "{uri}"\n'
+
+
 def test_auto_deploy_with_everything_it_needs_parses():
     p = _profile.parse(_auto_text())
     assert p.deploy.auto is True
@@ -1412,10 +1418,7 @@ def test_auto_deploy_with_everything_it_needs_parses():
 
 @pytest.mark.parametrize("uri", ["s3://b/p", "gs://b/p", "abfs://c@a/p", "file:///tmp/state"])
 def test_state_uri_schemes(uri):
-    assert (
-        _profile.parse(_example_with("s3://my-bucket/factory-state/my-agents/development", uri)).state.uri
-        == uri
-    )
+    assert _profile.parse(_with_old_state_uri(uri)).state.uri == uri
 
 
 @pytest.mark.parametrize(
@@ -1424,21 +1427,6 @@ def test_state_uri_schemes(uri):
         ("auto = false", 'auto = "yes"', "[deploy] auto must be true or false"),
         ("auto = false", "auto = 1", "[deploy] auto must be true or false"),
         ("auto = false", "auto = false\nsoon = true", "unknown key(s) in [deploy]: soon"),
-        (
-            "s3://my-bucket/factory-state/my-agents/development",
-            "my-bucket/state",
-            "[state] uri must start with a scheme",
-        ),
-        (
-            "s3://my-bucket/factory-state/my-agents/development",
-            "s3://",
-            "[state] uri must start with a scheme",
-        ),
-        (
-            'uri = "s3://my-bucket/factory-state/my-agents/development"',
-            "uri = 3",
-            "[state] uri must be a non-empty string",
-        ),
         ('app_id = "123456"', 'app_id = "12ab"', "[github] app_id must be digits"),
         ('app_id = "123456"', "app_id = 12.5", "[github] app_id must be"),
         (
@@ -1452,6 +1440,19 @@ def test_state_uri_schemes(uri):
 def test_invalid_auto_deploy_values_are_refused(old, new, message):
     with pytest.raises(_profile.ProfileError, match=re.escape(message)):
         _profile.parse(_example_with(old, new))
+
+
+def test_a_state_uri_that_is_not_a_string_is_still_refused():
+    with pytest.raises(_profile.ProfileError, match=re.escape("[state] uri must be a non-empty string")):
+        _profile.parse(EXAMPLE.read_text() + "\n[state]\nuri = 3\n")
+
+
+@pytest.mark.parametrize("uri", ["my-bucket/state", "s3://"])
+def test_a_state_uri_without_a_usable_scheme_now_loads_with_the_warning(uri, capsys, monkeypatch):
+    """The scheme used to be validated because the store read it; nothing reads it now."""
+    monkeypatch.setattr(_profile, "_warned", set())
+    assert _profile.parse(_with_old_state_uri(uri)).state.uri == uri
+    assert "[state] uri is no longer read" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1480,15 +1481,21 @@ def test_union_work_deploys_itself():
 
 @pytest.mark.parametrize("uri", ["gcs://b/p", "abfss://c@a/p"])
 def test_more_state_uri_schemes(uri):
-    old = "s3://my-bucket/factory-state/my-agents/development"
-    assert _profile.parse(_example_with(old, uri)).state.uri == uri
+    assert _profile.parse(_with_old_state_uri(uri)).state.uri == uri
 
 
 @pytest.mark.parametrize("uri", ["http://host/p", "https://host/p", "ftp://host/p", "S3://b/p", "r2://b/p"])
-def test_state_uri_scheme_must_be_one_the_state_store_reaches(uri):
-    old = "s3://my-bucket/factory-state/my-agents/development"
-    with pytest.raises(_profile.ProfileError, match=r"\[state\] uri (scheme must be one of|must start with)"):
-        _profile.parse(_example_with(old, uri))
+def test_a_state_uri_scheme_the_store_never_reached_now_loads_too(uri):
+    """The scheme was checked against what the object store could reach; there is no object store."""
+    assert _profile.parse(_with_old_state_uri(uri)).state.uri == uri
+
+
+@pytest.mark.parametrize("uri", ["s3://b/p", "gs://b/p", "http://host/p", "r2://b/p", "my-bucket/state"])
+def test_state_uri_scheme_must_be_one_the_state_store_reaches(uri, capsys, monkeypatch):
+    """Bucket-era name; now checks any [state] uri scheme loads, ignored, with a deprecation note."""
+    monkeypatch.setattr(_profile, "_warned", set())
+    assert _profile.parse(_with_old_state_uri(uri)).state.uri == uri
+    assert "[state] uri is no longer read" in capsys.readouterr().err
 
 
 def test_app_id_may_be_a_string_of_digits():
@@ -1645,8 +1652,7 @@ def test_meter_logins_follow_existing_bindings():
 
 
 def test_auto_deploy_does_not_require_object_storage():
-    text = _without(_auto_text(), 'uri = "s3://my-bucket/factory-state/my-agents/development"\n')
-    profile = _profile.parse(text)
+    profile = _profile.parse(_auto_text())
     assert profile.deploy.auto and profile.state.uri == ""
 
 

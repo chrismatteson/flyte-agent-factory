@@ -41,9 +41,12 @@ _METER_ERRORS = (_meter.MeterError, OSError, ValueError, TypeError, OverflowErro
 
 
 def open_meters(root: Path) -> _meter.MeterStore:
-    """Open the supervisor's meter record, sharing limits with the other pods when a state uri is set."""
-    uri = _session_config._PROFILE.state.uri if _session_config._PROFILE else ""
-    return _meter.MeterStore(root, share=_limit_share.LimitShare(uri) if uri else None)
+    """Open the supervisor's meter record, sharing limits with the other pods when a profile is selected.
+
+    The store is derived from the profile's `[repo] project` (`_state_store.current`), so without a profile
+    there is nowhere to share and limits stay in the pod.
+    """
+    return _meter.MeterStore(root, share=_limit_share.LimitShare() if _session_config._PROFILE else None)
 
 
 def read_wall_clock() -> float:

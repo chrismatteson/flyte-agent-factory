@@ -252,9 +252,7 @@ class Waits(dict[str, dict[str, Any]]):
         except _errors.REMOTE_ERRORS as exc:  # only the listing depends on it: the pass's starts stand
             print(f"[queue] wait reasons not stored: {type(exc).__name__}: {exc}", flush=True)
             return
-        _queue.write_waits(
-            _factory_base.PROFILE.state.uri, {n: w for n, w in self.items() if (n, w["gen"]) in still}
-        )
+        _queue.write_waits({n: w for n, w in self.items() if (n, w["gen"]) in still})
 
 
 def word_engine_limit(request: _queue.Request) -> str:

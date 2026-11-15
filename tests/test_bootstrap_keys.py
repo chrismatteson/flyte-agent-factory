@@ -28,7 +28,7 @@ from tests.test_bootstrap import person  # noqa: F401 -- autouse fixture: a git 
 
 ARGS = [
     "--endpoint", "flyte.example.test", "--project", "my-agents", "--domain", "staging",
-    "--workspace", "pat/agent-workspace", "--state-uri", "s3://example-bucket/state",
+    "--workspace", "pat/agent-workspace",
 ]  # fmt: skip
 CONNECTOR = "https://factory-mcp.example.test/flyte-mcp/mcp"
 
@@ -172,7 +172,6 @@ RUN_SETTINGS = Settings(
     project="my-agents",
     domain="staging",
     workspace="pat/agent-workspace",
-    state_uri="s3://example-bucket/state",
 )
 
 
@@ -432,7 +431,6 @@ def assert_filled_in(command):
         "my-agents",
         "staging",
         "pat/agent-workspace",
-        "s3://example-bucket/state",
     ):
         assert value in command
     assert not re.search(r"<[^>]*>", command) and "client_id=" not in command
@@ -449,9 +447,9 @@ def test_the_printed_commands_carry_the_runs_own_values_and_no_placeholders(worl
 
 
 def test_the_command_is_quoted_for_the_shell():
-    settings = Settings(endpoint="h", project="p q", workspace="o/r", state_uri="s3://b/a b")
+    settings = Settings(endpoint="h", project="p q", workspace="o/r")
     command = build_command(settings, "--chat-key")
-    assert "--project 'p q'" in command and "--state-uri 's3://b/a b'" in command
+    assert "--project 'p q'" in command and "--state-uri" not in command
 
 
 def _binding_pb2(binding: dict[str, Any]) -> SimpleNamespace:
@@ -503,7 +501,7 @@ class _Remote:
 
 
 def sdk_with(monkeypatch, remote):
-    sdk = FlyteSdk(Settings(endpoint="e", project="my-agents", workspace="o/r", state_uri="s3://b/a"))
+    sdk = FlyteSdk(Settings(endpoint="e", project="my-agents", workspace="o/r"))
     sdk._ready = True
     monkeypatch.setattr(_bootstrap_flyte, "_load_union_remote", lambda: remote)
     return sdk

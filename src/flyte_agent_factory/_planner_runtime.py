@@ -299,7 +299,7 @@ def record_waits(plan: _planner.Plan, requests: dict[str, _queue.Request]) -> No
             text = " ".join(filter(None, (reason.with_identity, reason.detail)))
             detail = {"detail": reason.with_identity} if reason.with_identity else {}
         waits[item.name] = _queue.describe_wait(request.gen, reason.code, text, **detail)
-    _queue.write_waits(_factory_base.PROFILE.state.uri, waits)
+    _queue.write_waits(waits)
 
 
 PIN_KEY = _names.COORDINATOR_ENGINE

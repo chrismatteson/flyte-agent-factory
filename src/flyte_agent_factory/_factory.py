@@ -44,6 +44,7 @@ from flyte_agent_factory import (
     _names,
     _profile,
     _queue,
+    _state_store,
     _union_identity,
     browser,
 )
@@ -335,7 +336,12 @@ def dispatch(*, exclude_run: str = "") -> list[str]:
     try:
         return _dispatch_pending(queue, waiting, exclude_run)
     finally:
-        _queue.release_lease(queue, holder)
+        try:
+            _queue.release_lease(queue, holder)
+        except _state_store.StateError as exc:  # the runs are started: a failure here must not hide them
+            print(
+                f"[queue] could not release the dispatch lease ({exc}); it will expire on its own", flush=True
+            )
 
 
 def wake_planner_for_free_slot() -> bool:
@@ -345,7 +351,7 @@ def wake_planner_for_free_slot() -> bool:
     to wake the planner, so without this it would wait for the planner's hourly timer. Admission itself
     stays in the planner: this only asks it to look now.
     """
-    if _factory_base.PROFILE.planner.admission != "planner" or not _factory_base.PROFILE.state.uri:
+    if _factory_base.PROFILE.planner.admission != "planner":
         return False
     from . import _planner_runtime
 
@@ -420,11 +426,7 @@ def gardening_decision(now: float | None = None) -> tuple[str, list[str]]:
             permissions=_github.ISSUES_READ,
         )
         open_issues = len(app.open_issues(_github.parse_repo(_factory_base.PROFILE.repo), _gardening.LABEL))
-    regression = (
-        _gardening.regressed(_gardening.read_counts(_factory_base.PROFILE.state.uri))
-        if _factory_base.PROFILE.state.uri
-        else []
-    )
+    regression = _gardening.regressed(_gardening.read_counts())
     # With the targets unknown, a reserved slot could go to a launch that has nothing to tend.
     try:
         targets = _gardening_targets()
@@ -786,9 +788,14 @@ def _new_request(
             issue = issue or last.request.issue
             if grant is None:
                 grant = last.request.browser
+    # A generation a run on the server already carries is taken even where the queue has no entry for it
+    # (a request the bucket-era code queued and ran, not yet migrated): runs are matched to requests by
+    # these labels, so reusing one would hand the new request that old run.
+    labelled = (_factory_base.run_labels(r).get(_factory_base.LABEL_GEN, "") for r in previous)
+    used = max((int(gen) for gen in labelled if gen.isdigit()), default=0)
     return _queue.Request(
         name=name,
-        gen=_queue.next_gen(found),
+        gen=max(_queue.next_gen(found), used + 1, _queue.cutover_floor(name) + 1),
         kind="resume" if previous else "new",
         brief=brief,
         model=model,
@@ -816,7 +823,7 @@ def waiting_rows(queue: str, now: float, running: Collection[str] = ()) -> list[
     `limit`, `behind`) are from the last admission pass.
     """
     rows, position = [], 0
-    waits = _queue.read_waits(_factory_base.PROFILE.state.uri)
+    waits = _queue.read_waits()
     for entry in _queue.pending(queue):
         request = entry.request
         if request is None:
@@ -906,32 +913,29 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
         "run": run.name,
         "url": run.url,
     }
-    if _factory_base.PROFILE.state.uri:
-        queue = _factory_base.queue_root()
-        # The grant is the newest request that was or will be run: a cancelled or failed one never ran.
-        latest = next(
-            (
-                r.request
-                for e in reversed(_queue.entries(queue, result["name"]))
-                if e.closed in ("", "started") and (r := _queue.load(queue, e)).request
+    queue = _factory_base.queue_root()
+    # The grant is the newest request that was or will be run: a cancelled or failed one never ran.
+    latest = next(
+        (
+            r.request
+            for e in reversed(_queue.entries(queue, result["name"]))
+            if e.closed in ("", "started") and (r := _queue.load(queue, e)).request
+        ),
+        None,
+    )
+    if latest and latest.browser:
+        result["browser"] = list(latest.browser)
+    # A request of this project that waits, and why.
+    request = next((e.request for e in _queue.pending(queue, result["name"]) if e.request), None)
+    if request:
+        result["queued"] = {
+            **({"reason": request.reason} if request.reason else {}),
+            **(
+                {"waiting_for": _waiting_for(request.name)}
+                if _factory_base._phase(run) in _factory_base.LIVE
+                else {}
             ),
-            None,
-        )
-        if latest and latest.browser:
-            result["browser"] = list(latest.browser)
-    if _factory_base.PROFILE.state.uri:  # a request of this project that waits, and why
-        request = next(
-            (e.request for e in _queue.pending(_factory_base.queue_root(), result["name"]) if e.request), None
-        )
-        if request:
-            result["queued"] = {
-                **({"reason": request.reason} if request.reason else {}),
-                **(
-                    {"waiting_for": _waiting_for(request.name)}
-                    if _factory_base._phase(run) in _factory_base.LIVE
-                    else {}
-                ),
-            }
+        }
     try:
         page = _factory_base.report_html(run)
     except REMOTE_ERRORS:  # a remote call; its error text may hold signed URLs, so it is omitted
@@ -1015,7 +1019,7 @@ def _rotation_request(
         return None
     return dataclasses.replace(
         started,
-        gen=_queue.next_gen(found),
+        gen=max(_queue.next_gen(found), _queue.cutover_floor(started.name) + 1),
         kind="resume",
         brief=(
             "The factory's access token was rotated, so this project was stopped with a checkpoint and is "
@@ -1071,8 +1075,9 @@ def cycle_projects() -> dict[str, Any]:
     return {"status": "rotating", "projects": rows}
 
 
-# The factory env mounts no deploy key (its projects' pods do), so the scan has its own environment.
-# `_git.install_deploy_key` keeps one key per pod, which is why each repository is a separate action.
+# The factory env mounts one deploy key, for the state branch of `[repo] project`; the scan clones every
+# repository the profile names, so it has its own environment. `_git.install_deploy_key` keeps one key per
+# pod, which is why each repository is a separate action.
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_factory_base.PROFILE, "queue")
 scan_env = flyte.TaskEnvironment(
     name="gardening-scan",
@@ -1231,10 +1236,7 @@ async def set_reserve(account: str, k: float) -> str:
     `account` is claude or codex; 0 removes the reserve. The next admission uses it.
     """
     _union_identity.establish()
-    state = _factory_base.PROFILE.state.uri
-    if not state:
-        raise ValueError("the reserve needs [state] uri in the deployment profile")
-    await asyncio.to_thread(_queue.put_reserve, state, account, k)
+    await asyncio.to_thread(_queue.put_reserve, account, k)
     return json.dumps({"account": account, "k": k})
 
 
@@ -1249,8 +1251,7 @@ async def clear_limit(engine: str = "claude") -> str:
 async def get_reserve() -> str:
     """JSON of each account's reserve constant (an account that is absent has none)."""
     _union_identity.establish()
-    state = _factory_base.PROFILE.state.uri
-    return json.dumps(await asyncio.to_thread(_queue.read_reserves, state) if state else {})
+    return json.dumps(await asyncio.to_thread(_queue.read_reserves))
 
 
 @env.task(
@@ -1401,10 +1402,8 @@ async def garden_weekly() -> str:
         print(f"[gardening] scan failed: {type(exc).__name__}: {exc}", flush=True)
         scans = {}
     unscanned = {t: scan["unscanned"] for t, scan in scans.items() if "unscanned" in scan}
-    if _factory_base.PROFILE.state.uri and (
-        counts := {t: scan["counts"] for t, scan in scans.items() if "counts" in scan}
-    ):
-        await asyncio.to_thread(_gardening.record_counts, _factory_base.PROFILE.state.uri, counts)
+    if counts := {t: scan["counts"] for t, scan in scans.items() if "counts" in scan}:
+        await asyncio.to_thread(_gardening.record_counts, counts)
     result = await asyncio.to_thread(
         launch_project,
         GARDENING_BRIEF,

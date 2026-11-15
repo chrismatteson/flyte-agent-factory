@@ -96,10 +96,12 @@ auto = false
 # profile = "profiles/example.toml"           # default: profiles/<name>.toml
 # ref = ""                                    # branch; default: the repo's default branch
 
-# Optional: legacy queue state. Deployer release history lives in labelled Flyte runs.
-# Any scheme flyte.storage reaches: s3://, gs://, abfs://, file://.
-[state]
-uri = "s3://my-bucket/factory-state/my-agents/development"
+# Optional. The factory's state (queue, leases, reserves) is a branch of [repo] project, reached with the
+# deploy key; docs/state-store.md. `branch` names it when two factories share one repository, project and
+# domain (default: factory-state/<backend project>-<backend domain>). `uri` is retired: it is ignored, with a
+# warning, and only still accepted so that an old profile loads.
+# [state]
+# branch = "factory-state/my-agents-development"
 
 # Optional: the GitHub App the deployer reads commit statuses and fetches source through, and the
 # identity that opens each project's pull request (branch factory/<name>; draft on DONE, ready on a pass).

@@ -12,7 +12,7 @@ from tests._bootstrap_fakes import CLAUDE_TOKEN, World, make_context
 
 ARGS = [
     "--endpoint", "flyte.example.test", "--project", "my-agents",
-    "--workspace", "pat/agent-workspace", "--state-uri", "s3://example-bucket/state",
+    "--workspace", "pat/agent-workspace",
 ]  # fmt: skip
 
 

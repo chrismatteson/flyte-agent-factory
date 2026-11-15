@@ -133,7 +133,7 @@ def read_facts(profile: Profile) -> _planner.Facts:
             profile,
             live,
             _factory_meters.slot_meters(profile.tasks),
-            _queue.read_reserves(profile.state.uri) if profile.state.uri else {},
+            _queue.read_reserves(),
         ),
         [],
         tracked_paths={repo: app.tracked_paths(repo) for repo in repos},

@@ -524,7 +524,7 @@ class Ending:
         monkeypatch.setattr(
             _session_config,
             "_PROFILE",
-            dataclasses.replace(_own_profile(), state=_profile.State(uri="file:///state")),
+            dataclasses.replace(_own_profile(), state=_profile.State()),
         )
         monkeypatch.setattr(flyte, "ctx", lambda: SimpleNamespace(action=SimpleNamespace(run_name="r-own")))
 
@@ -647,12 +647,24 @@ async def test_a_retried_pod_after_the_end_publishes_without_a_session(ending):
 
 
 @pytest.mark.asyncio
-async def test_without_a_state_uri_there_is_no_queue_to_dispatch(ending, monkeypatch):
+async def test_a_profile_without_a_state_table_still_dispatches_the_next_project(ending, monkeypatch):
+    # The state is on the git branch and always there; `[state]` only names the branch.
     monkeypatch.setattr(
         _session_config, "_PROFILE", dataclasses.replace(_own_profile(), state=_profile.State())
     )
     await ending.run()
-    assert not any(c.startswith("dispatch") for c in ending.calls)
+    assert ending.calls.count("dispatch(r-own)") == 1
+
+
+@pytest.mark.asyncio
+async def test_without_a_state_uri_there_is_no_queue_to_dispatch(ending, monkeypatch):
+    """Bucket-era name; now checks a profile with a legacy [state] uri still dispatches the next project."""
+    monkeypatch.setattr(
+        _session_config, "_PROFILE", dataclasses.replace(_own_profile(), state=_profile.State("s3://b/p"))
+    )
+    await ending.run()
+    assert ending.calls.count("dispatch(r-own)") == 1
+    assert ending.calls[-1] == "dispatch(r-own)"
 
 
 # --- QA round 1 ------------------------------------------------------------------------------- #
@@ -727,11 +739,11 @@ async def test_a_hung_dispatch_is_a_row_and_the_run_returns(ending, monkeypatch)
     assert any(r.startswith("⚠️") and "next queued project" in r for r in rows)
 
 
-def with_state_uri(monkeypatch) -> _timeline._Timeline:
+def with_own_profile(monkeypatch) -> _timeline._Timeline:
     monkeypatch.setattr(
         _session_config,
         "_PROFILE",
-        dataclasses.replace(_own_profile(), state=_profile.State(uri="file:///state")),
+        dataclasses.replace(_own_profile(), state=_profile.State()),
     )
     return _timeline._Timeline()
 
@@ -744,7 +756,7 @@ async def test_a_hung_queue_read_does_not_stop_the_dashboard(monkeypatch):
     monkeypatch.setattr(_factory_base, "queue_root", lambda: "file:///state/queue")
     monkeypatch.setattr(_factory, "waiting_rows", lambda queue, at: release.wait(60) and [])
     monkeypatch.setattr(_checkpoint, "_QUEUE_READ_TIMEOUT_S", 0.05)
-    timeline = with_state_uri(monkeypatch)
+    timeline = with_own_profile(monkeypatch)
     timeline.queue = [{"position": 1, "name": "stale", "since": 0}]
     try:
         await asyncio.wait_for(_supervise_support._refresh_queue(timeline), 30)
@@ -759,7 +771,7 @@ async def test_a_queue_module_that_cannot_import_does_not_stop_the_dashboard(mon
 
     monkeypatch.delattr(flyte_agent_factory, "_factory", raising=False)
     monkeypatch.setitem(sys.modules, "flyte_agent_factory._factory", None)
-    timeline = with_state_uri(monkeypatch)
+    timeline = with_own_profile(monkeypatch)
     timeline.queue = [{"position": 1, "name": "stale", "since": 0}]
     await _supervise_support._refresh_queue(timeline)  # does not raise
     assert timeline.queue == []
@@ -963,7 +975,7 @@ async def test_a_hung_queue_read_is_not_started_again(monkeypatch):
     monkeypatch.setattr(
         _session_config,
         "_PROFILE",
-        dataclasses.replace(_own_profile(), state=_profile.State(uri="file:///q")),
+        dataclasses.replace(_own_profile(), state=_profile.State()),
     )
     monkeypatch.setattr(_factory, "waiting_rows", hang)
     monkeypatch.setattr(_factory_base, "queue_root", lambda: "file:///q/queue")
@@ -987,7 +999,7 @@ async def test_a_refresh_skipped_behind_a_hung_read_shows_no_stale_queue(monkeyp
     monkeypatch.setattr(
         _session_config,
         "_PROFILE",
-        dataclasses.replace(_own_profile(), state=_profile.State(uri="file:///q")),
+        dataclasses.replace(_own_profile(), state=_profile.State()),
     )
     monkeypatch.setattr(_factory, "waiting_rows", lambda *_a: gate.wait(60) and [])
     monkeypatch.setattr(_factory_base, "queue_root", lambda: "file:///q/queue")

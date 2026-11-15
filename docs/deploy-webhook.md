@@ -40,10 +40,10 @@ most two bodies are read at once (`MAX_CONCURRENT_BODIES`), so unsigned requests
 3. Give the app's own service identity permission to list live runs in the factory project/domain,
    read the latest version of `factory-deployer.deploy_if_changed`, and create runs of that task.
    Scope run creation to that task where supported. It needs no slot-task execution, GitHub App
-   private key, storage-write or deployment permissions. The deployer keeps its existing identity.
+   private key or deployment permissions. The deployer keeps its existing identity.
    With issue intake (`[github] maintainers`), it also reads the latest version of
    `factory-issues.process` and creates runs of it. It submits that deployed task by name, so it
-   still needs no storage-write permission. For event repair it also lists and reads reconcile runs,
+   needs no extra permission for that. For event repair it also lists and reads reconcile runs,
    reads `factory-reconcile.reconcile`, and creates runs of that task. Work-slot identities need the
    same task-read/run-create permission for their final completion notification.
 4. In the existing GitHub App's settings, enable webhooks, set the webhook URL to
@@ -71,7 +71,7 @@ most two bodies are read at once (`MAX_CONCURRENT_BODIES`), so unsigned requests
    CI event or an accepted issue event 202, and unrelated events/branches, still-running CI and
    issue events that intake refuses 204. Use **Redeliver** to exercise the same delivery again.
    A live deployer or pending submission suppresses another run; a later run for the same SHA
-   pair is a no-op because `deployer/last.json` records the last successful deployment.
+   pair is a no-op because the newest successful deployer run's outputs record the SHA pair it deployed.
 
 The HTTP handler schedules submission and returns without waiting for Flyte. A 202 acknowledges
 intake, not durable submission or deployment success. The app serves `/github` and the signed internal planner wake endpoint; FastAPI's
@@ -127,8 +127,7 @@ allowlisting in front of the app (the ingress), not in the app.
 With `[github] maintainers = ["your-login"]` (and optionally `intake_label`, default `factory`)
 the webhook also turns GitHub issues into projects. Empty `maintainers` disables intake, and then
 issue events get 204 like any other unrelated event. Intake needs `webhook_secret`; `maintainers`
-without it does nothing, and the profile loader warns about that. It also needs `[state] uri`: an
-accepted event without `[state] uri` gets 503. The App needs Issues: write and its existing PR
+without it does nothing, and the profile loader warns about that. The App needs Issues: write and its existing PR
 permissions on each `[repo]` repository. Repository aliases are accepted too; MCP's narrower repo
 list does not restrict signed issue intake.
 
@@ -148,8 +147,8 @@ do nothing. Issue content is fenced as untrusted project data, and session guida
 cannot change factory or security settings. Refused authors receive no GitHub reply.
 
 Queue requests retain `issue = "owner/repo#number"`; runs carry a `factory-issue` label derived
-from that reference. The intake lease uses the queue's existing approximate storage lease, with
-the same eventual-consistency limitations. A crash between signalling a condition and recording
+from that reference. The intake lease is a compare-and-swap commit on the factory's state branch
+([state-store.md](state-store.md)). A crash between signalling a condition and recording
 delivery can repeat a direction on retry.
 
 The supervisor posts started, QA verdict, PR opened, blocked/escalated and released/ended
@@ -159,7 +158,7 @@ so retries check the marker first. Concurrent writers can both pass that check; 
 checks again and deletes its own comment if an older copy exists. A comment GitHub refuses stays in
 the supervisor's memory and is retried every minute; the end of the run waits at most 30 seconds
 for what is left. Nothing is
-queued in `[state]`. `factory-reconcile` then re-derives the started, QA verdict, PR opened and
+queued. `factory-reconcile` then re-derives the started, QA verdict, PR opened and
 ended comments from each run's report and posts any that are missing, for runs live or ended in the
 last day; while a run is live it leaves a comment to the supervisor for its first 10 minutes. An
 escalation the supervisor could not post before its pod died is not re-derived: it is still in the
@@ -240,7 +239,7 @@ task, which holds the board PAT and App key. Enable **Pushes**, **Branch or tag
 creation**, **Pull requests** and **Issues** deliveries. The App needs Issues
 read/write, Pull requests read, Contents read and Commit statuses write; the
 public app identity needs permission to submit `factory-issues.process`, even
-when maintainer intake is disabled. Board updates do not require `[state]`.
+when maintainer intake is disabled. Board updates keep no factory state.
 
 A push to `main`, including a merge commit, completes whole-item references,
 comments with the commit URL and closes the issue through the App. Partial

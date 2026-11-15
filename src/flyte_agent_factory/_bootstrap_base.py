@@ -244,7 +244,6 @@ class Settings:
     endpoint: str
     project: str
     workspace: str  # owner/repo
-    state_uri: str
     domain: str = DEFAULT_DOMAIN
     backend: str = "union"
     engine: str = "claude"

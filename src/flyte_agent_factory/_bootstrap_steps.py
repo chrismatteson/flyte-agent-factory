@@ -217,7 +217,7 @@ class ProjectStep:
 class WorkspaceStep:
     """The repository exists and is not public.
 
-    The profile written into it names private deployment coordinates (host, project, bucket, secret
+    The profile written into it names private deployment coordinates (host, project, secret
     names), and the operator's notes live there too.
     """
 

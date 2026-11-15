@@ -1,10 +1,11 @@
-"""Finding the deployed commit by content, and what a deploy would bring."""
+"""Reading the deployed commit from the task's stamp, and what a deploy would bring."""
 
 from __future__ import annotations
 
 import importlib.util
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,24 +41,61 @@ def history(tmp_path, monkeypatch):
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "docs only")
     shas.append(_git(repo, "rev-parse", "HEAD"))
+    main = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _git(repo, "checkout", "-qb", "side")
+    (pkg / "agent.py").write_text("side edit")
+    _git(repo, "commit", "-qam", "side edit")
+    shas.append(_git(repo, "rev-parse", "HEAD"))  # shas[4]: not an ancestor of main
+    _git(repo, "checkout", "-q", main)
     monkeypatch.setattr(deploy_status, "REPO", repo)
     return repo, shas
 
 
-def _bundle(tmp_path, files):
-    root = tmp_path / "bundle" / "flyte_agent_factory"
-    root.mkdir(parents=True)
-    for name, body in files.items():
-        (root / name).write_text(body)
-    return tmp_path / "bundle"
+def _stamped(monkeypatch, sha, args=()):
+    """Make `remote.Task.get(...).fetch()` return a task whose spec carries `sha` as the engine stamp."""
+    from flyte import remote
+
+    env = [SimpleNamespace(key="AGENT_FACTORY_ENGINE_SHA", value=sha)] if sha else []
+    container = SimpleNamespace(args=list(args), env=env)
+    task = SimpleNamespace(
+        version="v2x",
+        pb2=SimpleNamespace(spec=SimpleNamespace(task_template=SimpleNamespace(container=container))),
+    )
+    monkeypatch.setattr(remote.Task, "get", lambda *a, **k: SimpleNamespace(fetch=lambda: task))
 
 
-def test_a_partial_bundle_matches_the_newest_commit_with_its_files(history, tmp_path):
-    """Bundles carry only loaded modules: `unused.py` is absent and must not prevent a match."""
+def test_a_partial_bundle_matches_the_newest_commit_with_its_files(history, monkeypatch):
+    """Bucket-era name; now checks a stamp of shas[1] reports shas[1], whatever modules a bundle carried."""
     _, shas = history
-    blobs = deploy_status.bundle_blobs(_bundle(tmp_path, {"agent.py": "v2", "_bridge.py": "bridge"}))
-    commits = list(reversed(shas))
-    assert deploy_status.match_commit(blobs, commits) == shas[1]
+    _stamped(monkeypatch, shas[1])
+    row = deploy_status.status("agent-one.project", shas[3], "origin/main")
+    assert row["commit"] == shas[1]
+
+
+def test_the_deployed_commit_is_read_from_the_task_stamp_not_a_bundle(history, monkeypatch):
+    from flyte import storage
+
+    _, shas = history
+
+    def no_download(*a, **k):
+        raise AssertionError("bundle downloaded")
+
+    monkeypatch.setattr(storage, "get", no_download)
+    _stamped(monkeypatch, shas[1], args=["--tgz", "s3://never/read"])
+    row = deploy_status.status("agent-one.project", shas[3], "origin/main")
+    assert row["commit"] == shas[1]
+    assert [line.split(" ", 1)[1] for line in row["behind"]] == ["change v3"]
+    assert "uncertain" not in row
+    source = (Path(__file__).resolve().parents[1] / "ops" / "deploy_status.py").read_text()
+    assert "storage" not in source
+
+
+def test_an_unstamped_task_is_reported_as_unidentified(history, monkeypatch):
+    _, shas = history
+    _stamped(monkeypatch, "")
+    row = deploy_status.status("agent-one.project", shas[3], "origin/main")
+    assert "AGENT_FACTORY_ENGINE_SHA" in row["error"] and "redeploy" in row["error"]
+    assert "could not check" in deploy_status.render([row])
 
 
 def test_behind_lists_only_changes_to_the_package(history):
@@ -69,12 +107,13 @@ def test_behind_lists_only_changes_to_the_package(history):
     assert deploy_status.behind(shas[2], shas[3]) == [], "a docs-only commit needs no deploy"
 
 
-def test_unknown_code_is_said_plainly(history, tmp_path):
+def test_unknown_code_is_said_plainly(history, monkeypatch):
+    """Bucket-era name; now checks a stamp on a side branch is reported as not on the ref."""
     _, shas = history
-    blobs = deploy_status.bundle_blobs(_bundle(tmp_path, {"agent.py": "local edit"}))
-    assert deploy_status.match_commit(blobs, list(reversed(shas))) is None
-    rows = [{"task": "agent-own.project", "version": "abcdef12", "commit": None, "note": "matches no commit"}]
-    assert "matches no commit" in deploy_status.render(rows)
+    _stamped(monkeypatch, shas[4])
+    row = deploy_status.status("agent-own.project", shas[3], "origin/main")
+    assert row["commit"] is None and "not on origin/main" in row["note"]
+    assert "not on origin/main" in deploy_status.render([row])
 
 
 def test_render_says_how_far_behind_and_names_no_human_deploy():
@@ -124,7 +163,7 @@ def test_deploy_status_emits_no_deploy_needed_note():
 
 
 def test_a_change_to_an_unbundled_module_is_reported_uncertain_not_hidden(tmp_path, monkeypatch):
-    """qa: deployed A, then B changed only voice.py; the newest match was B and 'up to date' was reported."""
+    """Bucket-era name; now checks deployed A exactly; B (voice.py only) is behind, nothing uncertain."""
     repo = tmp_path / "r"
     pkg = repo / "src" / "flyte_agent_factory"
     pkg.mkdir(parents=True)
@@ -135,15 +174,15 @@ def test_a_change_to_an_unbundled_module_is_reported_uncertain_not_hidden(tmp_pa
     (pkg / "voice.py").write_text("v1")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "A")
+    a = _git(repo, "rev-parse", "HEAD")
     (pkg / "voice.py").write_text("v2")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "B voice only")
     monkeypatch.setattr(deploy_status, "REPO", repo)
-    commits = _git(repo, "rev-list", "HEAD").split()
-    blobs = deploy_status.bundle_blobs(_bundle(tmp_path, {"agent.py": "a1"}))
-    newest, oldest = deploy_status.match_range(blobs, commits)
-    assert newest == commits[0] and oldest == commits[1]
-    assert [c.split(" ", 1)[1] for c in deploy_status.behind(oldest, commits[0])] == ["B voice only"]
+    _stamped(monkeypatch, a)
+    row = deploy_status.status("agent-one.project", _git(repo, "rev-parse", "HEAD"), "origin/main")
+    assert [c.split(" ", 1)[1] for c in row["behind"]] == ["B voice only"]
+    assert "uncertain" not in row and "oldest" not in row
 
 
 def test_a_failed_fetch_falls_back_instead_of_crashing(monkeypatch, tmp_path):

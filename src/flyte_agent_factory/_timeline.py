@@ -15,6 +15,7 @@ import flyte
 import flyte.report
 
 from flyte_agent_factory import (
+    _auth,
     _dashboard,
     _instructions,
     _issues,
@@ -23,6 +24,7 @@ from flyte_agent_factory import (
     _policy,
     _roles,
     _session_config,
+    _state,
 )
 from flyte_agent_factory._bridge import DEFAULT_ASK_TIMEOUT_S, Bridge, _write_atomic, redact_tokens
 from flyte_agent_factory._delegation import ActiveJob, Delegations, EndedJob
@@ -679,6 +681,10 @@ class _Timeline:
                 "labels": [dict(row) for row in self.metric_labels],
             },
             "schema": _dashboard.SCHEMA,
+            # Where the factory finds this run again if it is aborted from inside (`_factory_recreate`):
+            # the checkpoint it saves to, and the client id of its API key. Every report flush carries them.
+            "checkpoint": _state.checkpoint_location(),
+            "app": _auth.own_client_id(),
             "generated_at": int(now // 60 * 60),
             "project": self._labels.get("project", ""),
             "goal": _brief_goal(),

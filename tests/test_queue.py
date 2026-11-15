@@ -1,9 +1,10 @@
-"""The launch queue's storage and dispatch order, against a real local state directory."""
+"""The launch queue's storage and dispatch order, against a local git state store."""
 
 import asyncio
 import dataclasses
 import json
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,8 @@ from pathlib import Path
 import pytest
 
 from flyte_agent_factory import _factory as factory
-from flyte_agent_factory import _factory_base, _queue, _timeline
+from flyte_agent_factory import _factory_base, _queue, _state_store, _timeline
+from tests.state_git import make_store, rival_wins_first_push
 
 
 def request(name, gen=1, at=100.0, **kw):
@@ -29,11 +31,12 @@ def request(name, gen=1, at=100.0, **kw):
 
 
 def files(queue):
-    return sorted(
-        str(p.relative_to(queue.removeprefix("file://")))
-        for p in Path(queue.removeprefix("file://")).rglob("*")
-        if p.is_file()
-    )
+    return sorted(path.removeprefix(f"{queue}/") for path in _queue._fs(queue).find(queue))
+
+
+def put(path, body):
+    """Write a file into the state store as something other than the queue's own writers would."""
+    _queue._write(path, body if isinstance(body, bytes) else body.encode())
 
 
 def fill_slots(world, *names):
@@ -94,9 +97,7 @@ def test_a_request_whose_run_exists_is_closed_on_sight(flyte_world):
 
 
 def test_an_unreadable_request_is_an_error_row_and_does_not_block_the_head(flyte_world):
-    bad = Path(flyte_world.queue.removeprefix("file://")) / "aaa" / "0001.json"
-    bad.parent.mkdir(parents=True)
-    bad.write_text("{not json")
+    put(f"{flyte_world.queue}/aaa/0001.json", "{not json")
     _queue.enqueue(flyte_world.queue, request("bbb"))
     view = factory.queue_view()
     assert [r.get("position") for r in view["queue"]] == [1, None]
@@ -106,9 +107,7 @@ def test_an_unreadable_request_is_an_error_row_and_does_not_block_the_head(flyte
 
 
 def test_foreign_objects_do_not_break_the_listing(queue_state):
-    stray = Path(queue_state.removeprefix("file://")) / "alpha" / "notes.txt"
-    stray.parent.mkdir(parents=True)
-    stray.write_text("hi")
+    put(f"{queue_state}/alpha/notes.txt", "hi")
     _queue.enqueue(queue_state, request("alpha"))
     assert [e.name for e in _queue.entries(queue_state)] == ["alpha"]
 
@@ -154,8 +153,16 @@ def test_the_chat_tasks_are_thin_wrappers(flyte_world):
 # --- the dispatch lease ---------------------------------------------------------------------------
 
 
-def lease_file(queue):
-    return Path(queue.removeprefix("file://")) / ".dispatch-lease.json"
+def lease_path(queue):
+    return f"{queue}/.dispatch-lease.json"
+
+
+def lease_holder(queue):
+    return json.loads(_queue._fs(lease_path(queue)).cat_file(lease_path(queue)))["holder"]
+
+
+def lease_exists(queue):
+    return _queue._fs(lease_path(queue)).exists(lease_path(queue))
 
 
 def test_the_lease_goes_to_one_holder_until_it_expires_or_is_released(queue_state):
@@ -166,25 +173,77 @@ def test_the_lease_goes_to_one_holder_until_it_expires_or_is_released(queue_stat
         _queue.take_lease(queue_state, "b", now=1002 + _queue.LEASE_TTL + 1) is None
     )  # a's (renewed at 1002) expired
     _queue.release_lease(queue_state, "a")  # a no longer holds it: b's lease stays
-    assert json.loads(lease_file(queue_state).read_text())["holder"] == "b"
+    assert lease_holder(queue_state) == "b"
     _queue.release_lease(queue_state, "b")
-    assert not lease_file(queue_state).exists()
+    assert not lease_exists(queue_state)
 
 
 @pytest.mark.parametrize("junk", ["{not json", "[]", '{"holder": 3}', '{"holder": "x"}'])
 def test_a_corrupt_lease_is_absent(queue_state, junk):
-    lease_file(queue_state).parent.mkdir(parents=True)
-    lease_file(queue_state).write_text(junk)
+    put(lease_path(queue_state), junk)
     assert _queue.take_lease(queue_state, "a", now=1000) is None
 
 
-def test_the_last_writer_in_the_settle_window_gets_the_lease(queue_state, monkeypatch):
-    # two takers both saw no lease; b writes after a, so after the settle a's re-read finds b
-    def rival_writes(_seconds):
-        lease_file(queue_state).write_text(json.dumps({"holder": "b", "expires": 5000}))
+def test_a_taker_that_loses_the_race_for_the_lease_finds_the_winner(
+    queue_state, state_store, tmp_path, monkeypatch
+):
+    # two takers both saw no lease; b's push lands between a's read and a's push, so a's push is rejected
+    # and a's re-read finds b. (The bucket store wrote, waited LEASE_SETTLE seconds and re-read.)
+    rival = make_store(tmp_path, remote=Path(state_store.remote), name="rival")
+    real_push = type(state_store)._push
+    pushes: list[str] = []
 
-    monkeypatch.setattr(time, "sleep", rival_writes)
+    def rival_pushes_first(self, commit):
+        if self is state_store:  # the rival's own push goes through untouched
+            first = not pushes
+            pushes.append(commit)
+            if first:
+                lease = json.dumps({"holder": "b", "expires": 5000}).encode()
+                rival.write({"queue/.dispatch-lease.json": lease}, "b")
+        return real_push(self, commit)
+
+    monkeypatch.setattr(type(state_store), "_push", rival_pushes_first)
     assert _queue.take_lease(queue_state, "a", now=1000) == "b"
+    assert len(pushes) == 1  # rejected once; the second attempt decided "held" and pushed nothing
+
+
+def test_two_takers_on_separate_stores_never_both_get_the_lease(
+    queue_state, state_store, tmp_path, monkeypatch
+):
+    """Each thread is a pod with its own cache directory over one remote: exactly one takes the lease."""
+    local = threading.local()
+    monkeypatch.setattr(_state_store, "current", lambda **_: local.store)
+    for round_ in range(5):
+        results: dict[str, str | None] = {}
+        barrier = threading.Barrier(2)
+
+        def taker(holder, round_=round_, barrier=barrier, results=results):
+            local.store = make_store(tmp_path, remote=Path(state_store.remote), name=f"{holder}-{round_}")
+            barrier.wait(timeout=30)
+            results[holder] = _queue.take_lease(queue_state, holder, now=1000)
+
+        threads = [threading.Thread(target=taker, args=(holder,)) for holder in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        assert sorted(results, key=str) == ["a", "b"]
+        [winner] = [holder for holder, seen in results.items() if seen is None]
+        loser = "b" if winner == "a" else "a"
+        assert results[loser] == winner
+        local.store = make_store(tmp_path, remote=Path(state_store.remote), name=f"reader-{round_}")
+        assert lease_holder(queue_state) == winner
+        _queue.release_lease(queue_state, winner)
+
+
+def test_the_last_writer_in_the_settle_window_gets_the_lease(queue_state, state_store, tmp_path, monkeypatch):
+    """Bucket-era name; now checks of two racing takers one gets the lease and the loser sees it."""
+    lease = json.dumps({"holder": "b", "expires": 5000}).encode()
+    rival_wins_first_push(monkeypatch, state_store, tmp_path, {"queue/.dispatch-lease.json": lease})
+    assert _queue.take_lease(queue_state, "a", now=1000) == "b"
+    assert lease_holder(queue_state) == "b"
+    # The winner still holds it: a did not overwrite it.
+    assert _queue.take_lease(queue_state, "b", now=1001) is None
 
 
 def test_the_lease_is_listed_by_nobody(queue_state):
@@ -198,14 +257,27 @@ def test_dispatch_holds_the_lease_while_it_runs_and_releases_it_even_on_error(fl
     seen = []
 
     def boom(*args, **kwargs):
-        seen.append(json.loads(lease_file(flyte_world.queue).read_text())["holder"])
+        seen.append(lease_holder(flyte_world.queue))
         raise RuntimeError("boom")
 
     monkeypatch.setattr(factory, "launch_on_slot", boom)
     with pytest.raises(RuntimeError):
         factory.dispatch()
     assert len(seen) == 1
-    assert not lease_file(flyte_world.queue).exists()
+    assert not lease_exists(flyte_world.queue)
+
+
+def test_dispatch_returns_the_started_runs_when_the_lease_cannot_be_released(
+    flyte_world, monkeypatch, capsys
+):
+    _queue.enqueue(flyte_world.queue, request("alpha"))
+
+    def cannot_release(queue, holder):
+        raise _state_store.StateError("push failed")
+
+    monkeypatch.setattr(_queue, "release_lease", cannot_release)
+    assert [run.split("-")[0] for run in factory.dispatch()] == ["alpha"]
+    assert "will expire on its own" in capsys.readouterr().out
 
 
 def test_dispatch_does_nothing_while_another_dispatcher_holds_the_lease(flyte_world):
@@ -214,7 +286,7 @@ def test_dispatch_does_nothing_while_another_dispatcher_holds_the_lease(flyte_wo
     assert factory.dispatch() == []
     assert flyte_world.created == []
     assert [e.name for e in _queue.pending(flyte_world.queue)] == ["alpha"]
-    assert json.loads(lease_file(flyte_world.queue).read_text())["holder"] == "someone-else"
+    assert lease_holder(flyte_world.queue) == "someone-else"
 
 
 def test_when_both_markers_exist_the_later_one_wins(queue_state):
@@ -253,9 +325,8 @@ def test_a_request_with_a_field_of_the_wrong_type_is_not_a_request(field):
 
 @pytest.mark.parametrize("body", [request("alpha", gen=1), request("bravo", gen=2)])
 def test_a_request_whose_body_disagrees_with_its_path_is_closed_failed_as_corrupt(flyte_world, body):
-    path = Path(flyte_world.queue.removeprefix("file://")) / "bravo" / "0001.json"
-    path.parent.mkdir(parents=True)
-    path.write_bytes(body.to_json())  # a bravo/0001 file that says it is something else
+    path = f"{flyte_world.queue}/bravo/0001.json"
+    put(path, body.to_json())  # a bravo/0001 file that says it is something else
     _queue.enqueue(flyte_world.queue, request("charlie", at=200))
     assert [run.split("-")[0] for run in factory.dispatch()] == ["charlie"]
     assert "corrupt" in _queue.marker(flyte_world.queue, "bravo", 1, "failed")["error"]
@@ -264,13 +335,12 @@ def test_a_request_whose_body_disagrees_with_its_path_is_closed_failed_as_corrup
         ("charlie", "started"),
     ]
     assert flyte_world.created[0]["inputs"]["name"] == "charlie"
-    assert not (path.parent / "0001.started").exists() and not (path.parent / "0001.cancelled").exists()
+    assert not _queue._fs(path).exists(f"{flyte_world.queue}/bravo/0001.started")
+    assert not _queue._fs(path).exists(f"{flyte_world.queue}/bravo/0001.cancelled")
 
 
 def test_a_corrupt_request_alone_is_still_closed(flyte_world):
-    path = Path(flyte_world.queue.removeprefix("file://")) / "bravo" / "0001.json"
-    path.parent.mkdir(parents=True)
-    path.write_bytes(request("alpha").to_json())
+    put(f"{flyte_world.queue}/bravo/0001.json", request("alpha").to_json())
     assert factory.dispatch() == []
     assert _queue.entries(flyte_world.queue)[0].closed == "failed"
 
@@ -543,25 +613,60 @@ def test_status_rows_from_the_json_timeline_carry_a_utc_clock(flyte_world, monke
         _time.tzset()
 
 
-def test_listing_returns_uris_the_store_reads_back(state_uri, tmp_path):
-    """Object-store listings drop the scheme; a path without it would reach the local filesystem."""
-    prefix = f"{state_uri}/outbox"
+def test_listing_returns_paths_the_store_reads_back():
+    """A listed path is a full state path, the one `_fs` takes: nothing else could read it."""
+    prefix = f"{_state_store.ROOT}/outbox"
     for name in ("2.json", "1.json", "notes.txt", "nested/3.json"):
         _queue._write(f"{prefix}/{name}", name.encode())
     found = _queue.listing(prefix)
     assert found == [f"{prefix}/1.json", f"{prefix}/2.json", f"{prefix}/nested/3.json"]
     assert [_queue._fs(path).cat_file(path) for path in found] == [b"1.json", b"2.json", b"nested/3.json"]
-    assert _queue.listing(f"{state_uri}/nothing-here") == []
+    assert _queue.listing(f"{_state_store.ROOT}/nothing-here") == []
 
 
-def test_listing_keeps_a_plain_local_path_plain(tmp_path):
+def test_listing_keeps_a_plain_local_path_plain():
+    """Bucket-era name; now checks a listing returns the state path unrewritten and honours the suffix."""
+    prefix = f"{_state_store.ROOT}/outbox"
+    _queue._write(f"{prefix}/a.json", b"{}")
+    [found] = _queue.listing(prefix)
+    assert found == f"{prefix}/a.json"
+    assert _queue.listing(prefix, ".cancelled") == []
+
+
+def test_listing_returns_uris_the_store_reads_back():
+    """Bucket-era name; now checks listed paths read back through the store as the queued requests."""
+    queue = _queue.root(_state_store.ROOT)
+    _queue.enqueue(queue, request("alpha"))
+    _queue.enqueue(queue, request("bravo"))
+    found = _queue.listing(queue)
+    assert [path.removeprefix(f"{queue}/") for path in found] == ["alpha/0001.json", "bravo/0001.json"]
+    read_back = [json.loads(_queue._fs(path).cat_file(path))["name"] for path in found]
+    assert read_back == ["alpha", "bravo"]
+
+
+def test_entries_read_an_object_store(state_store, tmp_path):
+    """Bucket-era name; now checks entries come from the git state store: a second store sees them."""
+    queue = _queue.root(_state_store.ROOT)
+    _queue.enqueue(queue, request("alpha"))
+    _queue.enqueue(queue, request("beta"))
+    _queue.mark(queue, "beta", 1, "started", run="beta-1-0-abcdef")
+    _state_store.configure(make_store(tmp_path, remote=Path(state_store.remote), name="reader"))
+    assert [(e.name, e.closed) for e in _queue.entries(queue)] == [("alpha", ""), ("beta", "started")]
+    assert [e.request.name for e in _queue.pending(queue) if e.request] == ["alpha"]
+
+
+def test_a_path_outside_the_state_root_is_refused(tmp_path):
+    """No object-store or local-file backend remains: a path that is not under the state root is an error."""
     (tmp_path / "a.json").write_text("{}")
-    assert _queue.listing(str(tmp_path)) == [str(tmp_path / "a.json")]
+    for path in (str(tmp_path), tmp_path.as_uri(), "s3://bucket/state"):
+        with pytest.raises(ValueError, match="not under"):
+            _queue.listing(path)
+        with pytest.raises(ValueError, match="not under"):
+            _queue._write(f"{path}/a.json", b"{}")
 
 
-def test_entries_read_an_object_store(state_uri, monkeypatch):
-    monkeypatch.setattr(_queue, "LEASE_SETTLE", 0)
-    queue = _queue.root(state_uri)
+def test_entries_read_the_store():
+    queue = _queue.root(_state_store.ROOT)
     _queue.enqueue(queue, request("alpha"))
     _queue.enqueue(queue, request("beta"))
     _queue.mark(queue, "beta", 1, "started", run="beta-1-0-abcdef")

@@ -19,16 +19,38 @@ def read(path):
     return (ROOT / path).read_text()
 
 
-def test_queue_state_requirement_reaches_both_personal_profile_users():
-    source = read("src/flyte_agent_factory/_factory_base.py")
-    assert "if not PROFILE.state.uri:" in source
+def test_setup_docs_ask_for_no_state_bucket():
     guide = read("docs/quickstart.md")
-    assert "[state]" in guide and re.search(r'^uri\s*=\s*"\w+://', guide, re.MULTILINE)
     assert "example-claude-personal.toml" in guide and "example-codex-personal.toml" in guide
+    assert "state-store.md" in guide and "--state-uri" in guide  # said once, as deprecated
+    reference = read("skills/agent-factory/references/setup.md")
+    assert "No state bucket" in reference
     for operation in ("ListBucket", "GetObject", "PutObject", "DeleteObject"):
-        assert operation in guide
-    assert "runtime" in guide and "local" in guide
-    assert "storage" in read("skills/agent-factory/references/setup.md").lower()
+        assert operation not in guide and operation not in reference
+
+
+PERSONAL_PROFILES = ("profiles/example-claude-personal.toml", "profiles/example-codex-personal.toml")
+
+
+def test_queue_state_requirement_reaches_both_personal_profile_users():
+    """Bucket-era name; now checks the personal profiles and guide put state on a git branch, no bucket."""
+    source = read("src/flyte_agent_factory/_factory_base.py")
+    assert "if not PROFILE.state.uri:" not in source
+    guide = read("docs/quickstart.md")
+    assert "orphan git" in guide and "branch" in guide and "no bucket" in guide
+    for path in PERSONAL_PROFILES:
+        assert not re.search(r"^\s*(\[state\]|uri\s*=)", read(path), re.MULTILINE), path
+    assert "git branch" in read("skills/agent-factory/references/setup.md")
+
+
+def test_quickstart_storage_probe_runs_without_network(tmp_path, monkeypatch):
+    """Bucket-era name; now checks the quickstart has no storage probe and personal profiles need no uri."""
+    from flyte_agent_factory import _profile
+
+    assert "<<'PYTHON'" not in read("docs/quickstart.md")
+    monkeypatch.delenv("AGENT_FACTORY_PROFILE_TOML", raising=False)
+    for path in PERSONAL_PROFILES:
+        assert _profile.parse(read(path)).state.uri == "", path
 
 
 def test_deploy_environment_needs_no_injected_key_and_the_guides_never_ask_for_one():
@@ -110,25 +132,6 @@ def test_comment_check_sees_whole_line_and_inline_comments_but_not_heredoc_bodie
     assert without_heredoc_bodies("python - <<'PY'\n# fine\nPY\nls # no") == ["python - <<'PY'", "ls # no"]
 
 
-def test_quickstart_storage_probe_runs_without_network(tmp_path, monkeypatch):
-    from flyte_agent_factory import _profile
-
-    state = tmp_path / "state"
-    state.mkdir()
-    profile = tmp_path / "profile.toml"
-    profile.write_text(
-        read("profiles/example-claude-personal.toml") + f'\n[state]\nuri = "{state.as_uri()}"\n'
-    )
-    monkeypatch.setenv("AGENT_FACTORY_PROFILE", str(profile))
-    monkeypatch.delenv("AGENT_FACTORY_PROFILE_TOML", raising=False)
-    monkeypatch.setattr(_profile, "PROFILES_DIR", tmp_path)
-    guide = read("docs/quickstart.md")
-    code = re.search(r"<<'PYTHON'\n(.*?)\nPYTHON", guide, re.DOTALL)
-    assert code
-    exec(compile(code[1], "quickstart-storage-probe", "exec"), {})
-    assert not list(state.iterdir())
-
-
 def test_setup_shell_examples_parse_in_bash():
     for path in ("docs/quickstart.md", "docs/chat-operator.md", "docs/factory-mcp-setup.md"):
         for block in re.findall(r"```bash\n(.*?)```", read(path), re.DOTALL):
@@ -187,7 +190,6 @@ def test_the_documented_admin_grant_is_the_command_the_bootstrap_prints():
         endpoint="flyte.example.com",
         project="my-agents",
         workspace="you/agent-workspace",
-        state_uri="s3://my-agent-state/factory/mine",
     )
     grant = build_command(example, "--grant factory-deployer factory-deployer")
     section = read("docs/factory-mcp-setup.md").split("### Grant the key a role", 1)[1]
@@ -578,7 +580,7 @@ def test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them(
             }
             required_by_heading = {
                 "GitHub": ("CODEOWNERS", "@OWNER"),
-                "Profile": ("filled-in", "[state]", "[backend]", "[repo]", "[secrets]", "never overwrite"),
+                "Profile": ("filled-in", "[backend]", "[repo]", "[secrets]", "never overwrite"),
                 "Deploy": ("[mcp] public_url", "only", "one copy-paste command"),
                 "Factory MCP": ("grant block", "client_id", "factory-chat", "one copy-paste command"),
             }
@@ -599,7 +601,7 @@ def test_install_audit_classifies_every_step_and_keeps_external_work_not_run():
         assert any(label in row[1] for label in ("Chat-done", "One copy-paste command", "UI/admin"))
         assert "`" in row[2] and "RUN" in row[2], f"Missing runnable/source evidence: {row}"
         assert "NOT RUN" in row[3], f"Missing live limitation and substitute: {row}"
-    for value in ("CODEOWNERS", "[state]", "public_url", "client_id"):
+    for value in ("CODEOWNERS", "public_url", "client_id"):
         assert any(value in " ".join(row) and "One copy-paste command" in row[1] for row in rows)
     assert "test_setup_operator_prepares_filled_in_handoffs_at_the_step_that_needs_them" in audit
     page = read("docs/install-audit.md")  # the skill-install row sits above the walkthrough section

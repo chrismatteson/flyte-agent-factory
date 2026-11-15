@@ -14,10 +14,8 @@ from pathlib import Path
 from flyte.io import Dir
 
 from flyte_agent_factory import (
-    _auth,
     _inbox,
     _policy,
-    _queue,
     _secret_env,
     _session_config,
     _state,
@@ -235,27 +233,6 @@ def _ended_path() -> Path:
     return _session_config.STATE_ROOT / "ended.json"
 
 
-async def _note_checkpoint_location(timeline: _timeline._Timeline, run_name: str) -> None:
-    """Tell the factory where this run's checkpoint is and which API key it runs with.
-
-    The factory recreates a run aborted from inside it -- by this run's own key, which it can only
-    tell by the client id noted here -- and resumes it from that checkpoint. Best effort: without the
-    note such an abort is final, as it was before, so a failure here only shows on the timeline.
-    """
-    location, app = _state.checkpoint_location(), _auth.own_client_id()
-    if not ((location or app) and _session_config._PROFILE and _session_config._PROFILE.state.uri):
-        return
-    try:
-        await asyncio.wait_for(
-            _inbox._in_daemon_thread(
-                _queue.note_checkpoint, _session_config._PROFILE.state.uri, run_name, location, app
-            ),
-            timeout=30,
-        )
-    except (asyncio.TimeoutError, *REMOTE_ERRORS) as e:
-        timeline.row("⚠️", f"could not record where this run's checkpoint is: {type(e).__name__}: {e}")
-
-
 #: The last act must end: a hung dispatch or queue read would otherwise hold the run (or the
 #: dashboard loop) open after its work is published.
 _HAND_OVER_DISPATCH_TIMEOUT_S = 120.0
@@ -292,8 +269,6 @@ async def _hand_over_slot(timeline: _timeline._Timeline, run_name: str, *, compl
             timeline.row("⚠️", "completion wake failed; the safety-net timer will scan again")
     if _session_config._PROFILE and _session_config._PROFILE.planner.admission == "planner":
         return
-    if not (_session_config._PROFILE and _session_config._PROFILE.state.uri):
-        return  # no launch queue in this deployment
     try:
         # Lazily: `_factory` needs a profile at import. `exclude_run` because this run is still
         # RUNNING, and would otherwise make its own slot look busy.

@@ -651,11 +651,23 @@ async def test_malformed_issue_payload_is_refused(submitted, monkeypatch):
     assert submitted == []
 
 
-async def test_accepted_issue_without_state_fails_closed(submitted, monkeypatch):
+async def test_accepted_issue_is_submitted_without_a_state_table(submitted, monkeypatch):
+    # The state is the git branch and is always there; there is nothing left to fail closed on.
     monkeypatch.setattr(_issues, "accept_event", lambda *args: {"kind": "launch"})
     monkeypatch.setattr(_webhook, "PROFILE", dataclasses.replace(_webhook.PROFILE, state=_profile.State("")))
-    assert (await send_issue({"action": "opened"})).status_code == 503
-    assert submitted == []
+    assert (await send_issue({"action": "opened"})).status_code == 202
+    assert len(submitted) == 1
+
+
+async def test_accepted_issue_without_state_fails_closed(submitted, monkeypatch):
+    """Bucket-era name; now checks an accepted issue with no [state] uri is still handled and submitted."""
+    monkeypatch.setattr(_issues, "accept_event", lambda *args: {"kind": "launch"})
+    monkeypatch.setattr(_webhook, "PROFILE", dataclasses.replace(_webhook.PROFILE, state=_profile.State("")))
+    response = await send_issue({"action": "opened"})
+    assert response.status_code == 202
+    [(_, inputs)] = submitted
+    assert inputs["event"] == "issues"
+    assert json.loads(inputs["payload"]) == {"action": "opened"}
 
 
 async def test_failed_intake_submission_is_a_failed_delivery_without_details(submitted, monkeypatch, caplog):
@@ -710,13 +722,18 @@ def test_issue_tasks_ship_with_the_webhook_and_hold_the_app_key_alone(monkeypatc
     assert issues.name == "factory-issues"
     _deploy.check_environments(app)  # the dependency walk admits factory-issues with the webhook
     # The public app mounts only the webhook secret (and its tier key); the App's private key only the
-    # intake tasks (and theirs).
+    # intake tasks (and theirs), with the deploy key the intake needs to write the queue to the state
+    # branch.
     queue = profile.union.key_for("queue")
     assert [(s.key, s.as_env_var) for s in app.secrets] == [
         ("hook", _webhook.SECRET_ENV),
         (queue, _union_identity.KEY_ENV),
     ]
-    assert [s.key for s in issues.secrets] == [profile.github.private_key_secret, queue]
+    assert [s.key for s in issues.secrets] == [
+        profile.secrets.deploy_key,
+        profile.github.private_key_secret,
+        queue,
+    ]
 
 
 def test_webhook_without_maintainers_deploys_no_issue_tasks(monkeypatch):

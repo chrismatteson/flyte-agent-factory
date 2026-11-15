@@ -6,9 +6,10 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
+import flyte
 from flyte import remote
 
-from flyte_agent_factory import _deploy, _profile, _queue
+from flyte_agent_factory import _deploy, _git, _profile, _queue, _state_store
 
 PROFILE = _profile.require()
 
@@ -55,10 +56,19 @@ def report_html(run: remote.Run) -> str:
     return str(run.get_report()) if hasattr(run, "get_report") else ""
 
 
+def state_secrets(profile: _profile.Profile) -> list[flyte.Secret]:
+    """Return the deploy key a task environment mounts to push to the state branch (`[repo] project`).
+
+    Every environment whose tasks read or write the state store needs it: the store pushes with
+    `_git.install_deploy_key`, which finds no key where none is mounted.
+    """
+    if not profile.secrets.deploy_key:
+        return []
+    return [flyte.Secret(key=profile.secrets.deploy_key, as_env_var=_git.GIT_DEPLOY_KEY_ENV_VAR)]
+
+
 def queue_root() -> str:
-    if not PROFILE.state.uri:
-        raise ValueError("the launch queue needs [state] uri in the deployment profile")
-    return _queue.root(PROFILE.state.uri)
+    return _queue.root(_state_store.ROOT)
 
 
 def run_labels(run: remote.Run) -> dict[str, str]:

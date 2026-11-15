@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import json
 import os
@@ -22,11 +23,14 @@ from flyte_agent_factory import (
     _factory_meters,
     _factory_policy,
     _factory_recreate,
+    _git,
     _meter,
     _queue,
+    _state_store,
     _union_identity,
 )
 from flyte_agent_factory import _factory as factory
+from tests.fake_flyte import status_report
 
 
 def slotted(name, task):
@@ -54,6 +58,16 @@ def test_invalid_names(name):
 def test_invalid_models(model):
     with pytest.raises(ValueError, match="model"):
         _factory_policy.validate("valid-name", model)
+
+
+def test_a_launch_without_state_uri_says_so(flyte_world):
+    """Bucket-era name; now checks a launch with no [state] uri queues normally and asks for no bucket."""
+    assert _factory_base.PROFILE.state.uri == ""
+    flyte_world.add("one", _factory_base.SLOTS[0])
+    flyte_world.add("two", _factory_base.SLOTS[1])
+    result = factory.launch_project("brief", "valid-name")
+    assert (result["status"], result["position"]) == ("queued", 1)
+    assert "[state]" not in json.dumps(result) and "bucket" not in json.dumps(result)
 
 
 def test_full_slots_queue_the_launch_instead_of_refusing(flyte_world):
@@ -141,8 +155,10 @@ def test_factory_env_holds_the_queue_tasks_and_the_meter_task():
         "factory.plan_pass",
         "factory.garden_weekly",
     }
+    # The deploy key is for the state branch of `[repo] project`: the queue and its leases are pushed to it.
     assert [(s.key, s.as_env_var) for s in cast(list[flyte.Secret], factory.env.secrets)] == [
         (_factory_base.PROFILE.secrets.claude_token, _factory_meters.TOKEN_ENV),
+        (_factory_base.PROFILE.secrets.deploy_key, _git.GIT_DEPLOY_KEY_ENV_VAR),
         (_factory_base.PROFILE.union.key_for("queue"), _union_identity.KEY_ENV),
     ]
 
@@ -230,8 +246,7 @@ def add_labelled(world: Any, name: str, project: str, slot: Any, gen: int = 1, *
 
 
 def written(queue):
-    root = Path(queue.removeprefix("file://"))
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()) if root.exists() else []
+    return sorted(path.removeprefix(f"{queue}/") for path in _queue._fs(queue).find(queue))
 
 
 @pytest.mark.parametrize(
@@ -259,9 +274,20 @@ def test_an_empty_repo_means_the_first_allowed_one(flyte_world):
     assert created["inputs"]["repo"] == next(iter(factory.allowed_repos().values()))
 
 
-def test_a_launch_without_state_uri_says_so(monkeypatch):
-    with pytest.raises(ValueError, match=r"\[state\] uri"):
-        factory.launch_project("brief", "valid-name")
+def test_a_profile_without_state_queues_dispatches_cancels_and_lists(flyte_world):
+    """`[state] uri` is gone: the queue is on the state branch, whatever the profile says about `[state]`."""
+    assert _factory_base.PROFILE.state.uri == ""
+    for name, slot in zip(("x", "y"), _factory_base.SLOTS, strict=False):
+        flyte_world.add(name, slot)
+    first = factory.launch_project("first", "alpha")
+    other = factory.launch_project("other", "bravo")
+    assert (first["status"], other["status"]) == ("queued", "queued")
+    assert [r["name"] for r in factory.queue_view()["queue"]] == ["alpha", "bravo"]
+    assert json.loads(asyncio.run(factory.queue_list.func()))["queue"][0]["name"] == "alpha"
+    assert factory.cancel("alpha") == {"cancelled": [1]}
+    flyte_world.runs.pop("x")  # a slot frees up: the next sweep starts the one that is left
+    assert [run.split("-")[0] for run in factory.dispatch()] == ["bravo"]
+    assert [e.closed for e in _queue.entries(flyte_world.queue)] == ["cancelled", "started"]
 
 
 def test_a_resume_cannot_change_repo_or_outgrow_the_brief(flyte_world, monkeypatch):
@@ -849,9 +875,8 @@ def test_normalize_policy_refuses_a_key_with_the_removed_claude_prefix(key):
 
 
 def garbage_request(world, name="alpha", gen=1):
-    path = Path(world.queue.removeprefix("file://")) / name / f"{gen:04d}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("{not json")
+    path = f"{world.queue}/{name}/{gen:04d}.json"
+    _queue._write(path, b"{not json")
     return path
 
 
@@ -945,10 +970,16 @@ def _aborted_project(
     """Start a project through the queue, with its key and checkpoint noted, and abort its run."""
     _queue.enqueue(world.queue, _queue.Request("alpha", 1, "new", "b", "opus", "r", "", {}, 1.0))
     _queue.mark(world.queue, "alpha", 1, "started", run=run)
-    _queue.note_checkpoint(_factory_base.PROFILE.state.uri, run, location, app=OWN_KEY)
     world.add("other", _factory_base.SLOTS[1])
     return add_labelled(
-        world, run, "alpha", _factory_base.SLOTS[0], phase="ABORTED", aborted_by=aborted_by, **kw
+        world,
+        run,
+        "alpha",
+        _factory_base.SLOTS[0],
+        phase="ABORTED",
+        aborted_by=aborted_by,
+        report=status_report(checkpoint=location, app=OWN_KEY),
+        **kw,
     )
 
 
@@ -957,7 +988,7 @@ def _abort_from_inside(world: Any, run_name: str) -> None:
     run = world.runs[run_name]
     run.abort("orphan cleanup")
     run.aborted_by = OWN_KEY
-    _queue.note_checkpoint(_factory_base.PROFILE.state.uri, run_name, "", app=OWN_KEY)
+    run.report = status_report(app=OWN_KEY)
 
 
 def test_a_run_aborted_from_inside_is_recreated_once_from_its_checkpoint(flyte_world, checkpoint):
@@ -971,6 +1002,27 @@ def test_a_run_aborted_from_inside_is_recreated_once_from_its_checkpoint(flyte_w
     assert "aborted from inside" in created["inputs"]["brief"], "the project is told, in its brief"
     assert _queue.marker(flyte_world.queue, "alpha", 1, "attempt-1")["recreated_from"] == "alpha-run"
     assert _queue.marker(flyte_world.queue, "alpha", 1, "started")["run"] == started
+
+
+def test_a_run_started_before_the_cutover_is_recreated_from_its_migrated_note(flyte_world, checkpoint):
+    """A pre-cutover run's report has no pointer; the bucket note `migrate_state.py` copied stands in."""
+    note = {"at": 1.0, "location": "s3://b/alpha-run/checkpoint", "app": OWN_KEY}
+    _state_store.current().write({"checkpoints/alpha-run.json": json.dumps(note).encode()}, "migrate")
+    run = _aborted_project(flyte_world, OWN_KEY)
+    run.report = status_report()  # the old image's report: no `checkpoint`, no `app`
+    [started] = _sweep()
+    assert checkpoint == ["s3://b/alpha-run/checkpoint"]
+    [created] = flyte_world.created
+    assert created["inputs"]["workspace_in"] == "workspace-of[s3://b/alpha-run/checkpoint]"
+    assert _queue.marker(flyte_world.queue, "alpha", 1, "attempt-1")["recreated_from"] == "alpha-run"
+
+
+def test_a_pre_cutover_run_with_no_migrated_note_is_not_recreated(flyte_world, checkpoint):
+    """Without the report fields or a migrated note, nobody can say who aborted it: the abort is final."""
+    run = _aborted_project(flyte_world, OWN_KEY)
+    run.report = status_report()
+    assert _sweep() == []
+    assert checkpoint == [] and flyte_world.created == []
 
 
 def test_who_aborted_is_read_from_the_root_action_not_the_run(flyte_world, checkpoint):
@@ -1014,7 +1066,7 @@ def test_an_abort_with_another_api_key_is_final(flyte_world, checkpoint):
 def test_an_abort_is_final_when_the_run_never_noted_its_key(flyte_world, checkpoint):
     """Without the run's own client id there is nothing to compare, and the owner's abort must stand."""
     _aborted_project(flyte_world, OWN_KEY)
-    _queue.note_checkpoint(_factory_base.PROFILE.state.uri, "alpha-run", "s3://b/cp")  # an older run: no key
+    flyte_world.runs["alpha-run"].report = status_report(checkpoint="s3://b/cp")  # an older run: no key
     assert _sweep() == []
     assert flyte_world.created == []
 
@@ -1031,9 +1083,14 @@ def test_an_aborted_run_the_queue_did_not_start_is_left_alone(flyte_world, check
     """Only the run the queue's `started` marker names is a project run to bring back."""
     _aborted_project(flyte_world, OWN_KEY, run="old-run")
     add_labelled(
-        flyte_world, "older-run", "alpha", _factory_base.SLOTS[0], phase="ABORTED", aborted_by=OWN_KEY
+        flyte_world,
+        "older-run",
+        "alpha",
+        _factory_base.SLOTS[0],
+        phase="ABORTED",
+        aborted_by=OWN_KEY,
+        report=status_report(app=OWN_KEY),
     )
-    _queue.note_checkpoint(_factory_base.PROFILE.state.uri, "older-run", "", app=OWN_KEY)
     _queue.mark(flyte_world.queue, "alpha", 1, "started", run="old-run", at=0)
     flyte_world.runs["old-run"].aborted_by = "user"
     _sweep()

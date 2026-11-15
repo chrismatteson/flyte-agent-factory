@@ -18,7 +18,6 @@ import functools
 import re
 import subprocess
 import sys
-import urllib.parse
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeVar
@@ -40,7 +39,6 @@ from ._bootstrap_steps import (
     ToolsStep,
     WorkspaceStep,
 )
-from ._profile import _STATE_SCHEMES
 
 EXIT_OK, EXIT_TODO = 0, 3
 KEY_MODES = {"chat-key": "the chat key", "grant": "granting a key"}
@@ -204,9 +202,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--workspace", required=True, help="<owner>/<repo>, the workspace repository")
     ap.add_argument(
         "--state-uri",
-        required=True,
-        help="object-storage prefix for factory state, starting with one of "
-        f"{', '.join(f'{scheme}://' for scheme in _STATE_SCHEMES)}",
+        help="deprecated and ignored: the factory keeps its state on a git branch, not in a bucket",
     )
     ap.add_argument("--backend", choices=("union", "oss"), default="union")
     ap.add_argument("--engine", choices=("claude", "codex"), default="claude")
@@ -266,11 +262,10 @@ def main(
         ap.error(f"--grant gives only {' or '.join(GRANTABLE)}")
     if not _WORKSPACE.fullmatch(args.workspace):
         ap.error("--workspace must be <owner>/<repo>")
-    state = urllib.parse.urlsplit(args.state_uri)
-    if state.scheme not in _STATE_SCHEMES or not (state.netloc or state.path.strip("/")):
-        ap.error(
-            "--state-uri must be <scheme>://<bucket>[/<prefix>], with a scheme of "
-            + ", ".join(_STATE_SCHEMES)
+    if args.state_uri is not None:
+        # Old copy-paste commands carry it; they must keep running.
+        print(
+            "note: --state-uri is ignored; the factory keeps its state on a git branch (docs/state-store.md)"
         )
     if not args.project.strip():
         ap.error("--project must not be empty")
@@ -283,7 +278,6 @@ def main(
         endpoint=endpoint,
         project=args.project,
         workspace=args.workspace,
-        state_uri=args.state_uri,
         domain=args.domain,
         backend=args.backend,
         engine=args.engine,

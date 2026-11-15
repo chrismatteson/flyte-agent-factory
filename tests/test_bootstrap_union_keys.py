@@ -140,7 +140,6 @@ def _settings():
         endpoint="flyte.example.test",
         project="my-agents",
         workspace="pat/agent-workspace",
-        state_uri="s3://example-bucket/state",
     )
 
 

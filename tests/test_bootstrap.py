@@ -40,7 +40,7 @@ from tests._bootstrap_fakes import (
 ROOT = Path(__file__).resolve().parents[1]
 ARGS = [
     "--endpoint", "flyte.example.test", "--project", "my-agents",
-    "--workspace", "pat/agent-workspace", "--state-uri", "s3://example-bucket/state",
+    "--workspace", "pat/agent-workspace",
 ]  # fmt: skip
 
 
@@ -283,7 +283,7 @@ def test_a_resumed_profile_only_gains_missing_keys(world):
     settings = _bootstrap._build_parser().parse_args(ARGS)
     from flyte_agent_factory._bootstrap_base import Settings
 
-    s = Settings(settings.endpoint, settings.project, settings.workspace, settings.state_uri)
+    s = Settings(settings.endpoint, settings.project, settings.workspace)
     added = _bootstrap_profile.fill_missing(path, s, "424242")
     assert "github.app_id" in added and "deploy.auto" in added
     result = path.read_text()
@@ -296,7 +296,7 @@ def test_the_profile_is_created_exclusively_and_never_overwritten(world, tmp_pat
     from flyte_agent_factory import _bootstrap_profile as bp
     from flyte_agent_factory._bootstrap_base import Settings
 
-    s = Settings("h.example.test", "p", "pat/agent-workspace", "s3://b/p")
+    s = Settings("h.example.test", "p", "pat/agent-workspace")
     path = tmp_path / "profile.toml"
     path.write_text('name = "mine"\n')
     assert bp.write(path, s, None).startswith("added")
@@ -452,7 +452,7 @@ def test_the_real_flyte_adapter_reports_only_the_error_class(monkeypatch):
     from flyte_agent_factory._bootstrap_base import Settings
     from flyte_agent_factory._bootstrap_flyte import FlyteSdk
 
-    sdk = FlyteSdk(Settings("h", "p", "o/r", "s3://b/p"))
+    sdk = FlyteSdk(Settings("h", "p", "o/r"))
     sdk._ready = True
 
     def create(name, value):
@@ -512,9 +512,6 @@ def test_the_manifest_asks_for_the_documented_permissions_and_no_webhook():
 def test_bad_arguments_are_refused(world):
     bad_values = (
         ["--workspace", "nodash"],
-        ["--state-uri", "bucket/path"],
-        ["--state-uri", "az://c/p"],
-        ["--state-uri", "s3://"],
         ["--project", ""],
         ["--domain", ""],
     )
@@ -532,23 +529,12 @@ def test_bad_arguments_are_refused(world):
     assert world.events == []
 
 
-@pytest.mark.parametrize("scheme", _profile._STATE_SCHEMES)
-def test_every_state_scheme_the_profile_accepts_is_accepted(scheme, world):
-    argv = [a if a != "s3://example-bucket/state" else f"{scheme}://example-bucket/state" for a in ARGS]
-    code = _bootstrap.main(
-        [*argv, "--dry-run", "--dir", str(world.root / "clone")],
-        make_context=lambda settings: make_context(world, settings, [], CLAUDE_TOKEN),
-    )
-    assert code in (0, 3)
-
-
 @pytest.mark.parametrize(
     "change",
     [
         ["--project", "my-agents-2"],
         ["--domain", "staging"],
         ["--endpoint", "other.example.test"],
-        ["--state-uri", "s3://other/x"],
     ],
 )
 def test_a_rerun_with_another_project_domain_or_endpoint_is_blocked_before_any_change(world, change):
@@ -568,7 +554,7 @@ def test_a_rerun_with_another_project_domain_or_endpoint_is_blocked_before_any_c
     assert world.events == before
     text = next(line for line in out if line.startswith("next:"))
     command = text.split("values: ", 1)[1]
-    assert "--project my-agents " in command and "--state-uri s3://example-bucket/state" in command
+    assert "--project my-agents " in command and "--state-uri" not in command
     assert "--endpoint flyte.example.test" in command and "--domain" not in command
     assert not re.search(r"<[^>]*>", text) and change[1] not in command
 
@@ -586,18 +572,69 @@ def test_status_and_dry_run_exclude_each_other(world):
     assert world.events == []
 
 
-def test_a_bucket_only_state_uri_is_accepted_as_the_message_says(world, capsys):
-    with pytest.raises(SystemExit):
-        _bootstrap.main([*ARGS[:-1], "s3://", "--dry-run"])
-    assert "<scheme>://<bucket>[/<prefix>]" in capsys.readouterr().err
+def test_state_uri_is_a_deprecated_no_op_that_says_so(world, capsys):
     lines: list[str] = []
     code = _bootstrap.main(
-        [*[a if a != "s3://example-bucket/state" else "s3://example-bucket" for a in ARGS], "--dry-run",
-         "--dir", str(world.root / "clone")],
+        [*ARGS, "--state-uri", "s3://example-bucket/state", "--dry-run", "--dir", str(world.root / "clone")],
         make_context=lambda s: make_context(world, s, lines),
-    )  # fmt: skip
-    assert code in (0, 3) and "--state-uri" not in capsys.readouterr().err
+    )
+    assert code in (0, 3)
+    assert "--state-uri is ignored" in capsys.readouterr().out
     assert any(row.startswith("[todo]") and "would" in row for row in lines), lines
+
+
+def test_the_generated_profile_has_no_state_table_even_with_state_uri(world):
+    code, _ = run(world, "--no-app", "--state-uri", "s3://example-bucket/state")
+    assert code == 0
+    path = world.root / "clone/profile.toml"
+    assert "state" not in tomllib.loads(path.read_text())
+    assert "example-bucket" not in path.read_text()
+
+
+@pytest.mark.parametrize("value", ["bucket/path", "az://c/p", "s3://", "gs://b/p", "s3://other/x"])
+def test_any_former_state_uri_value_is_ignored_not_refused(value, world, capsys):
+    code = _bootstrap.main(
+        [*ARGS, "--state-uri", value, "--dry-run", "--dir", str(world.root / "clone")],
+        make_context=lambda s: make_context(world, s, []),
+    )
+    assert code in (0, 3)
+    assert "--state-uri is ignored" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("scheme", ["s3", "gs", "abfs", "az"])
+def test_every_state_scheme_the_profile_accepts_is_accepted(scheme, world, capsys):
+    """Each scheme the bucket-era profile took still parses: the value is ignored, never refused."""
+    code = _bootstrap.main(
+        [
+            *ARGS,
+            "--state-uri",
+            f"{scheme}://example-bucket/state",
+            "--dry-run",
+            "--dir",
+            str(world.root / "clone"),
+        ],
+        make_context=lambda settings: make_context(world, settings, [], CLAUDE_TOKEN),
+    )
+    assert code in (0, 3)
+    assert "--state-uri is ignored" in capsys.readouterr().out
+
+
+def test_a_bucket_only_state_uri_is_accepted_as_the_message_says(world, capsys):
+    lines: list[str] = []
+    code = _bootstrap.main(
+        [*ARGS, "--state-uri", "s3://example-bucket", "--dry-run", "--dir", str(world.root / "clone")],
+        make_context=lambda s: make_context(world, s, lines),
+    )
+    captured = capsys.readouterr()
+    assert code in (0, 3) and "--state-uri" not in captured.err
+    assert "--state-uri is ignored" in captured.out
+    assert any(row.startswith("[todo]") and "would" in row for row in lines), lines
+
+
+def test_a_rerun_with_another_state_uri_is_not_blocked(world):
+    assert run(world, "--no-app", "--state-uri", "s3://example-bucket/state")[0] == 0
+    code, out = run(world, "--no-app", "--state-uri", "s3://other/x")
+    assert code == 0 and statuses(out)["profile"] != "blocked", out
 
 
 def test_the_ops_script_exits_with_the_bootstraps_code(monkeypatch, capsys):
@@ -660,7 +697,7 @@ class _NeverReached:
 
 def test_a_step_whose_check_fails_stops_a_real_run_before_the_next_step(world):
     out: list[str] = []
-    ctx = make_context(world, Settings("h", "p", "pat/ws", "s3://b/p"), out)
+    ctx = make_context(world, Settings("h", "p", "pat/ws"), out)
     assert _bootstrap.run(ctx, [cast(Step, _BrokenCheck()), cast(Step, _NeverReached())]) == 3
     assert out == [
         "[blocked] broken: check failed: BootstrapError: cannot ask",
@@ -701,7 +738,7 @@ def test_the_fakes_refuse_a_repository_that_is_not_there_and_a_command_nobody_ex
 
 
 def test_an_existing_policy_with_the_right_binding_is_reused_not_remade(world):
-    flyte = make_context(world, Settings("h", "my-agents", "pat/ws", "s3://b/p"), []).flyte
+    flyte = make_context(world, Settings("h", "my-agents", "pat/ws"), []).flyte
     flyte.config_path.write_text("admin:\n  endpoint: dns:///h\n")
     flyte.ensure_policy("p")
     flyte.ensure_policy("p")

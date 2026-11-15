@@ -27,6 +27,7 @@ from flyte_agent_factory import (
     _workspace,
 )
 from flyte_agent_factory import _factory as factory
+from tests.state_git import rival_wins_first_push
 from tests.test_factory import projects
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -173,38 +174,34 @@ def test_regressed_names_the_target_and_rule_that_got_worse():
     assert _gardening.regressed({}) == []
 
 
-def test_the_first_scan_is_the_baseline_and_escalates_nothing(tmp_path):
-    uri = tmp_path.as_uri()
-    _gardening.record_counts(uri, {"a": {"ruff": 4}})
-    counts = _gardening.read_counts(uri)
+def test_the_first_scan_is_the_baseline_and_escalates_nothing():
+    _gardening.record_counts({"a": {"ruff": 4}})
+    counts = _gardening.read_counts()
     assert counts == {"clean": {"a": {"ruff": 4}}, "latest": {"a": {"ruff": 4}}}
     assert _gardening.regressed(counts) == []
 
 
-def test_more_findings_on_any_rule_regress_and_keep_the_baseline(tmp_path):
-    uri = tmp_path.as_uri()
-    _gardening.record_counts(uri, {"a": {"ruff": 1, "mypy": 3}})
-    _gardening.record_counts(uri, {"a": {"ruff": 0, "mypy": 4}})  # one rule down, one up
-    counts = _gardening.read_counts(uri)
+def test_more_findings_on_any_rule_regress_and_keep_the_baseline():
+    _gardening.record_counts({"a": {"ruff": 1, "mypy": 3}})
+    _gardening.record_counts({"a": {"ruff": 0, "mypy": 4}})  # one rule down, one up
+    counts = _gardening.read_counts()
     assert counts == {"clean": {"a": {"ruff": 1, "mypy": 3}}, "latest": {"a": {"ruff": 0, "mypy": 4}}}
     assert _gardening.regressed(counts) == ["a: mypy"]
 
 
-def test_equal_or_fewer_findings_move_the_baseline(tmp_path):
-    uri = tmp_path.as_uri()
-    _gardening.record_counts(uri, {"a": {"ruff": 2}})
-    _gardening.record_counts(uri, {"a": {"ruff": 2}})
-    _gardening.record_counts(uri, {"a": {"ruff": 1}})
-    counts = _gardening.read_counts(uri)
+def test_equal_or_fewer_findings_move_the_baseline():
+    _gardening.record_counts({"a": {"ruff": 2}})
+    _gardening.record_counts({"a": {"ruff": 2}})
+    _gardening.record_counts({"a": {"ruff": 1}})
+    counts = _gardening.read_counts()
     assert counts == {"clean": {"a": {"ruff": 1}}, "latest": {"a": {"ruff": 1}}}
     assert _gardening.regressed(counts) == []
 
 
-def test_one_targets_scan_does_not_move_anothers_baseline(tmp_path):
-    uri = tmp_path.as_uri()
-    _gardening.record_counts(uri, {"a": {"ruff": 1}, "b": {"ruff": 1}})
-    _gardening.record_counts(uri, {"a": {"ruff": 5}, "b": {"ruff": 0}})
-    assert _gardening.read_counts(uri)["clean"] == {"a": {"ruff": 1}, "b": {"ruff": 0}}
+def test_one_targets_scan_does_not_move_anothers_baseline():
+    _gardening.record_counts({"a": {"ruff": 1}, "b": {"ruff": 1}})
+    _gardening.record_counts({"a": {"ruff": 5}, "b": {"ruff": 0}})
+    assert _gardening.read_counts()["clean"] == {"a": {"ruff": 1}, "b": {"ruff": 0}}
 
 
 def test_finding_counts_count_the_lines_of_failing_rules_only():
@@ -558,7 +555,7 @@ def weekly(flyte_world, queue_state, monkeypatch):
         return json.dumps(scans.by_repo[args[0]])
 
     monkeypatch.setattr(_factory, "_spot_first", spot_first)
-    return SimpleNamespace(world=flyte_world, scans=scans, uri=_factory_base.PROFILE.state.uri)
+    return SimpleNamespace(world=flyte_world, scans=scans)
 
 
 def test_the_weekly_task_skips_when_there_are_no_targets(weekly):
@@ -566,7 +563,7 @@ def test_the_weekly_task_skips_when_there_are_no_targets(weekly):
     assert asyncio.run(_factory.garden_weekly.func()) == "skip: no targets in gardening.toml"
     assert _queue.pending(weekly.world.queue) == []
     assert set(weekly.world.runs) == {"one", "two"}  # the two fake slot holders, no gardening run
-    assert _gardening.read_counts(weekly.uri) == {"clean": {}, "latest": {}}
+    assert _gardening.read_counts() == {"clean": {}, "latest": {}}
 
 
 def test_the_weekly_task_skips_when_the_targets_cannot_be_read(weekly, monkeypatch):
@@ -597,11 +594,11 @@ def test_the_weekly_task_queues_a_low_priority_launch(weekly):
 
 def test_the_weekly_task_scans_before_it_decides_and_records_the_baseline(weekly):
     result = json.loads(asyncio.run(_factory.garden_weekly.func()))
-    assert _gardening.read_counts(weekly.uri) == {
+    assert _gardening.read_counts() == {
         "clean": {FACTORY: {"ruff": 1}},
         "latest": {FACTORY: {"ruff": 1}},
     }
-    assert _gardening.regressed(_gardening.read_counts(weekly.uri)) == []
+    assert _gardening.regressed(_gardening.read_counts()) == []
     assert result["unscanned"] == {
         "path:tools": "a workspace path, which only the gardening project can reach"
     }
@@ -611,7 +608,7 @@ def test_a_worse_scan_escalates_the_decision_naming_target_and_rule(weekly):
     asyncio.run(_factory.garden_weekly.func())
     weekly.scans.by_repo[FACTORY] = {"counts": {"ruff": 3}}
     asyncio.run(_factory.garden_weekly.func())
-    regression = _gardening.regressed(_gardening.read_counts(weekly.uri))
+    regression = _gardening.regressed(_gardening.read_counts())
     assert regression == [f"{FACTORY}: ruff"]
     level, reasons = _gardening.priority(NOW, [NOW - 86400], regression, 0, SETTINGS)
     assert level == "normal"
@@ -621,7 +618,7 @@ def test_a_worse_scan_escalates_the_decision_naming_target_and_rule(weekly):
 def test_an_unscannable_target_records_nothing_and_never_escalates(weekly):
     weekly.scans.by_repo[FACTORY] = {"unscanned": "no deploy key for this repository in the profile"}
     result = json.loads(asyncio.run(_factory.garden_weekly.func()))
-    assert _gardening.read_counts(weekly.uri) == {"clean": {}, "latest": {}}
+    assert _gardening.read_counts() == {"clean": {}, "latest": {}}
     assert result["unscanned"][FACTORY] == "no deploy key for this repository in the profile"
     assert result["status"] in ("started", "queued")
 
@@ -747,3 +744,10 @@ def test_the_engines_own_configs_can_be_compared(tmp_path):
         root / "pyproject.toml", _workspace.TEMPLATE / "standards" / "languages" / "configs"
     )
     assert isinstance(lines, list)  # the engine differs from the template today, so the count is not asserted
+
+
+def test_counts_recorded_by_a_concurrent_writer_are_not_lost(state_store, tmp_path, monkeypatch):
+    other = json.dumps({"clean": {"b": {"ruff": 3}}, "latest": {"b": {"ruff": 3}}}).encode()
+    rival_wins_first_push(monkeypatch, state_store, tmp_path, {"gardening/counts.json": other})
+    _gardening.record_counts({"a": {"ruff": 4}})
+    assert _gardening.read_counts()["clean"] == {"a": {"ruff": 4}, "b": {"ruff": 3}}

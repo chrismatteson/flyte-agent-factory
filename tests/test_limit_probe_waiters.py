@@ -263,7 +263,7 @@ def _clear_by_success(now) -> None:
 
 def _clear_by_another_pod(now) -> None:
     assert _usage._meters is not None and _usage._meters.share is not None
-    other = _limit_share.LimitShare(_usage._meters.share.uri, clock=lambda: _agent_time().time())
+    other = _limit_share.LimitShare(_usage._meters.share.root, clock=lambda: _agent_time().time())
     other.clear_engine("claude")
     now["t"] += _limit_share.LIMIT_SHARE_POLL_S + 1  # this pod reads it at its next poll
 
@@ -276,7 +276,7 @@ async def test_a_clear_resumes_the_paused_author_at_the_next_tick(tmp_path, monk
     rig = _rig(tmp_path, monkeypatch, engine="claude", store=True)
     meters = _usage._meters
     assert meters is not None
-    meters.share = _limit_share.LimitShare(f"file://{tmp_path}/state", clock=lambda: _agent_time().time())
+    meters.share = _limit_share.LimitShare(clock=lambda: _agent_time().time())
     meters.note_limit("codex", CODEX_WEEKLY, "")  # nowhere else to go: the pause is a deferral
     meters.readings["codex"].limit_noted_at = None
     stop, pump = await _refused_in_pump(rig, now, notice)

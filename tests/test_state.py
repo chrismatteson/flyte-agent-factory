@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import pytest
 
-from flyte_agent_factory import _checkpoint, _session_config, _state
+from flyte_agent_factory import _checkpoint, _state
 
 
 class _FakeDir:
@@ -144,24 +144,16 @@ def test_the_checkpoint_location_is_where_this_action_saves(monkeypatch):
     assert _state.checkpoint_location() == ""
 
 
-async def test_the_run_leaves_its_checkpoint_location_for_the_factory(monkeypatch, queue_state):
-    """The run leaves its checkpoint location where the factory reads it."""
-    from flyte_agent_factory import _auth, _factory_base, _queue
+async def test_the_run_leaves_its_checkpoint_location_for_the_factory(monkeypatch):
+    """The run leaves its checkpoint location in its report (the factory reads it there), not in the store."""
+    from flyte_agent_factory import _auth, _timeline
 
-    monkeypatch.setattr(_session_config, "_PROFILE", _factory_base.PROFILE)
     monkeypatch.setattr(_state, "checkpoint_location", lambda: "s3://b/run/a0/checkpoint")
-    rows = []
-    timeline = types.SimpleNamespace(row=lambda *a: rows.append(a))
     monkeypatch.setattr(_auth, "own_client_id", lambda: "pods-key-id")
-    await _checkpoint._note_checkpoint_location(cast(Any, timeline), "alpha-1-0-aaaaaa")
-    assert (
-        _queue.read_checkpoint_uri(_factory_base.PROFILE.state.uri, "alpha-1-0-aaaaaa")
-        == "s3://b/run/a0/checkpoint"
-    )
-    assert _queue.read_checkpoint_uri(_factory_base.PROFILE.state.uri, "never-noted") == ""
-    assert _queue.read_app_client_id(_factory_base.PROFILE.state.uri, "alpha-1-0-aaaaaa") == "pods-key-id"
-    assert _queue.read_app_client_id(_factory_base.PROFILE.state.uri, "never-noted") == ""
-    assert rows == []
+    monkeypatch.setattr("flyte_agent_factory._timeline._auth.own_client_id", lambda: "pods-key-id")
+    snapshot = _timeline._Timeline().snapshot()
+    assert (snapshot["checkpoint"], snapshot["app"]) == ("s3://b/run/a0/checkpoint", "pods-key-id")
+    assert not hasattr(_checkpoint, "_note_checkpoint_location")  # nothing is written to the store for it
 
 
 def test_the_run_notes_its_key_only_by_client_id(monkeypatch):

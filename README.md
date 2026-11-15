@@ -74,7 +74,7 @@ Setup, the full split of who can do what, and what to ask: [docs/chat-operator.m
 Start with [guided setup](docs/quickstart.md): download `agent-factory.zip` and `since.zip` from
 [`skills/dist/`](https://github.com/unionai-oss/flyte-agent-factory/tree/main/skills/dist), save them in claude.ai
 (Settings, Capabilities, Skills) or unzip them into `~/.claude/skills/` for Claude Code, then run `/agent-factory`.
-It asks for your Flyte endpoint, project, GitHub owner and state bucket, hands you one copy-paste command that does the
+It asks for your Flyte endpoint, project, GitHub owner and engine, hands you one copy-paste command that does the
 machine work (workspace from the bundled template, deploy key, your own GitHub App, ruleset, board, profile, deploy)
 and resumes if interrupted, then connects the MCP and helps with your first launch. It never asks for a credential in
 chat. Fresh installs currently follow the Union path; OSS runs every step except the deploy

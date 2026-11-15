@@ -10,7 +10,7 @@ import pytest
 from obstore.exceptions import GenericError
 
 from flyte_agent_factory import _factory as factory
-from flyte_agent_factory import _factory_base, _planner, _queue
+from flyte_agent_factory import _factory_base, _planner, _queue, _state_store
 from tests.test_factory import projects
 
 ENGINE = "git@example.org:team/engine.git"
@@ -520,13 +520,13 @@ def test_a_reason_stored_for_another_generation_is_not_shown(flyte_world):
     request = _queue.Request("proj", 2, "resume", "b", "opus", SANDBOX, "", {}, 1.0)
     _queue.enqueue(flyte_world.queue, request)
     stale = {"proj": {"gen": 1, "reason": "engine_busy: x", "wait": {"code": "engine_busy"}}}
-    _queue.write_waits(_factory_base.PROFILE.state.uri, stale)
+    _queue.write_waits(stale)
     assert rows()["proj"]["wait"]["code"] == "awaiting_admission"
 
 
 def test_a_malformed_stored_reason_does_not_break_the_listing(flyte_world):
     enqueue(flyte_world, "a", 1.0)
-    _queue.write_waits(_factory_base.PROFILE.state.uri, {"a": {"gen": 1}})
+    _queue.write_waits({"a": {"gen": 1}})
     assert rows()["a"]["wait"]["code"] == "awaiting_admission"
 
 
@@ -543,7 +543,7 @@ def test_a_malformed_stored_reason_does_not_break_the_listing(flyte_world):
 )
 def test_a_stored_reason_without_text_and_a_code_falls_back(flyte_world, stored):
     enqueue(flyte_world, "a", 1.0)
-    _queue.write_waits(_factory_base.PROFILE.state.uri, {"a": stored})
+    _queue.write_waits({"a": stored})
     row = rows()["a"]
     assert row["wait"] == {"code": "awaiting_admission"}
     assert row["wait_reason"].startswith("not yet judged")
@@ -641,15 +641,14 @@ def test_a_surviving_twin_counts_against_its_actual_engine(flyte_world, monkeypa
 
 def test_an_unreadable_wait_cache_leaves_queue_reasons_available(flyte_world, monkeypatch, capsys):
     enqueue(flyte_world, "work", 1.0)
-    fs = _queue._fs(_factory_base.PROFILE.state.uri)
-    cat_file = fs.cat_file
+    cat_file = _state_store.StateFS.cat_file
 
-    def read(path):
+    def read(self, path):
         if path.endswith("/waits.json"):
             raise GenericError("store unavailable")
-        return cat_file(path)
+        return cat_file(self, path)
 
-    monkeypatch.setattr(fs, "cat_file", read)
+    monkeypatch.setattr(_state_store.StateFS, "cat_file", read)
     [row] = json.loads(json.dumps(factory.queue_view()))["queue"]
     assert row["name"] == "work"
     assert row["wait"] == {"code": "awaiting_admission"}
@@ -674,14 +673,13 @@ def test_wait_cache_unexpected_errors_and_cancellation_propagate(flyte_world, mo
 
 def test_an_unreadable_queue_request_still_raises(flyte_world, monkeypatch):
     enqueue(flyte_world, "work", 1.0)
-    fs = _queue._fs(_factory_base.PROFILE.state.uri)
-    cat_file = fs.cat_file
+    cat_file = _state_store.StateFS.cat_file
 
-    def read(path):
+    def read(self, path):
         if path.endswith("/0001.json"):
             raise GenericError("queue unavailable")
-        return cat_file(path)
+        return cat_file(self, path)
 
-    monkeypatch.setattr(fs, "cat_file", read)
+    monkeypatch.setattr(_state_store.StateFS, "cat_file", read)
     with pytest.raises(GenericError, match="queue unavailable"):
         factory.queue_view()

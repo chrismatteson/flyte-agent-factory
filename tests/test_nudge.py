@@ -5598,8 +5598,9 @@ async def _pump_until(bridge, proc, timeline, stop, done, *, seconds: float) -> 
 
 @pytest.fixture
 def parked_fast(no_idle_delay, monkeypatch):
-    """Shorten the park grace period and reset the release flag."""
+    """Shorten the park grace period and reset the release flag and note (restored after the test)."""
     monkeypatch.setattr(_supervise_support, "_released", False)
+    monkeypatch.setattr(_supervise_support, "_release_note", _supervise_support._release_note)
     monkeypatch.setattr(_checkpoint, "_park_release_s", lambda emit=None: 0.3)
     # Without a Flyte context the real listing errors, and an unknown child count now blocks release.
     monkeypatch.setattr(_supervise_support, "_in_flight_children", lambda: (0, ""))
