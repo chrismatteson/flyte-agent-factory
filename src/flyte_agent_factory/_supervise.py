@@ -13,6 +13,7 @@ from typing import Any, cast
 
 from flyte_agent_factory import (
     _author,
+    _capacity,
     _checkpoint,
     _contract,
     _demo_checks,
@@ -116,6 +117,7 @@ async def _pump(
     compact_task = None
     compact_round = None
     preflight_bounces = 0
+    capacity = _capacity.CapacityWait()  # the pre-review's retries after no capacity
     exhausted_announced = False
     parked_at: float | None = None
     parked_wall = 0.0
@@ -186,6 +188,13 @@ async def _pump(
             _usage.poll_limit_share()  # another pod's or a person's clear of a limit this pod remembers
             handover_probe.check(proc)
             notes = bridge.drain_notes()
+            if retry := capacity.retry(
+                notes,
+                time.monotonic(),
+                qa_task is None and not _supervise_support._escalated,
+                _supervise_support._declares_done,
+            ):
+                declared_done, notes = False, retry
             if isinstance(proc, AuthorSession):
                 proc.declared_done = declared_done  # the handoff's briefing says whether the work was done
             hit = getattr(proc, "limit_hit_at", None)
@@ -531,6 +540,7 @@ async def _pump(
             if _supervise_support._preflight_resumes != seen_preflight_resumes:
                 seen_preflight_resumes = _supervise_support._preflight_resumes
                 preflight_bounces = 0
+                capacity.reset()
                 declared_done = False
                 passed_round = None
                 timeline.review_passed = False
@@ -609,6 +619,8 @@ async def _pump(
                             child_lanes=True,
                         )
                         checks_seconds = 0.0
+                        capacity.note = note
+                        checks_capacity = ""  # why checks.sh found no room for its test lanes
                         if (
                             workspace
                             / _session_config._checks_rel(
@@ -618,8 +630,13 @@ async def _pump(
                             checks_problem = await _supervise_support._run_declared_checks(
                                 workspace, timeline, work.junit_dir
                             )
+                            checks_capacity = (
+                                checks_problem.capacity
+                                if isinstance(checks_problem, _capacity.ChecksNoCapacity)
+                                else ""
+                            )
                             checks_seconds = time.monotonic() - checks_started
-                            if checks_problem:
+                            if checks_problem and not checks_capacity:
                                 problems.append(checks_problem)
                                 check_failed = True
                         else:
@@ -659,17 +676,11 @@ async def _pump(
                                 time.monotonic() - checks_started, checks_seconds, work
                             ),
                         )
-                        if work.harness_faults and not problems:
-                            declared_done = True
-                            await _supervise_support._escalate_harness_fault(
-                                proc, timeline, "\n".join(work.harness_faults)
-                            )
+                        if await _supervise_support._hold_or_wait_without_blame(
+                            proc, timeline, capacity, problems, work, checks_capacity
+                        ):
+                            declared_done = True  # holding or waiting is not idleness: nothing to nudge
                             continue
-                        if problems and work.harness_faults:
-                            problems.append(
-                                "The gate also hit a fault of the factory's (not yours; the next DONE reruns "
-                                "the gate): " + "; ".join(work.harness_faults)
-                            )
                         if problems:
                             failures = "\n".join(f"{i}. {problem}" for i, problem in enumerate(problems, 1))
                             if preflight_bounces >= _supervise_support._PREFLIGHT_MAX_BOUNCES:

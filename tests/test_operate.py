@@ -639,7 +639,7 @@ def test_every_package_module_loads_with_the_agent():
     # `_board_events`, `_loop` and `_loop_flow` also run only on the factory side.
     # `_isolation_canary` is a probe run by the factory side, never imported by a slot.
     # `_promote` runs from chat through ops/promote.py. `_slow_lane` runs as a subprocess and ships
-    # via include.
+    # via include; `_lane_shards`, its planner, is the gate's too (`_gate_base` reads the CPU quota with it).
     # The `_factory_*` modules are `_factory`'s own and ship with it (the slot env's `include`).
     # `_bootstrap*` is the setup command (ops/bootstrap.py) run from an engine checkout on a person's machine.
     # `_grant_page` is `_factory_mcp`'s (the factory side); `_grants_cli` is the `credential-grant` command,

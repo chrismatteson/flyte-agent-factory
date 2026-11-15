@@ -54,3 +54,4 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [public-cutover.md](public-cutover.md) | For the owner: publishing the engine as a fresh-history public repository, the dry run, and pointing the factory at it |
 | [architecture.md](architecture.md#where-things-live) | Which module holds which responsibility |
 | [oss-flyte-compat.md](oss-flyte-compat.md) | What running on OSS Flyte needs |
+| [test-lanes.md](test-lanes.md) | How pre-review splits the suite into small child shards on 2- and 4-CPU nodes, its knobs, and how to read a capacity, setup or test outcome |

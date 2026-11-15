@@ -27,8 +27,10 @@ import flyte.sandbox
 from flyte_agent_factory import (
     _author,
     _board,
+    _capacity,
     _checkpoint,
     _dashboard,
+    _gate_base,
     _gate_tests,
     _gates,
     _inbox,
@@ -196,6 +198,7 @@ def _pre_review_row(total: float, checks: float, work: _gate_tests.GateWork) -> 
     one of them was read back from an earlier gate run.
     """
     lane = f" (slow lane {work.slow_seconds:.0f}s)" if work.slow_seconds else ""
+    no_capacity = ", no capacity" if work.capacity else ""
     gate = work.seconds["gate"] - work.seconds["base"]
     parts = [
         f"checks {checks:.0f}s{lane}",
@@ -205,7 +208,7 @@ def _pre_review_row(total: float, checks: float, work: _gate_tests.GateWork) -> 
         parts.append(
             "base cached" if work.base_hits == work.base_runs else f"base {work.seconds['base']:.0f}s"
         )
-    return f"pre-review {total:.0f}s: " + ", ".join(parts)
+    return f"pre-review {total:.0f}s: " + ", ".join(parts) + no_capacity
 
 
 async def _run_declared_checks(
@@ -215,6 +218,11 @@ async def _run_declared_checks(
     *,
     script: str | None = None,
 ) -> str:
+    """Run the project's `checks.sh`; return what is wrong ("" when it passes).
+
+    A failure with `*.capacity` files in `junit_dir` is the cluster's, not the project's: the returned
+    text says so, and is a `_capacity.ChecksNoCapacity` that carries the reason.
+    """
     started = time.monotonic()
     timeline.phase("checks")
     timeline.activity(f"running declared checks ({_CHECKS_TIMEOUT_S}s limit)")
@@ -252,10 +260,11 @@ async def _run_declared_checks(
         env[_gate_tests.SLOW_LANE_ENV] = "child"
         # In a subdirectory of the junit directory, which is removed with it. The same for every project.
         # The same lookup as the gate's own lanes: the run's image, since FLYTE_INTERNAL_IMAGE here lacks git.
-        image = await asyncio.to_thread(
-            _gate_tests._run_image, workspace, _gate_tests._launcher_command(Path(), [])[1]
-        )
+        image = await asyncio.to_thread(_gate_tests._run_image, workspace, _gate_tests._launcher_env())
         env[_gate_tests.TEST_LANE_ENV] = str(_gate_tests.write_lane_launcher(junit_dir / "lane", image))
+        # The launcher must report before the limit kills `checks.sh` and everything it started.
+        env[_capacity.LANE_BUDGET_ENV] = str(_CHECKS_TIMEOUT_S - 120)
+        env = _gate_base.set_xdist_env(env)
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash",
@@ -308,7 +317,12 @@ async def _run_declared_checks(
     if not code:
         return ""
     timeout = f" (timed out after {_CHECKS_TIMEOUT_S}s)" if timed_out else ""
-    return f"`{script}` failed with exit code {code}{timeout}. Output tail: {log_rel}"
+    if junit_dir is not None and (reasons := _capacity.decide_checks_outcome(junit_dir)):
+        problem = f"`{script}` failed with exit code {code}{timeout}: {_capacity.explain(reasons)}"
+        return _capacity.ChecksNoCapacity(problem, reasons)
+    infrastructure = _capacity.label_infrastructure_failures(junit_dir) if junit_dir is not None else ""
+    label = f" {infrastructure}." if infrastructure else ""
+    return f"`{script}` failed with exit code {code}{timeout}.{label} Output tail: {log_rel}"
 
 
 def _prompt_keys(summary: str) -> tuple[str, str]:
@@ -790,6 +804,35 @@ async def _escalate_preflight(
     )
 
 
+async def _hold_or_wait_without_blame(
+    proc: ClaudeProcess,
+    timeline: _timeline._Timeline,
+    capacity: _capacity.CapacityWait,
+    problems: list[str],
+    work: _gate_tests.GateWork,
+    checks_capacity: str,
+) -> bool:
+    """Return True when a pre-review's only trouble is not the project's: a factory fault or no capacity.
+
+    A fault of the factory's goes to the operator at once, which retrying for capacity would only delay; the
+    capacity outcome, if any, goes with it. Otherwise no capacity waits and retries
+    (`_wait_or_escalate_on_no_capacity`). With the project's own problems both are listed among them and the
+    DONE bounces.
+    """
+    reasons = [checks_capacity, work.capacity]
+    if work.harness_faults and not problems:
+        capacity.reset()
+        no_room = [_capacity.explain(reason) for reason in reasons if reason]
+        await _escalate_harness_fault(proc, timeline, "\n".join(work.harness_faults + no_room))
+        return True
+    if problems and work.harness_faults:
+        problems.append(
+            "The gate also hit a fault of the factory's (not yours; the next DONE reruns the gate): "
+            + "; ".join(work.harness_faults)
+        )
+    return await _wait_or_escalate_on_no_capacity(proc, timeline, capacity, problems, reasons)
+
+
 async def _escalate_harness_fault(proc: ClaudeProcess, timeline: _timeline._Timeline, faults: str) -> None:
     """Hold a DONE the gate could not judge because of the factory, not the project, for a human.
 
@@ -816,6 +859,61 @@ async def _escalate_harness_fault(proc: ClaudeProcess, timeline: _timeline._Time
         f"`/review-again`.\n\nThe fault:\n\n{faults}",
         label="Pre-review harness fault",
     )
+
+
+async def _wait_or_escalate_on_no_capacity(
+    proc: ClaudeProcess,
+    timeline: _timeline._Timeline,
+    wait: _capacity.CapacityWait,
+    problems: list[str],
+    reasons: list[str],
+) -> bool:
+    """Return True when a pre-review's only problem is that the cluster had no room for the test lanes.
+
+    That is not a bounce: the agent is told nothing to fix. The pre-review is scheduled to run again (the
+    supervisor loop checks `wait.at`), and after the last backoff the work goes to a human. With other
+    problems the DONE bounces as usual, the capacity outcome listed among them and labelled.
+    """
+    global _escalated, _preflight_escalated
+    lines = [_capacity.explain(reason) for reason in reasons if reason]
+    if problems or not lines:
+        wait.reset()
+        problems += lines
+        return False
+    reason = "; ".join(filter(None, reasons))
+    if not wait.exhausted():
+        delay = wait.schedule(time.monotonic())
+        timeline.row(
+            "⏳",
+            f"pre-review: no capacity ({reason}); retrying in {delay / 60:.0f} min "
+            f"({wait.attempts}/{len(_capacity.RETRY_BACKOFF_S)})",
+        )
+        timeline.phase("waiting")
+        timeline.activity(
+            f"no cluster capacity for the test lanes -- pre-review retries in {delay / 60:.0f} min"
+        )
+        return True
+    _escalated = True
+    _preflight_escalated = True
+    await _post_verdict(
+        _session_config.WORKSPACE,
+        timeline,
+        await _head_sha(_session_config.WORKSPACE),
+        0,
+        "no cluster capacity for the test lanes before review",
+    )
+    timeline.row("🚨", f"no capacity for the test lanes after {wait.attempts} retries ({reason}); escalating")
+    timeline.activity("no cluster capacity for the test lanes -- needs a human; resume with /review-again")
+    await proc.submit(
+        "Your work is finished and waiting on cluster capacity for the test lanes; this is not a failure of "
+        "your change, so change nothing. "
+        + _tell_human_first("the cluster had no capacity for the test lanes")
+        + ' `ask-human "<the cluster had no capacity for the test lanes after '
+        f'{wait.attempts} retries; the work itself is done>"` and wait. Tell the operator to resume with '
+        f"`/review-again`.\n\nThe last reason: {reason}",
+        label="Pre-review no capacity escalated",
+    )
+    return True
 
 
 async def _escalate_review_budget(proc: ClaudeProcess, timeline: _timeline._Timeline) -> None:

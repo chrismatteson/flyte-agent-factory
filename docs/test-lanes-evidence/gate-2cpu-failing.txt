@@ -1,0 +1,53 @@
+scenario: gate-2cpu-failing (gate, 2-CPU shards, one deliberately failing test)
+measured: 2026-11-14T16:13:40Z
+commit: c0926fa6868f7e63b07344881276dc859727ddfc (code last changed at 80c25bc5335695834c93e4de0eab7433085030c1)
+run: small-node-checks-w-3-0-2gj89m
+limit: 1200 s
+wall: 285 s
+outcome: FAIL (exit 1)
+junit cases: 8262, failed: 1
+failed: tests.test_zz_demo_failure::test_a_deliberately_failing_test_for_the_demo
+capacity: -
+ran here (session pod): no
+child actions launched: 1qnbx2bl7qgz4whdm7rcq1310 1upq6fhty02mdbccs9gynejwm 47ljv61vtal8kbwvsskrb8pbz 4fsledsur3x780wshmtc8uxoq 6nobweehoy157aa5qt1j2lhl7 8hskj2g33nfwjdalz4tsvse82 e5o4h4oemmftei84fn0eto9f5 eeyesmj3mk573hk0gily975f1 ttz0skh7ysproer94x9uux3d
+
+--- lane verdict and shard lines ---
+=== shard 1/3 (spot, child action e5o4h4oemmftei84fn0eto9f5) ===
+test-lane: wall 234s, peak memory 1612 MiB, 2 workers
+=== shard 2/3 (spot, child action 1upq6fhty02mdbccs9gynejwm) ===
+test-lane: wall 246s, peak memory 1615 MiB, 2 workers
+=== shard 3/3 (spot, child action 1qnbx2bl7qgz4whdm7rcq1310) ===
+FAILED tests/test_zz_demo_failure.py::test_a_deliberately_failing_test_for_the_demo
+test-lane: wall 256s, peak memory 1998 MiB, 2 workers
+=== lane verdict: exit 1 ===
+shard 1/3 (spot, child action e5o4h4oemmftei84fn0eto9f5): exit 0: 2183 passed, 1 skipped, 10 warnings in 210.44s (0:03:30)
+shard 2/3 (spot, child action 1upq6fhty02mdbccs9gynejwm): exit 0: 2996 passed, 5 skipped, 8 warnings in 226.20s (0:03:46)
+shard 3/3 (spot, child action 1qnbx2bl7qgz4whdm7rcq1310): exit 1: 1 failed, 2893 passed, 22 skipped, 11 warnings in 234.24s (0:03:54)
+slow lane: shard 1/3 spot child action e5o4h4oemmftei84fn0eto9f5 239s code 0
+slow lane: shard 2/3 spot child action 1upq6fhty02mdbccs9gynejwm 262s code 0
+slow lane: shard 3/3 spot child action 1qnbx2bl7qgz4whdm7rcq1310 269s code 1
+=== shard 1/6 (spot, child action 8hskj2g33nfwjdalz4tsvse82) ===
+test-lane: wall 220s, peak memory 2362 MiB, 2 workers
+=== shard 2/6 (spot, child action 47ljv61vtal8kbwvsskrb8pbz) ===
+test-lane: wall 267s, peak memory 2513 MiB, 2 workers
+=== shard 3/6 (spot, child action ttz0skh7ysproer94x9uux3d) ===
+test-lane: wall 156s, peak memory 1236 MiB, 2 workers
+=== shard 4/6 (spot, child action eeyesmj3mk573hk0gily975f1) ===
+test-lane: wall 94s, peak memory 1713 MiB, 2 workers
+=== shard 5/6 (spot, child action 6nobweehoy157aa5qt1j2lhl7) ===
+test-lane: wall 64s, peak memory 1119 MiB, 2 workers
+=== shard 6/6 (spot, child action 4fsledsur3x780wshmtc8uxoq) ===
+test-lane: wall 103s, peak memory 1231 MiB, 2 workers
+=== lane verdict: exit 0 ===
+shard 1/6 (spot, child action 8hskj2g33nfwjdalz4tsvse82): exit 0: 18 passed, 8 warnings in 199.02s (0:03:19)
+shard 2/6 (spot, child action 47ljv61vtal8kbwvsskrb8pbz): exit 0: 17 passed, 8 warnings in 243.66s (0:04:03)
+shard 3/6 (spot, child action ttz0skh7ysproer94x9uux3d): exit 0: 25 passed, 8 warnings in 127.91s (0:02:07)
+shard 4/6 (spot, child action eeyesmj3mk573hk0gily975f1): exit 0: 44 passed, 8 warnings in 73.05s (0:01:13)
+shard 5/6 (spot, child action 6nobweehoy157aa5qt1j2lhl7): exit 5: 8 warnings in 35.56s
+shard 6/6 (spot, child action 4fsledsur3x780wshmtc8uxoq): exit 0: 56 passed, 1 xfailed, 8 warnings in 79.87s (0:01:19)
+slow lane: shard 5/6 spot child action 6nobweehoy157aa5qt1j2lhl7 69s code 5
+slow lane: shard 4/6 spot child action eeyesmj3mk573hk0gily975f1 106s code 0
+slow lane: shard 6/6 spot child action 4fsledsur3x780wshmtc8uxoq 110s code 0
+slow lane: shard 3/6 spot child action ttz0skh7ysproer94x9uux3d 162s code 0
+slow lane: shard 1/6 spot child action 8hskj2g33nfwjdalz4tsvse82 229s code 0
+slow lane: shard 2/6 spot child action 47ljv61vtal8kbwvsskrb8pbz 272s code 0

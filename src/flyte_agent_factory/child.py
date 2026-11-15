@@ -325,15 +325,15 @@ def main(argv: Sequence[str] | None = None, base_dir: str | Path | None = None) 
     abort.add_argument("--reason", default="Aborted by the session that started it.")
     args = parser.parse_args(argv)
 
-    base = Path(base_dir) if base_dir is not None else Path.cwd()
+    base = Path(base_dir) if base_dir is not None else find_base()
     if not context_path(base).is_file():
         # The record of who started what lives beside the context, so another directory has neither.
         where = _names.getenv("AGENT_FACTORY_WORKSPACE") or "the workspace root"
         print(f"refused, nothing aborted: no run context here ({base}); run from {where}", file=sys.stderr)
         return 1
-    attach(base_dir)
+    attach(base)
     try:
-        abort_children(args.names, args.reason, base_dir)
+        abort_children(args.names, args.reason, base)
     except AbortRefused as exc:
         print(f"refused, nothing aborted: {exc}", file=sys.stderr)
         return 1

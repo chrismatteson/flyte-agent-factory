@@ -491,7 +491,9 @@ the session role definitions, the browser image files and the workspace template
 | `_browser_gate.py` | the grant gate in the supervisor: the only route from a session to a personal browser, and the owner's approvals ([personal-browser.md](personal-browser.md)) |
 | `_browser_exit_node.py` | the browser's optional exit-node egress |
 | `_images.py` | the container images for the agent task and the browser app |
-| `_slow_lane.py` | the pytest lanes as a raw-container child action with its own CPUs |
+| `_slow_lane.py` | the pytest lanes as raw-container child actions, one per shard of test files, each with its own CPUs |
+| `_lane_shards.py` | the lane's pure logic: CPU quota, shard plan from recorded durations, junit merge |
+| `_capacity.py` | lanes the cluster had no room for: reads the launcher's `.capacity` files and outcome records, so "full" is retried later rather than bounced |
 | `_demo_checks.py` | demo package checks and publishing |
 
 **The pre-review gate**

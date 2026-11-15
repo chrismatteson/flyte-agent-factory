@@ -144,13 +144,13 @@ _changed_paths = _gate_start.list_changed_paths  # the commit-path lister lives 
 
 #: Files that decide what a pytest run reports. The session can write them, so a junit `checks.sh` left is
 #: evidence only when the round changed none of them; otherwise the gate runs the tests itself.
-#: `_slow_lane.py` is what checks.sh runs to make slow.xml; the package's `__init__.py`, `child.py` and
-#: `_names.py` load before it writes it. Python imports `sitecustomize`, `usercustomize` and `*.pth` files at
-#: start-up, a `pytest`, `_pytest` or `py` module anywhere on the path shadows the real one, and `uv.lock`
-#: picks what is installed. `tests/test_gate_speed.py` checks the package modules against the launcher.
+#: `_slow_lane.py` is what checks.sh runs to make slow.xml, `_lane_shards.py` plans and merges its shards; the
+#: package's `__init__.py`, `child.py`, `_names.py` load before it writes it. Python imports `sitecustomize`,
+#: `usercustomize` and `*.pth` files at start-up, a `pytest`, `_pytest` or `py` module anywhere on the path
+#: shadows the real one, `uv.lock` picks what is installed. `tests/test_gate_speed.py` checks the modules.
 _TEST_HARNESS = re.compile(
     r"(^|/)(checks\.sh|conftest\.py|pyproject\.toml|pytest\.ini|setup\.cfg|tox\.ini|uv\.lock"
-    r"|sitecustomize\.py|usercustomize\.py|pytest\.py|py\.py|_slow_lane\.py)$"
+    r"|sitecustomize\.py|usercustomize\.py|pytest\.py|py\.py|_slow_lane\.py|_lane_shards\.py)$"
     r"|(^|/)_pytest/|(^|/)(pytest|py)/__init__\.py$|\.pth$"
     r"|(^|/)src/flyte_agent_factory/(__init__|child|_names)\.py$"
     r"|(^|/)ops/package_skill\.py$"  # checks.sh runs its --check on the skill zips
@@ -875,7 +875,9 @@ def standards_results(
             if not shared and "No module named pytest" in output:  # a shared run quotes child-lane launchers
                 code = 127
                 output = image_defect("pytest", [rule.ident])
-            record(rule.ident, _gate_base.Status.from_exit(code), shlex.join(command) + "\n" + output)
+            record(
+                rule.ident, _gate_tests.judge_shared_run(shared, code), shlex.join(command) + "\n" + output
+            )
 
     def labelled(ids: list[str], output: str) -> str:
         return f"[{', '.join(ids)}] {output}"
@@ -1366,7 +1368,7 @@ def run(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(results, indent=2))
     work.seconds["gate"] = time.monotonic() - started
-    return "\n".join(f"{r['rule']}: {r['output']}" for r in results if _gate_base.Status(r["status"]).blocks)
+    return "\n".join(f"{r['rule']}: {r['output']}" for r in results if _gate_base.Status(r["status"]).fails)
 
 
 def standards_scan(

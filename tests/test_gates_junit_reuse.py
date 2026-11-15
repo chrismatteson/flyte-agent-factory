@@ -134,3 +134,16 @@ def test_launcher_text_in_a_passing_shared_run_is_not_a_missing_pytest(project, 
 
     monkeypatch.setattr(_gate_tests, "_run_head_pytest", fake)
     assert _pytest_result(project, standards, None).status is _gate_base.Status.PASS
+
+
+def test_sharded_slow_lane_seconds_are_its_longest_shard(tmp_path, project):
+    # The sharded launcher merges a `<testsuite>` per concurrent shard; the lane took as long as its longest.
+    sharded = (
+        '<testsuites><testsuite time="40"><testcase classname="t" name="test_a"/></testsuite>'
+        '<testsuite time="95.5"><testcase classname="t" name="test_b"/></testsuite></testsuites>'
+    )
+    head = git(project, "rev-parse", "HEAD").strip()
+    run = _gate_tests.read_junit(_junit(tmp_path / "junit", project, slow=sharded), 0.0, head)
+    assert run is not None
+    assert run.slow_seconds == 95.5
+    assert len(run.cases) == 3
