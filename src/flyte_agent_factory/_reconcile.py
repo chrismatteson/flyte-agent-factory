@@ -14,7 +14,6 @@ import logging
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from itertools import islice
 from types import MappingProxyType
 from typing import Callable, cast
 
@@ -133,15 +132,15 @@ def project_runs() -> list[remote.Run]:
     after = datetime.now(timezone.utc) - timedelta(hours=MILESTONE_WINDOW_H)
     found: dict[str, remote.Run] = {}
     for live, limit in ((True, LIVE_RUN_LIMIT), (False, RUN_PAGE_SIZE * RUN_PAGE_CAP)):
-        listed = remote.Run.listall(
+        # The helper stops at `limit` without asking for the page after it.
+        page = _factory_base.list_runs(
+            {},
+            keys=[LABEL_ISSUE],
             in_phase=_factory_base.SERVER_LIVE if live else None,
             updated_at=None if live else remote.TimeFilter(after=after),
-            with_label_keys=[LABEL_ISSUE],
             limit=limit,
             sort_by=("created_at", "desc"),
         )
-        # Stop before asking the iterator for another page at the cap.
-        page = list(islice(listed, limit))
         if len(page) == limit:
             log.warning(
                 "Reconcile %s run listing reached its %s-run page cap", "live" if live else "recent", limit

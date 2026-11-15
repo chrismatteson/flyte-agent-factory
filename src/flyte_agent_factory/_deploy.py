@@ -177,18 +177,20 @@ DEPLOYER_ENV = "AGENT_FACTORY_DEPLOYER_ENV"
 # Before any environment is defined: `_profile.pod_env` adds these to every one.
 _TAKE_DEPLOYER_ENV = f"""
 import json
-from flyte_agent_factory import _profile
+from flyte_agent_factory import _profile, _profile_oss
 _profile.set_deployer_env(json.loads(os.environ.pop("{DEPLOYER_ENV}", "{{}}")))
 """
 
 # Every child initialises the SDK the same way: as the deployer's key inside the deployer (which sets
-# `DEPLOY_KEY_ENV`), as the user's CLI login on a laptop. Never the key Union injects into the pod.
+# `DEPLOY_KEY_ENV`), as the user's CLI login on a laptop. Never the key Union injects into the pod. The image
+# builder is the profile's: Union's remote builder, or the local one (docker) where there is none.
 _INIT = (
     _TAKE_DEPLOYER_ENV
     + f"""
 from flyte_agent_factory._union_identity import init_for_script
 init_for_script(_profile.require(), key_env=os.environ.get("{DEPLOY_KEY_ENV}", ""),
-    project=sys.argv[3], domain=sys.argv[4], root_dir=root, image_builder="remote")
+    project=sys.argv[3], domain=sys.argv[4], root_dir=root,
+    image_builder=_profile_oss.builder(_profile.require().backend))
 """
 )
 
@@ -258,7 +260,10 @@ for deployment in deployments:
             app = deployed.deployed_app.watch(wait_for="activated")
             print(f"factory-mcp public URL: {app.endpoint}")
             print(f"Connector URL: {app.endpoint.rstrip('/')}/flyte-mcp/mcp")
-            print("Connect with header Authorization: Bearer <Union API key or access token>.")
+            if _profile_oss.mcp_auth(_profile.require()) == "proxy":
+                print("Connect through your authenticating proxy; the app itself checks no token.")
+            else:
+                print("Connect with header Authorization: Bearer <Union API key or access token>.")
         # Not watched like factory-mcp: an app whose secret does not exist yet never activates, and the
         # deploy must not hang or fail on it. The create response may not carry the URL yet.
         if deployed.get_name() == "factory-webhook" and not dry:

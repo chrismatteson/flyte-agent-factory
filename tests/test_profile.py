@@ -176,6 +176,7 @@ def test_only_example_and_readme_are_tracked_in_profiles():
         "profiles/example-claude-personal.toml",
         "profiles/example-codex-personal.toml",
         "profiles/example.toml",
+        "profiles/oss-example.toml",
     ]
 
 

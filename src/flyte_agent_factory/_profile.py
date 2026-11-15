@@ -29,6 +29,7 @@ from . import (
     _git,
     _github,
     _names,
+    _profile_oss,
     _profile_policy,
     _profile_resources,
     _profile_union,
@@ -78,7 +79,7 @@ class ProfileError(ValueError):
 
 @dataclass(frozen=True)
 class Backend:
-    kind: str  # "union" or "oss": recorded for docs and guards, not branched on at runtime
+    kind: str  # "union" or "oss": read for the identity, builder, endpoint and MCP auth (`_profile_oss`)
     endpoint: str
     project: str
     domain: str
@@ -86,6 +87,9 @@ class Backend:
     console_host: str = ""
     signin_host: str = ""
     config: str = ""  # the Flyte config file `make` passes to the CLI
+    internal_endpoint: str = ""  # where a pod reaches Flyte; required on oss (`_profile_oss`)
+    insecure: bool = False  # the internal endpoint speaks plain HTTP
+    image_builder: str = ""  # one of `_profile_oss.IMAGE_BUILDERS`; empty: the kind's default
 
 
 @dataclass(frozen=True)
@@ -147,6 +151,7 @@ class Secrets:
 @dataclass(frozen=True)
 class Mcp:
     public_url: str = ""
+    auth: str = ""  # "union" or "proxy"; empty: the kind's default (`_profile_oss.mcp_auth`)
     # Keys of [repo] that chat may launch projects into; the project repo unless the profile says more.
     repos: tuple[str, ...] = ("project",)
 
@@ -805,12 +810,14 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             "(a skeleton can set allow_placeholders = true)"
         )
 
+    backend_table = dict(_table(data, "backend", where))
+    insecure = backend_table.pop("insecure", False)
     backend = _fields(
-        _table(data, "backend", where),
+        backend_table,
         "backend",
         where,
         ("kind", "endpoint", "project", "domain"),
-        ("org", "console_host", "signin_host", "config"),
+        ("org", "console_host", "signin_host", "config", "internal_endpoint", "image_builder"),
     )
     if backend["kind"] not in BACKENDS:
         raise ProfileError(f"{where}: [backend] kind must be one of {BACKENDS}, not {backend['kind']!r}")
@@ -890,8 +897,10 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     repo_aliases = _repo_aliases(_table(data, "repo_aliases", where, required=False), repo, where)
 
     mcp = None
+    mcp_auth: object = None  # None: the key is absent and the kind's default applies
     if "mcp" in data:
         table = dict(_table(data, "mcp", where))
+        mcp_auth = table.get("auth")
         repos = table.pop("repos", ["project"])
         if not isinstance(repos, list) or not all(isinstance(key, str) for key in repos):
             raise ProfileError(f"{where}: [mcp] repos must be a list of strings")
@@ -903,16 +912,12 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
                 f"{where}: [mcp] repos names {', '.join(unknown_repos)}, which are not keys of [repo] "
                 f"({', '.join(repo)})"
             )
-        mcp = Mcp(
-            repos=tuple(repos),
-            **_fields(
-                table,
-                "mcp",
-                where,
-                (),
-                ("public_url",),
-            ),
-        )
+        mcp = Mcp(repos=tuple(repos), **_fields(table, "mcp", where, (), ("public_url", "auth")))
+
+    try:
+        _profile_oss.validate_keys(backend, insecure, mcp_auth)
+    except ValueError as exc:
+        raise ProfileError(f"{where}: {exc}") from exc
 
     gcp = None
     if "gcp" in data:
@@ -1146,7 +1151,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     return Profile(
         name=name,
         text=re.sub(r'^standards_payload = "[^"\n]*"\n', "", text, count=1),
-        backend=Backend(**backend),
+        backend=Backend(insecure=insecure, **backend),
         repo=repo["project"],
         repos=repo,
         repo_keys=repo_keys,
@@ -1431,6 +1436,7 @@ def pod_env() -> dict[str, str]:
     # AGENT_FACTORY_GITHUB_PUSH=app would bake App pushes into the slots without the isolation canary (#179).
     # Only the deployer's deploy children set these, explicitly (`_deploy._run_child`'s `deployer_env`).
     env.update(_deployer_env)
+    env.update(_profile_oss.endpoint_env(profile))
     return env
 
 

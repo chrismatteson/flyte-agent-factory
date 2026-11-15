@@ -164,10 +164,9 @@ launch your first project (below). It ends by naming the one thing still blockin
 - `git`, OpenSSH (`ssh-keygen`), [uv](https://docs.astral.sh/uv/getting-started/installation/), and Claude Code
   or claude.ai with request-header connectors (a beta; see [chat-operator.md](chat-operator.md)).
 
-**OSS Flyte** is a partial path. The bootstrap runs every step except the deploy against an OSS endpoint
-(`--backend oss`), then stops and names what remains Union-only (API keys, the remote image builder and MCP
-authentication). See [oss-flyte-compat.md](oss-flyte-compat.md). Do not follow Union-only commands against an OSS
-endpoint.
+**OSS Flyte** has its own path with no Union API keys: see [On OSS Flyte](#on-oss-flyte) in section 5. The guided
+bootstrap runs every step except the deploy against an OSS endpoint (`--backend oss`); the deploy is by hand. Do not
+follow the Union-only commands (API keys, `[union]`) against an OSS endpoint.
 
 **Template repository.** Setup uses the workspace template bundled in the engine, so it works from the engine
 repository alone. Docs link to `unionai-oss/flyte-agent-workspace`, but that repository does not exist yet. Publishing
@@ -521,6 +520,46 @@ Follow [chat-operator.md, Setup](chat-operator.md#setup) in order:
 4. Connect GitHub's official MCP separately ([github-connector.md](github-connector.md)) and check repository
    access. For boards also check `projects_list`, `projects_get`, `projects_write`; repo access alone does not
    grant Projects access. Install tokens/OAuth secrets in connector settings, never in chat or factory secrets.
+
+### On OSS Flyte
+
+With `[backend] kind = "oss"` the factory needs no Union keys, builds images with the local builder (docker, and
+push access to the registry your Flyte config names) and reaches Flyte from pods at `internal_endpoint`. The full
+path, the key table and the trust model are in
+[oss-flyte-compat.md](oss-flyte-compat.md#running-the-factory-on-oss-flyte); in short, from
+[profiles/oss-example.toml](../profiles/oss-example.toml):
+
+```toml
+[backend]
+kind = "oss"
+endpoint = "flyte.example.com"
+project = "my-agents"
+domain = "development"
+internal_endpoint = "http://flyte-http.flyte.svc.cluster.local:8090"
+insecure = true
+image_builder = "local"
+config = "~/.flyte/example-oss-config.yaml"
+
+[mcp]
+public_url = "https://factory-mcp.example.com"
+auth = "proxy"
+```
+
+Create the two secrets the profile names with your OSS config file (`[backend] config`; the file arguments are
+placeholders, and a value never goes on the command line), then deploy:
+
+```bash
+export FLYTE_CONFIG=~/.flyte/example-oss-config.yaml
+uv run flyte --config "$FLYTE_CONFIG" create secret claude_code_oauth_token --from-file <file holding the token> -p my-agents -d development
+uv run flyte --config "$FLYTE_CONFIG" create secret my_deploy_key --from-file <private key file> -p my-agents -d development
+export AGENT_FACTORY_PROFILE=oss-example
+export AGENT_FACTORY_SECRETS="$(PYTHONPATH=src uv run python -m flyte_agent_factory._profile agent_secrets)"
+PYTHONPATH=src uv run python ops/deploy_work.py
+PYTHONPATH=src uv run python ops/deploy_factory.py
+```
+
+The Flyte API on OSS has no authorization, so keep it on a private network, and **the factory MCP app (`[mcp] auth =
+"proxy"`) must sit behind an authenticating (OAuth) proxy, never exposed on its own.**
 
 ## 6. Launch and confirm
 

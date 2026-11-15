@@ -204,8 +204,11 @@ def _spend(now: float, exclude_run: str = "") -> list[_loop.Spend]:
     rows = []
     after = datetime.fromtimestamp(now - 8 * 86400, timezone.utc)
     runs: dict[str, remote.Run] = {}
-    for query in ({"with_label_keys": ["factory-loop"]}, {"task_name": "factory-loop.loop_run"}):
-        found = list(remote.Run.listall(updated_at=remote.TimeFilter(after=after), limit=10000, **query))
+    since = remote.TimeFilter(after=after)
+    for found in (
+        _factory_base.list_runs({}, keys=["factory-loop"], updated_at=since, limit=10000),
+        list(remote.Run.listall(updated_at=since, limit=10000, task_name="factory-loop.loop_run")),
+    ):
         if len(found) == 10000:
             raise ValueError("loop spend listing exceeded its bound")
         runs.update((run.name, run) for run in found)

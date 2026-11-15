@@ -71,6 +71,7 @@ from flyte_agent_factory import (
     _names,
     _policy,
     _profile,
+    _profile_oss,
     _pull_requests,
     _resources,
     _review,
@@ -328,6 +329,7 @@ subagent_env = flyte.TaskEnvironment(
     env_vars={
         "PYTHONUNBUFFERED": "1",
         **_session_env_vars,
+        **_profile_oss.endpoint_env(),
         "AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE": _names.getenv("AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE", "claude"),
         **_token_secret_env(),
         **_codex_token_secret_env(),
@@ -441,7 +443,7 @@ async def project(
 
     timeline.header("project", project_name)
     timeline.header("run", run_name)
-    timeline.row("🔑", f"Union: tier {identity.tier}, secret {identity.secret}, client {identity.client_id}")
+    timeline.row("🔑", _union_identity.describe_identity(identity))
     timeline.header("model", f"{model} ({effort or 'default effort'})")
     # The console's run page, from the same profile the probes use; "" where there is no console.
     timeline.run_url = _board.run_url(_session_config._PROFILE, run_name) if ctx and ctx.action else ""

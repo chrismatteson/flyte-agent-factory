@@ -1,9 +1,15 @@
 """The factory's MCP server: Flyte's stock MCP app, every tool, limited to the factory's project and domain.
 
-Union authenticates every request at the app ingress (`requires_auth=True`) and Flyte runs each
-call as the caller, so a Union user's sign-in token or a Union API key both work as the bearer.
-What the caller may do inside the factory's project and domain is bounded by their Union auth (RBAC);
-this module only keeps every tool from reaching outside it (`_scope_tools_to_the_factory`).
+With `[mcp] auth = "union"` (the default on a Union backend) Union authenticates every request at the app
+ingress (`requires_auth=True`) and Flyte runs each call as the caller, so a Union user's sign-in token or a
+Union API key both work as the bearer. What the caller may do inside the factory's project and domain is
+bounded by their Union auth (RBAC); this module only keeps every tool from reaching outside it
+(`_scope_tools_to_the_factory`).
+
+With `auth = "proxy"` (the default on OSS) the app does no authentication of its own (`requires_auth=False`):
+it trusts whoever reaches it. It must sit behind an authenticating proxy (an OAuth proxy) and never be exposed
+on its own: anyone who can reach the app can launch and abort runs in the factory's project. It also asks
+Kubernetes for no CPU or memory (an empty `flyte.Resources()`), so it schedules on a lean node.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from mcp.server.fastmcp import (
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
 
-from . import _factory, _grant_page, _profile, _resources, _union_identity
+from . import _factory, _grant_page, _profile, _profile_oss, _resources, _union_identity
 from ._bridge import _ENDED_PHASES, _ended_on_server
 from ._bridge_common import parse_approval
 from ._errors import REMOTE_ERRORS
@@ -212,13 +218,14 @@ _FETCH_DOCS = (
     f"&& rm -rf /tmp/flyte-sdk /tmp/unionai-examples && chmod -R a+rX {DOCS_DIR}"
 )
 
-_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
+_QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_for(PROFILE, "queue")  # none on OSS
+_PROXY_AUTH = _profile_oss.mcp_auth(PROFILE) == "proxy"
 app = FlyteMCPAppEnvironment(
     name="factory-mcp",
     image=agent_image()
     .with_pip_packages("flyte[mcp]>=2.10.7,<2.11.0", "mcp>=1.30.0,<2")
     .with_commands([_FETCH_DOCS]),
-    requires_auth=True,
+    requires_auth=not _PROXY_AUTH,
     tools=TOOLS,
     task_allowlist=None,  # any task in the factory project; `_scope_tools_to_the_factory` bounds it
     instructions=INSTRUCTIONS,

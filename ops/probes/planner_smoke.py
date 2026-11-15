@@ -128,7 +128,7 @@ def main() -> None:
         _planner_runtime.notify(profile, key)
 
     def runs(issue: str) -> list[remote.Run]:
-        return list(remote.Run.listall(with_labels={"factory-issue": _issues.issue_label(issue)}))
+        return _factory_base.list_runs({"factory-issue": _issues.issue_label(issue)})
 
     first = wait_for(lambda: runs(issues[1]), "priority launch")
     if len(first) != 1 or runs(issues[0]):
