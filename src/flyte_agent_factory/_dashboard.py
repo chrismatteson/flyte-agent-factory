@@ -798,6 +798,8 @@ def render(
                 "phase": data["phase"],
                 "project": data.get("project"),
                 "truncated": True,
+                "checkpoint": data.get("checkpoint", ""),
+                "app": data.get("app", ""),
                 # Small, and what `factory.credential_link` needs: dropping it would stop a grant being given.
                 "credentials": data.get("credentials") or {},
                 **({"metrics": metrics} if metrics is not None else {}),

@@ -79,7 +79,6 @@ def collect_wanted_keys(
         },
         "repo": {"project": workspace_url, "factory": ENGINE_REPO_URL},
         "secrets": {"claude_token": SECRET_CLAUDE, "deploy_key": SECRET_DEPLOY_KEY},
-        "state": {"uri": settings.state_uri},
         "mcp": {"public_url": mcp_url},
     }
     if settings.backend == "union":  # a Union backend requires it; an OSS one has no such secrets
@@ -166,13 +165,12 @@ def find_conflicts(path: Path, settings: Settings) -> dict[str, tuple[str, str]]
     a second project, never an edit to make silently.
     """
     data = tomllib.loads(path.read_text())
-    backend, state = data.get("backend", {}), data.get("state", {})
+    backend = data.get("backend", {})
     wanted = {
         "backend.kind": (backend.get("kind"), settings.backend),
         "backend.endpoint": (backend.get("endpoint"), settings.endpoint),
         "backend.project": (backend.get("project"), settings.project),
         "backend.domain": (backend.get("domain"), settings.domain),
-        "state.uri": (state.get("uri"), settings.state_uri),
     }
     conflicts = {}
     for name, (have, given) in wanted.items():
@@ -188,14 +186,13 @@ def find_conflicts(path: Path, settings: Settings) -> dict[str, tuple[str, str]]
 def read_settings(path: Path, settings: Settings) -> Settings:
     """Return a copy of `settings` with the values `path` holds, for the command that matches the file."""
     data = tomllib.loads(path.read_text())
-    backend, state = data.get("backend", {}), data.get("state", {})
+    backend = data.get("backend", {})
     return dataclasses.replace(
         settings,
         backend=backend.get("kind", settings.backend),
         endpoint=normalise_endpoint(str(backend.get("endpoint", settings.endpoint))) or settings.endpoint,
         project=backend.get("project", settings.project),
         domain=backend.get("domain", settings.domain),
-        state_uri=state.get("uri", settings.state_uri),
     )
 
 

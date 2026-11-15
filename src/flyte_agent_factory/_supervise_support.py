@@ -893,12 +893,12 @@ _queue_read: asyncio.Future[Any] | None = None
 
 
 async def _refresh_queue(timeline: _timeline._Timeline) -> None:
-    """Who is waiting for a slot, for the dashboard. Only where the profile has a `[state] uri`.
+    """Who is waiting for a slot, for the dashboard.
 
-    Fail-soft: the queue is information for the human, and an unreadable bucket must not touch the
+    Fail-soft: the queue is information for the human, and an unreadable state branch must not touch the
     run. It shows as empty rather than as a list that may be hours old.
     """
-    if not (_session_config._PROFILE and _session_config._PROFILE.state.uri):
+    if not _session_config._PROFILE:
         return
     try:
         from flyte_agent_factory import _factory, _factory_base  # lazily: it needs a profile at import

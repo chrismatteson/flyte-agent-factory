@@ -26,7 +26,7 @@ follow the same steps yourself. The skill's procedure is its
 ## What /agent-factory walks you through
 
 It asks whether Flyte or Union is already running for you and for its URL, then collects the non-secret values:
-endpoint, project, domain, the GitHub owner for your workspace, the state bucket and the engine. It never asks for a
+endpoint, project, domain, the GitHub owner for your workspace and the engine. It never asks for a
 credential. The GitHub App is the guided-setup default (read-only on code; pushes stay on deploy keys until the isolation canary reports `isolated`) and optional: without it the deploy key into your
 workspace is the only GitHub credential setup requires, with no CI visibility
 ([github-app.md](github-app.md), which also says why two GitHub credentials remain for now). claude.ai has no local shell, so it ends the conversation part with **one copy-paste command**
@@ -88,7 +88,7 @@ The setup it performs, in the order a person thinks of it:
    first time. It deploys the work slots and the factory again, even though the last deploy matches your profile:
 
    ```bash
-   d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --redeploy
+   d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --redeploy
    ```
 
 Around those seven, the bootstrap also checks tools and signs you in to Flyte, makes sure the project exists,
@@ -122,7 +122,7 @@ interruption, or add `--status` for a read-only table; paste that table into the
 operator picks up at the first `todo`. The command:
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace
 ```
 
 The chat fills in your values. Optional flags: `--domain` (default `development`), `--backend union|oss`,
@@ -157,9 +157,6 @@ launch your first project (below). It ends by naming the one thing still blockin
 - A GitHub account, and `gh` signed in locally (`gh auth login`; the board also needs `gh auth refresh -s project`).
 - A **Flyte backend**: a Union organization (you get an endpoint such as `flyte.example.com`). Union is required
   for the whole path today. This guide cannot create a tenant or a cluster.
-- A **state bucket**: a private, encrypted object-storage prefix the factory's tasks and your machine can list,
-  read, write and delete ([Required shared state storage](#required-shared-state-storage)). Its URI is
-  `--state-uri`.
 - **Claude Pro or Max**, whose `claude setup-token` supplies the workers; an Anthropic API key is not needed.
   Codex is optional and still needs a Claude token ([engines.md](engines.md)). With `--engine codex` the
   `engine-token` step prints one command (`codex login --device-auth`, then `flyte create secret
@@ -324,7 +321,7 @@ repo = "you/my-workspace"
 profile = "profile.toml"
 ```
 
-Include `[state] uri` only after the storage prerequisite below is satisfied. If `profile.toml` already exists (an
+If `profile.toml` already exists (an
 earlier run, or a hand copy), never overwrite it: use a targeted edit of the confirmed fields, preserving all other
 settings, in one copy-paste command instead. Chat can request non-secret profile fields to prepare that edit; never
 read credential files or secret values into chat. Have the command parse the resulting TOML with Python's `tomllib`
@@ -351,72 +348,15 @@ export FLYTE_PROJECT="$(PYTHONPATH=src uv run python -m flyte_agent_factory._pro
 export FLYTE_DOMAIN="$(PYTHONPATH=src uv run python -m flyte_agent_factory._profile domain)"
 ```
 
-### Required shared state storage
+### Factory state needs no storage
 
-Both `example-claude-personal.toml` and `example-codex-personal.toml` omit `[state]`. **Add it to your copied
-profile before deploying.** Every launch uses the queue and rejects an empty state URI, even with auto-deploy
-disabled. Profile parsing alone does not check storage access.
-
-Ask your backend administrator which native object-storage provider and runtime identity this Union project
-uses. Have them provision a private, encrypted bucket/container and a dedicated prefix for this deployment,
-or authorize an existing one. Use that provider's console and IAM tools; the factory does not create storage
-or attach cloud roles. Give the factory tasks (including sweep/reconcile/deployer), project slots and any
-local operator using `ops/operate.py` access to list, read, create/overwrite and delete objects under this
-prefix. A Union API key grants control-plane access; it does not grant native object-storage permissions.
-The local machine and runtime need their own provider authentication; a laptop's cloud login is not inherited
-by remote tasks. Ask the administrator to configure the runtime workload identity, not long-lived cloud keys
-in a profile or chat.
-
-For **AWS S3**, the administrator must allow `s3:ListBucket` on the bucket restricted to the chosen prefix,
-and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on objects under it. SSE-KMS additionally needs the key's
-policy and encrypt/decrypt/data-key permissions for those identities. For **GCS**, use bucket/prefix-scoped
-object list/get/create/delete permissions (overwrite needs delete). For **Azure**, use scoped blob data
-list/read/write/delete permissions, such as Storage Blob Data Contributor on the intended container.
-Do not choose a URI scheme until the administrator confirms the provider and grants. There is no single
-cloud-provisioning command valid across these backends. If that access is unavailable, stop here: setup cannot
-continue until the administrator supplies the provider, bucket/prefix and runtime identity.
-
-Once the administrator confirms storage, have chat include `[state] uri` in the profile handoff, or prepare
-one copy-paste command to add/update only that field in the existing profile and validate it. Do not append a
-duplicate `[state]` table. For an administrator-confirmed S3 bucket and prefix, the resulting section is:
-
-```toml
-[state]
-uri = "s3://my-agent-state/factory/mine"
-```
-
-Use `gs://`/`gcs://` for confirmed GCS or `abfs://`/`abfss://` for confirmed Azure instead. `file://` on your
-laptop or a pod's disk is not shared durable state for the factory.
-
-After selecting and provisioning the provider, this command tests local list/write/read/delete access using
-the same Flyte storage interface as the queue. It writes only a uniquely named probe under the chosen prefix;
-run locally with provider credentials already configured, and do not send credential errors unredacted to chat:
-
-```bash
-PYTHONPATH=src uv run python - <<'PYTHON'
-import uuid
-import flyte.storage
-from flyte_agent_factory import _profile
-
-uri = _profile.require().state.uri
-if not uri:
-    raise SystemExit("Set [state] uri first")
-fs = flyte.storage.get_underlying_filesystem(path=uri)
-path = uri.rstrip("/") + "/setup-probe-" + uuid.uuid4().hex
-fs.find(uri)
-try:
-    fs.pipe_file(path, b"factory setup probe")
-    assert fs.cat_file(path) == b"factory setup probe"
-finally:
-    if fs.exists(path):
-        fs.rm(path)
-print("Local storage probe passed; runtime identity still needs its own check")
-PYTHON
-```
-
-A local pass does not prove runtime access; the administrator must check the same operations as the runtime
-identity before first launch. This project has not run that live check against a real bucket; see
-[install-audit.md](install-audit.md#setup-walkthrough-verification).
+The factory keeps its own state (the launch queue, usage reserves, admission wait reasons) on an orphan git
+branch of your workspace repository, `factory-state/<project>-<domain>`, so there is no bucket, prefix or IAM
+policy to set up and no `[state]` table to write. It is reached with `[secrets] deploy_key`, which the
+bootstrap creates as a write key; from your machine, with your own git credentials. See
+[state-store.md](state-store.md). A profile left over from an older install may still carry `[state] uri`; it
+is ignored with a deprecation warning, and so is `--state-uri` on an old bootstrap command. To move a factory
+that has state in a bucket, see "Cutover from the bucket" in [state-store.md](state-store.md).
 
 List secret names/metadata in the selected project/domain:
 
@@ -493,7 +433,7 @@ Run only this step, for example to add the keys later or after an administrator 
 command the bootstrap prints for your values (here the example values):
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --union-keys
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --union-keys
 ```
 
 If a key of that name already exists in Union (an earlier run died between making it and storing it) its value cannot

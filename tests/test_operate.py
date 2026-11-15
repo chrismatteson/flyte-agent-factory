@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 from obstore.exceptions import GenericError
 
+from flyte_agent_factory import _queue, _state_store
+
 
 def _load(name: str, path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, path)
@@ -227,7 +229,7 @@ def test_a_refused_launch_queues_nothing(flyte_world, brief_file):
     args.name = "Bad Name"
     with pytest.raises(ValueError, match="name must be"):
         operate.launch(args)
-    assert flyte_world.created == [] and not Path(flyte_world.queue.removeprefix("file://")).exists()
+    assert flyte_world.created == [] and not _queue._fs(flyte_world.queue).find(flyte_world.queue)
 
 
 def test_an_interface_failure_says_no_run_was_created(flyte_world, brief_file):
@@ -779,7 +781,11 @@ def test_the_overview_shows_the_queue(flyte_world, monkeypatch, brief_file, caps
 
 
 def test_the_overview_still_shows_projects_when_the_queue_is_unreadable(monkeypatch, capsys):
-    monkeypatch.setattr(operate, "_init", lambda: None)  # the suite profile has no [state] uri
+    def waiting_rows(*_):
+        raise _state_store.StateError("push rejected 10 times; giving up")
+
+    monkeypatch.setattr(operate, "_init", lambda: None)
+    monkeypatch.setattr(operate._factory, "waiting_rows", waiting_rows)
     monkeypatch.setattr(operate._factory, "recent_runs", list)
     operate.main(["overview"])
     out = capsys.readouterr().out
@@ -840,6 +846,13 @@ def test_stalled_completion_notification_cannot_keep_the_process_alive():
         from flyte_agent_factory import _checkpoint, _factory, _profile, _session_config, agent
         from tests.fake_flyte import FakeFlyte
 
+        import tempfile
+        from pathlib import Path
+
+        from flyte_agent_factory import _state_store
+        from tests.state_git import make_store
+
+        _state_store.configure(make_store(Path(tempfile.mkdtemp())))  # the suite's own store, as in conftest
         world = FakeFlyte(pytest.MonkeyPatch(), _factory)
         world.before_create = lambda: time.sleep(60)
         _checkpoint._NOTIFY_TIMEOUT_S = 1.0  # the seam for the production 15 s; the property is the same

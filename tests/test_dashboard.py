@@ -1,7 +1,6 @@
 """The run report as a dashboard: sections, the JSON twin, and the readers that predate it."""
 
 import asyncio
-import dataclasses
 import json
 import re
 import time
@@ -17,7 +16,6 @@ from flyte_agent_factory import (
     _dashboard,
     _inbox,
     _meter,
-    _profile,
     _reviewer,
     _session_config,
     _supervise,
@@ -895,12 +893,6 @@ def test_criterion_notes_for_lettered_and_dotted_ids():
     assert results == {"G1": "PASS", "1.1": "PASS", "3.10a": "PASS", "P0.2": "PASS", "C5": "PASS"}
 
 
-def with_state_uri(monkeypatch, uri: str) -> None:
-    assert _session_config._PROFILE is not None
-    profile = dataclasses.replace(_session_config._PROFILE, state=_profile.State(uri=uri))
-    monkeypatch.setattr(_session_config, "_PROFILE", profile)
-
-
 def test_the_queue_shows_who_is_waiting_and_since_when():
     now = time.time()
     timeline = timeline_for(
@@ -927,11 +919,10 @@ def test_an_empty_queue_adds_nothing_to_the_page():
 
 
 @pytest.mark.asyncio
-async def test_the_dashboard_loop_reads_the_queue_when_the_profile_has_a_state_uri(monkeypatch):
+async def test_the_dashboard_loop_reads_the_queue(monkeypatch):
     from flyte_agent_factory import _factory, _factory_base
 
     now = time.time()
-    with_state_uri(monkeypatch, "file:///tmp/state")
     monkeypatch.setattr(_factory_base, "queue_root", lambda: "file:///tmp/state/queue")
     monkeypatch.setattr(
         _factory,
@@ -950,7 +941,7 @@ async def test_the_dashboard_loop_reads_the_queue_when_the_profile_has_a_state_u
 
 
 @pytest.mark.asyncio
-async def test_the_queue_is_skipped_without_a_state_uri_and_failures_are_soft(monkeypatch):
+async def test_failures_reading_the_queue_are_soft(monkeypatch):
     from flyte_agent_factory import _factory, _factory_base
 
     def boom(*a, **k):
@@ -960,13 +951,51 @@ async def test_the_queue_is_skipped_without_a_state_uri_and_failures_are_soft(mo
     monkeypatch.setattr(_factory_base, "queue_root", lambda: "file:///tmp/state/queue")
     timeline = timeline_for(queue=[{"position": 1, "name": "stale", "since": 0}])
 
-    with_state_uri(monkeypatch, "")
-    await _supervise_support._refresh_queue(timeline)
-    assert timeline.queue == [{"position": 1, "name": "stale", "since": 0}]
-
-    with_state_uri(monkeypatch, "file:///tmp/state")
     await _supervise_support._refresh_queue(timeline)
     assert timeline.queue == [], "an unreadable queue shows nothing rather than a stale list"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uri", ["", "file:///tmp/state"])
+async def test_the_dashboard_loop_reads_the_queue_when_the_profile_has_a_state_uri(monkeypatch, uri):
+    """Bucket-era name; now checks the loop reads the state-store queue with or without a legacy uri."""
+    import dataclasses
+
+    from flyte_agent_factory import _factory, _factory_base, _profile
+
+    assert _session_config._PROFILE is not None
+    profile = dataclasses.replace(_session_config._PROFILE, state=_profile.State(uri=uri))
+    monkeypatch.setattr(_session_config, "_PROFILE", profile)
+    # A previous test's read thread may still be winding down.
+    monkeypatch.setattr(_supervise_support, "_queue_read", None)
+    monkeypatch.setattr(_factory_base, "queue_root", lambda: "state-branch-queue")
+    monkeypatch.setattr(
+        _factory, "waiting_rows", lambda queue, at: [{"position": 1, "name": "alpha", "waiting_s": 60}]
+    )
+    timeline = timeline_for()
+
+    await _supervise_support._refresh_queue(timeline)
+
+    assert [(e["position"], e["name"]) for e in timeline.queue] == [(1, "alpha")]
+
+
+@pytest.mark.asyncio
+async def test_the_queue_is_skipped_without_a_state_uri_and_failures_are_soft(monkeypatch):
+    """Bucket-era name; now checks a failing state-store read is soft: the page still renders, queue empty."""
+    from flyte_agent_factory import _factory, _factory_base
+
+    def boom(*a, **k):
+        raise RuntimeError("state branch unreachable")
+
+    monkeypatch.setattr(_supervise_support, "_queue_read", None)
+    monkeypatch.setattr(_factory, "waiting_rows", boom)
+    monkeypatch.setattr(_factory_base, "queue_root", lambda: "state-branch-queue")
+    timeline = timeline_for(queue=[{"position": 1, "name": "stale", "since": 0}])
+
+    await _supervise_support._refresh_queue(timeline)
+
+    assert timeline.queue == []
+    assert data_of(timeline.render())["queue"] == {"waiting": 0, "entries": []}
 
 
 @pytest.mark.asyncio

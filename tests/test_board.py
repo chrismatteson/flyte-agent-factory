@@ -402,10 +402,12 @@ def test_sync_environment_only_mounts_pat(tmp_path):
     profile = board_profile(tmp_path)
     env = {key: value for key, value in os.environ.items() if key != _profile.PROFILE_ENV}
     env[_profile.TOML_ENV] = profile.text
-    code = """
-from flyte_agent_factory import _reconcile
+    code = f"""
+from flyte_agent_factory import _git, _reconcile
 assert _reconcile.env.name == "factory-reconcile"
+# The deploy key is for the queue it reads (state branch); then the board's PAT and the queue tier's key.
 assert [(s.key, s.as_env_var) for s in _reconcile.env.secrets] == [
+    ({profile.secrets.deploy_key!r}, _git.GIT_DEPLOY_KEY_ENV_VAR),
     ("github_board_pat", "GITHUB_BOARD_PAT"),
     ("factory-project-key", "AGENT_FACTORY_UNION_KEY"),
 ]

@@ -114,6 +114,8 @@ profile_uri = "s3://YOUR-PROJECT-PREFIX/browser-github/profile.tar.gz"
 # exit_node = "other-node"   # optional override for this identity; "" means direct egress
 ```
 
+The `profile_uri` archive is separate from the factory's state (which lives on a git branch, see `state-store.md`) and still uses the object-storage URI it is given: it holds sign-in cookies, which must not go into git.
+
 An identity name matches `^[a-z][a-z0-9-]{0,19}$`, needs a `profile_uri`, and two identities may not share one.
 The earlier shape still works and is exactly one identity named `personal`:
 `[browser] personal = true` with `profile_uri` (and `exit_node`). Do not combine it with

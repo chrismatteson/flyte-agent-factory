@@ -37,6 +37,7 @@ from . import (
     _pull_requests,
     _queue,
     _router,
+    _state_store,
     _union_identity,
 )
 from ._images import agent_image
@@ -51,7 +52,8 @@ env = flyte.TaskEnvironment(
     secrets=cast(
         list[str | flyte.Secret],
         (
-            (
+            _factory_base.state_secrets(PROFILE)
+            + (
                 [flyte.Secret(key=PROFILE.board.pat_secret, as_env_var=_board.TOKEN_ENV)]
                 if PROFILE.board
                 else []
@@ -484,10 +486,8 @@ async def loop_run(pr_number: int) -> str:
 
 def _generate_backlog(app: _github.GithubApp) -> str:
     repo = PROFILE.loop.repo
-    if not PROFILE.state.uri:
-        raise ValueError("backlog generation requires [state] uri")
     holder = secrets.token_hex(16)
-    root = f"{PROFILE.state.uri.rstrip('/')}/loop/backlog"
+    root = f"{_state_store.ROOT}/loop/backlog"
     if _queue.take_lease(root, holder) is not None:
         raise RuntimeError("another backlog generator is running")
     board = None

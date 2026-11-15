@@ -1,4 +1,4 @@
-"""The launch queue's storage: request objects and marker objects under `<[state] uri>/queue/`.
+"""The launch queue's storage: request files and marker files under `queue/` on the state branch.
 
 One directory per project name; inside it, per generation (`gen`, one per launch of that name):
 
@@ -9,16 +9,15 @@ One directory per project name; inside it, per generation (`gen`, one per launch
     NNNN.attempt-<n>  a dispatch of attempt n-1 lost its slot; the next run name uses n ({at}), or the
                       run was aborted from inside and is recreated ({at, aborted_run, recreated_from})
 
-A request is pending until one of the first three markers exists. There is no compare-and-swap
-here: `flyte.storage` does not expose conditional puts, so nothing in this module claims anything.
-Nor does Flyte: creating a run under a name that exists REPLACES that run (measured, not documented),
-so run names are random and never repeat. Dispatchers are serialised by an approximate lease
-(`take_lease`), and a request that still gets two runs is deduplicated on the server by labels
+A request is pending until one of the first three markers exists. Writes claim nothing by themselves;
+the one claim is `take_lease`, a compare-and-swap on the branch tip (`_state_store`). Flyte has none:
+creating a run under a name that exists REPLACES that run (measured, not documented), so run names are
+random and never repeat. A request that still gets two runs is deduplicated on the server by labels
 (`_factory`). The markers are caches of what Flyte already knows.
 
-Everything is synchronous and goes through the filesystem `flyte.storage` itself reads and writes
-with (`get_underlying_filesystem`): callers are plain functions (`ops/operate.py`, a thread in a
-project pod) as well as tasks that already run an event loop, and fsspec's sync methods work in both.
+Everything is synchronous and goes through `_state_store`'s filesystem view: callers are plain
+functions (`ops/operate.py`, a thread in a project pod) as well as tasks that already run an event loop.
+Paths are `_state_store.ROOT` plus a key; that is the only storage there is.
 """
 
 from __future__ import annotations
@@ -31,40 +30,24 @@ import string
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal, Protocol, TypedDict, cast, overload
+from typing import Any, TypedDict, cast
 
-import flyte.storage
-
-from flyte_agent_factory import _errors
+from flyte_agent_factory import _errors, _state_store
 
 #: Suffixes that close a request, strongest first. `started` and `cancelled` can both exist (a cancel
 #: and a dispatch crossing); `_outcome` picks between them. A request can only be failed before a run exists.
 CLOSING = ("started", "cancelled", "failed")
 _FILE = re.compile(r"(\d+)\.(json|started|cancelled|failed|attempt-(\d+)|yield-([a-z0-9-]+))")
-_MTIME_KEYS = ("mtime", "LastModified", "last_modified")
+_MTIME_KEY = "mtime"  # the only key `StateFS.find` emits
 #: Admission order of a request's `priority`, first admitted first. `low` never takes a slot while a
 #: request of another priority waits that could start (`_factory._dispatch_pending`).
 PRIORITIES = ("expedite", "normal", "low")
 #: A dispatcher that dies holding the lease blocks the others for this long. A dispatch is a few
 #: Flyte calls, so a few minutes is generous.
 LEASE_TTL = 5 * 60
-#: Seconds between writing the lease and re-reading it; see `take_lease`.
-LEASE_SETTLE = 2
 _LEASE = ".dispatch-lease.json"
 _BASE36 = string.digits + string.ascii_lowercase
 _RUN_NAME_MAX = 30  # the control plane's limit
-
-
-class _Filesystem(Protocol):
-    def makedirs(self, path: str, *, exist_ok: bool) -> None: ...
-    def pipe_file(self, path: str, body: bytes) -> None: ...
-    @overload
-    def find(self, path: str, *, detail: Literal[True]) -> dict[str, dict[str, object]]: ...
-    @overload
-    def find(self, path: str) -> list[str]: ...
-    def cat_file(self, path: str) -> bytes: ...
-    def rm(self, path: str) -> None: ...
-    def exists(self, path: str) -> bool: ...
 
 
 class _Marker(TypedDict, total=False):
@@ -85,7 +68,7 @@ class _Lease(TypedDict, total=False):
 
 @dataclass(frozen=True)
 class Request:
-    """What to launch. Never holds a secret: the bucket is readable cluster-wide."""
+    """What to launch. Never holds a secret: the state branch is readable by everyone with the repository."""
 
     name: str
     gen: int
@@ -151,7 +134,7 @@ class Request:
 
 @dataclass
 class Entry:
-    """One generation of one project name, as the bucket shows it."""
+    """One generation of one project name, as the state branch shows it."""
 
     name: str
     gen: int
@@ -171,7 +154,7 @@ class Entry:
 
 
 def root(uri: str) -> str:
-    """Return the queue prefix inside the `[state] uri`."""
+    """Return the queue prefix inside the state root."""
     return f"{uri.rstrip('/')}/queue"
 
 
@@ -188,9 +171,10 @@ def run_id(name: str, gen: int, attempt: int) -> str:
     return head[: _RUN_NAME_MAX - len(tail)].rstrip("-") + tail
 
 
-def _fs(path: str) -> _Filesystem:
-    # fsspec has no stubs; Flyte returns its synchronous filesystem interface.
-    return cast(_Filesystem, flyte.storage.get_underlying_filesystem(path=path))
+def _fs(path: str) -> _state_store.StateFS:
+    """Return the state store's filesystem view; ValueError for a path that is not a state path."""
+    _state_store.key_of(path)
+    return _state_store.current().fs()
 
 
 def _path(queue: str, name: str, gen: int, suffix: str) -> str:
@@ -198,33 +182,17 @@ def _path(queue: str, name: str, gen: int, suffix: str) -> str:
 
 
 def _write(path: str, body: bytes) -> None:
-    fs = _fs(path)
-    if path.startswith("file://"):  # object stores have no directories to make; a local path does
-        fs.makedirs(path.removeprefix("file://").rsplit("/", 1)[0], exist_ok=True)
-    fs.pipe_file(path, body)
+    _fs(path).pipe_file(path, body)
 
 
 def listing(prefix: str, suffix: str = ".json") -> list[str]:
-    """Every object under `prefix` whose name ends in `suffix`, sorted, as paths `_fs` reads back.
-
-    Object-store listings (obstore's S3 and GCS stores) return `bucket/key` without the scheme, and `_fs`
-    of that is the local filesystem: reads miss and writes land on local disk. So the scheme of `prefix`
-    is put back. Not `fs.unstrip_protocol`: that adds the store's first protocol, which need not be the one
-    the caller configured (`gs` against `gcs`), and turns a plain local prefix into a `file://` one.
-    """
-    scheme = prefix.split("://", 1)[0] + "://" if "://" in prefix else ""
-    found = _fs(prefix).find(prefix)
-    return sorted(path if "://" in path else scheme + path for path in found if path.endswith(suffix))
+    """Every file under `prefix` whose name ends in `suffix`, sorted, as paths `_fs` reads back."""
+    return sorted(path for path in _fs(prefix).find(prefix) if path.endswith(suffix))
 
 
 def _modified(info: dict[str, object]) -> float:
-    for key in _MTIME_KEYS:
-        value = info.get(key)
-        if isinstance(value, datetime):
-            return value.timestamp()
-        if isinstance(value, (int, float)):
-            return float(value)
-    return 0.0
+    value = info.get(_MTIME_KEY)
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 def entries(queue: str, name: str | None = None) -> list[Entry]:
@@ -312,6 +280,28 @@ def next_gen(found: list[Entry]) -> int:
     return max((e.gen for e in found), default=0) + 1
 
 
+#: How far above the bucket's highest generation of a name the new code numbers its launches after a
+#: cutover: room for every launch the code still on the old image (hand-overs, re-queues) can make.
+CUTOVER_GAP = 100
+_MIGRATION = "migration.json"  # written by `ops/migrate_state.py`
+
+
+def cutover_floor(name: str) -> int:
+    """Return the generation `name`'s next launch must exceed: 0, or past what the bucket-era code numbered.
+
+    Runs are matched to requests by their (name, generation) labels, and pods still on the old image
+    number their requests from the bucket, so after a migration (`docs/state-store.md`, "Cutover") the
+    new code keeps `CUTOVER_GAP` clear above the highest generation the bucket had: the two never label
+    a run alike. A store that was never migrated into has no floor.
+    """
+    body = _state_store.current().read(_MIGRATION)
+    if body is None:
+        return 0
+    gens = json_object(body).get("gens")
+    gen = gens.get(name, 0) if isinstance(gens, dict) else 0
+    return (gen if isinstance(gen, int) else 0) + CUTOVER_GAP
+
+
 def enqueue(queue: str, request: Request) -> None:
     """Write `request`; writing the same (name, gen) again replaces it, which keeps its place in line."""
     _write(_path(queue, request.name, request.gen, "json"), request.to_json())
@@ -333,41 +323,63 @@ def marker(queue: str, name: str, gen: int, suffix: str) -> _Marker:
     return cast(_Marker, value) if isinstance(value, dict) else {}
 
 
-def _read_lease(path: str) -> _Lease:
-    """Return the lease at `path`, or {} where it is absent, unreadable or not a lease."""
+def _parse_lease(body: bytes | None) -> _Lease:
+    """Return the lease in `body`, or {} where it is absent, unreadable or not a lease."""
     try:
-        lease = json.loads(_fs(path).cat_file(path))
-    except (OSError, ValueError):
+        lease = json.loads(body) if body is not None else None
+    except ValueError:
         return {}
-    ok = isinstance(lease, dict) and isinstance(lease.get("holder"), str)
+    if not isinstance(lease, dict):
+        return {}
+    ok = isinstance(lease.get("holder"), str) and isinstance(lease.get("expires"), (int, float))
     # Both lease fields are checked above before exposing their types.
-    return cast(_Lease, lease) if ok and isinstance(lease.get("expires"), (int, float)) else {}
+    return cast(_Lease, lease) if ok else {}
 
 
 def take_lease(queue: str, holder: str, now: float | None = None) -> str | None:
     """None once the dispatch lease is `holder`'s; otherwise the holder that has it.
 
-    Same honesty as `_deployer._take_lease`: this is not mutual exclusion. Object stores give no
-    compare-and-swap, so two dispatchers can both read "no lease" and both write. After writing we
-    wait `LEASE_SETTLE` seconds and read again, so a racing write has landed and the last writer
-    carries on. A slower race, or a store that serves stale reads, still lets two through; the
-    label dedupe after run creation is what catches those.
+    This IS mutual exclusion. "Take it if absent, expired or mine" is decided on the branch tip and
+    committed in one `StateStore.transact`; a non-forced push is a compare-and-swap on the tip, so when
+    two dispatchers race, the second push is rejected, and its re-read shows the first holder.
+    What it does not cover is a holder that outlives `LEASE_TTL` mid-dispatch, which the cancel re-reads and
+    the label dedupe still catch.
     """
     now = time.time() if now is None else now
-    path = f"{queue}/{_LEASE}"
-    lease = _read_lease(path)
-    if lease and lease["holder"] != holder and lease["expires"] > now:
-        return lease["holder"]
-    _write(path, json.dumps({"holder": holder, "expires": now + LEASE_TTL}).encode())
-    time.sleep(LEASE_SETTLE)
-    lease = _read_lease(path)
-    return None if lease.get("holder") == holder else lease.get("holder", "unknown")
+    key = _state_store.key_of(f"{queue}/{_LEASE}")
+
+    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], str | None]:
+        lease = _parse_lease(snap.read(key))
+        if lease and lease["holder"] != holder and lease["expires"] > now:
+            return {}, lease["holder"]
+        body = json.dumps({"holder": holder, "expires": now + LEASE_TTL}).encode()
+        return {key: body}, None
+
+    return _state_store.current().transact(decide, f"lease {holder}")
 
 
 def release_lease(queue: str, holder: str) -> None:
-    path = f"{queue}/{_LEASE}"
-    if _read_lease(path).get("holder") == holder:  # not one that expired and was taken over meanwhile
-        _fs(path).rm(path)
+    key = _state_store.key_of(f"{queue}/{_LEASE}")
+
+    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+        # Not one that expired and was taken over meanwhile.
+        return ({key: None} if _parse_lease(snap.read(key)).get("holder") == holder else {}), None
+
+    _state_store.current().transact(decide, f"release lease {holder}")
+
+
+def exists(path: str) -> bool:
+    """Whether a file exists at `path`, read from the branch as it is now, not as it was a second ago."""
+    return _state_store.current().exists(_state_store.key_of(path), fresh=True)
+
+
+def json_object(body: bytes | None) -> dict[str, Any]:
+    """Return the JSON object in `body`, or {} where it is absent, unreadable or not an object."""
+    try:
+        value = json.loads(body) if body is not None else None
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def read_json(path: str) -> dict[str, Any]:
@@ -396,8 +408,7 @@ def write_json(path: str, value: dict[str, Any]) -> None:
     _write(path, json.dumps(value, sort_keys=True).encode())
 
 
-def _waits_path(uri: str) -> str:
-    return f"{uri.rstrip('/')}/waits.json"
+_WAITS = f"{_state_store.ROOT}/waits.json"
 
 
 def describe_wait(gen: int, code: str, text: str = "", **detail: Any) -> dict[str, Any]:
@@ -408,27 +419,23 @@ def describe_wait(gen: int, code: str, text: str = "", **detail: Any) -> dict[st
     return {"gen": gen, "reason": f"{code}: {text}" if text else code, "wait": {"code": code, **detail}}
 
 
-def write_waits(uri: str, waits: dict[str, dict[str, Any]]) -> None:
+def write_waits(waits: dict[str, dict[str, Any]]) -> None:
     """Store why each waiting request waited at the last admission pass, by request name.
 
     `queue_list` reads it back: the reasons are the admission decision's own, so the listing cannot
     drift from what the dispatcher or planner did. Each reason carries the `gen` it was made for. Only a
-    listing depends on it, so a store that is absent or fails never stops an admission pass.
+    listing depends on it, so a store that fails never stops an admission pass.
     """
-    if not uri:
-        return
     try:
-        write_json(_waits_path(uri), waits)
-    except _errors.REMOTE_ERRORS as exc:  # an object store raises obstore's errors, not OSError
+        write_json(_WAITS, waits)
+    except _errors.REMOTE_ERRORS as exc:  # a failed git push is a StateError, not an OSError
         print(f"[queue] wait reasons not stored: {type(exc).__name__}: {exc}", flush=True)
 
 
-def read_waits(uri: str) -> dict[str, dict[str, Any]]:
+def read_waits() -> dict[str, dict[str, Any]]:
     """Return the reasons stored by `write_waits`; {} where there are none."""
-    if not uri:
-        return {}
     try:
-        stored = read_json(_waits_path(uri))
+        stored = read_json(_WAITS)
     except _errors.REMOTE_ERRORS as exc:  # optional diagnostics must not hide the readable queue
         print(f"[queue] wait reasons not read: {type(exc).__name__}: {exc}", flush=True)
         return {}
@@ -439,17 +446,19 @@ def read_waits(uri: str) -> dict[str, dict[str, Any]]:
 RESERVE_ACCOUNTS = ("claude", "codex")
 
 
-def _reserve_path(uri: str) -> str:
-    return f"{uri.rstrip('/')}/reserve.json"
+_RESERVE = f"{_state_store.ROOT}/reserve.json"
 
 
-def read_reserves(uri: str) -> dict[str, float]:
+def read_reserves() -> dict[str, float]:
     """Return each account's reserve constant `k` (`_meter.reserve_ok`); one with none holds nothing back.
 
-    It lives in `reserve.json` under `[state] uri`, so a chat session changes it (`factory.set_reserve`)
+    It lives in `reserve.json` on the state branch, so a chat session changes it (`factory.set_reserve`)
     and the next admission reads it without a redeploy. A bad or absent entry is no reserve.
     """
-    stored = read_json(_reserve_path(uri))
+    return _reserves_in(read_json(_RESERVE))
+
+
+def _reserves_in(stored: dict[str, Any]) -> dict[str, float]:
     return {
         account: float(k)
         for account, k in stored.items()
@@ -457,50 +466,21 @@ def read_reserves(uri: str) -> dict[str, float]:
     }
 
 
-def put_reserve(uri: str, account: str, k: float) -> None:
+def put_reserve(account: str, k: float) -> None:
     """Store `k` for `account`; 0 removes the reserve."""
     if account not in RESERVE_ACCOUNTS:
         raise ValueError(f"unknown account {account!r}; the accounts are {', '.join(RESERVE_ACCOUNTS)}")
     if not math.isfinite(k) or k < 0:
         raise ValueError(f"k must be a number of percent per hour, 0 or more, not {k!r}")
-    stored = read_reserves(uri)
-    stored.pop(account, None)
-    write_json(_reserve_path(uri), {**stored, **({account: k} if k else {})})
+    key = _state_store.key_of(_RESERVE)
 
+    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+        # The whole file is rewritten, so it is read here, on the tip the push is made against.
+        stored = {a: v for a, v in _reserves_in(json_object(snap.read(key))).items() if a != account}
+        body = json.dumps({**stored, **({account: k} if k else {})}, sort_keys=True).encode()
+        return {key: body}, None
 
-def _checkpoint_path(uri: str, run_name: str) -> str:
-    return f"{uri.rstrip('/')}/checkpoints/{run_name}.json"
-
-
-def note_checkpoint(uri: str, run_name: str, location: str, app: str = "") -> None:
-    """Record where run `run_name` saves its checkpoint, and the API key it runs with.
-
-    The location is only known to the run itself; Flyte does not list it. `app` is the client id of the
-    key the run's pods authenticate with (`_auth.own_client_id`), never its secret: the factory compares
-    it with who the server says aborted the run. It sits beside the queue (under the `[state] uri`), not
-    in it, because the queue's listing reads every file it finds.
-    """
-    note = {"at": time.time(), "location": location, "app": app}
-    _write(_checkpoint_path(uri, run_name), json.dumps(note).encode())
-
-
-def _read_run_note(uri: str, run_name: str) -> dict[str, Any]:
-    path = _checkpoint_path(uri, run_name)
-    try:
-        value = json.loads(_fs(path).cat_file(path))
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def read_checkpoint_uri(uri: str, run_name: str) -> str:
-    """Return where `note_checkpoint` said the run saves its checkpoint, or "" if it never did."""
-    return str(_read_run_note(uri, run_name).get("location", ""))
-
-
-def read_app_client_id(uri: str, run_name: str) -> str:
-    """Return the client id `note_checkpoint` recorded for the run's API key, or "" if it never did."""
-    return str(_read_run_note(uri, run_name).get("app", ""))
+    _state_store.current().transact(decide, f"reserve {account}")
 
 
 def reopen(queue: str, name: str, gen: int) -> None:
@@ -512,10 +492,9 @@ def reopen(queue: str, name: str, gen: int) -> None:
 def cancelled(queue: str, name: str, gen: int) -> bool:
     """Return whether a cancel marker exists.
 
-    Read straight from storage: the dispatcher's last look before it claims.
+    Read from the branch tip, not the cache: the dispatcher's last look before it claims.
     """
-    path = _path(queue, name, gen, "cancelled")
-    return _fs(path).exists(path)
+    return exists(_path(queue, name, gen, "cancelled"))
 
 
 def effective_brief(request: Request) -> str:

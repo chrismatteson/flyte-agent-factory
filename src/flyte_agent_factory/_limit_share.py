@@ -1,15 +1,18 @@
 """Usage limits shared between pods: who noted a limit, and who has seen it end.
 
 A pod remembers a refusal's reset time (`_meter.MeterStore.note_limit`); so that every pod on one token learns
-when one of them, or the owner, finds that limit over, each pod shares what it knows. Under
-`{state uri}/limits/` a pod publishes the limit it noted per account, and writes `cleared_at` when a call on
-that account succeeds although a limit is on record. Pods that remember a limit read those files now and
-then and drop a limit noted before `cleared_at`. A person's reset is `engine-<engine>.json`, for every
-account of that engine.
+when one of them, or the owner, finds that limit over, each pod shares what it knows. Under `limits/` in the
+factory's state store (`_state_store`, a git branch; `docs/state-store.md`) a pod publishes the limit it noted
+per account, and writes `cleared_at` when a call on that account succeeds although a limit is on record. Pods
+that remember a limit read those files now and then and drop a limit noted before `cleared_at`. A person's
+reset is `engine-<engine>.json`, for every account of that engine.
 
 Only account hashes and times are stored, never a token or a secret name. The store is advice: a read or
 write that fails is logged (once per interval; a missing file is no failure) and never fails or defers a
-call. Callers construct a `LimitShare` only when a state uri is set (`_usage.open_meters`, `_factory_meters`).
+call. Every pod that constructs a `LimitShare` needs the deploy key the store pushes with
+(`_factory_base.state_secrets`); without it the writes fail and are logged, and limits stay in their pod.
+Records are addressed as `{root}/limits/<name>.json` through `_queue`, so another backend behind the same
+paths needs no change here.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from flyte_agent_factory import _queue, _timeline
+from flyte_agent_factory import _queue, _state_store, _timeline
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 #: How often a pod holding a remembered limit looks for another pod's clear.
@@ -44,19 +47,19 @@ def _is_time(value: Any) -> bool:
 
 
 class LimitShare:
-    """The shared limit records under one `[state] uri`."""
+    """The shared limit records under one state root."""
 
-    def __init__(self, uri: str, clock: Callable[[], float] = time.time) -> None:
-        self.uri, self.clock = uri.rstrip("/"), clock
+    def __init__(self, root: str = _state_store.ROOT, clock: Callable[[], float] = time.time) -> None:
+        self.root, self.clock = root.rstrip("/"), clock
         self.poll_s = LIMIT_SHARE_POLL_S
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._logged = float("-inf")
 
     def _account_path(self, account: str) -> str:
-        return f"{self.uri}/limits/{hashlib.sha256(account.encode()).hexdigest()[:16]}.json"
+        return f"{self.root}/limits/{hashlib.sha256(account.encode()).hexdigest()[:16]}.json"
 
     def _engine_path(self, engine: str) -> str:
-        return f"{self.uri}/limits/engine-{engine}.json"
+        return f"{self.root}/limits/engine-{engine}.json"
 
     def _failed(self, what: str, exc: Exception) -> None:
         # One line per interval: a store that is down would otherwise log on every call.
@@ -70,7 +73,7 @@ class LimitShare:
             return cached[1]
         try:
             record = _queue.read_json_or_raise(path)
-        except REMOTE_ERRORS as exc:  # advice only: a storage failure must not fail a call
+        except REMOTE_ERRORS as exc:  # advice only: a store failure (`StateError` too) must not fail a call
             self._failed("read", exc)
             return cached[1] if cached else {}
         # A null time is absent, as `publish` writes it; anything else that is not a number is malformed.

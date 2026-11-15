@@ -6,7 +6,7 @@ from typing import cast
 
 import flyte
 
-from . import _deploy, _factory_meters, _git, _profile
+from . import _deploy, _factory_base, _factory_meters, _git, _profile
 
 
 def env_secrets(profile: _profile.Profile) -> list[str | flyte.Secret]:
@@ -30,6 +30,8 @@ def env_secrets(profile: _profile.Profile) -> list[str | flyte.Secret]:
         flyte.Secret(key=identity.token_secret, as_env_var=identity.token_env)
         for identity in profile.browser.identities
     )
+    # The queue, leases, reserves and wait reasons are files on the state branch of `[repo] project`.
+    mounted.extend(_factory_base.state_secrets(profile))
     return mounted
 
 

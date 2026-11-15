@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import flyte.io
 from flyte import remote
 
-from flyte_agent_factory import _deploy, _factory_base, _queue
+from flyte_agent_factory import _dashboard, _deploy, _factory_base, _queue, _state_store
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 #: How long a queue sweep may wait to be placed (`sweep`'s `max_queued_time`).
 SWEEP_QUEUE_BOUND = timedelta(minutes=5)
+
+#: Where the migration put the checkpoint notes of runs started before the cutover (the old layout's name).
+LEGACY_CHECKPOINTS = "checkpoints"
 
 
 def _recreate_lookback() -> timedelta:
@@ -22,6 +26,41 @@ def _recreate_lookback() -> timedelta:
     handled no longer matches the request's `started` marker and is skipped.
     """
     return timedelta(minutes=2 * _deploy.QUEUE_SWEEP_MINUTES) + SWEEP_QUEUE_BOUND
+
+
+def _report_note(run: remote.Run) -> dict[str, str]:
+    """`checkpoint` (where the run saves its checkpoint) and `app` (its API key's client id), from its report.
+
+    The project pod puts both into every flush of its status snapshot (`_Timeline.snapshot`), so they
+    live and die with the run's report: no separate store to keep. A run started before the cutover put
+    neither there; its pointer is the old bucket note that `ops/migrate_state.py` carried to the branch,
+    read when the report lacks a field. Neither readable is "no note", as a missing note file was.
+    """
+    try:
+        data = _dashboard.from_report(_factory_base.report_html(run)) or {}
+    except REMOTE_ERRORS:
+        data = {}
+    note = {key: data[key] for key in ("checkpoint", "app") if isinstance(data.get(key), str) and data[key]}
+    if len(note) < 2:
+        legacy = _legacy_note(run.name)
+        note = {**legacy, **note}
+    return note
+
+
+def _legacy_note(run_name: str) -> dict[str, str]:
+    """Return the pre-cutover `checkpoints/<run>.json` note (`location`, `app`) as checkpoint/app, or {}."""
+    try:
+        body = _state_store.current().read(f"{LEGACY_CHECKPOINTS}/{run_name}.json")
+        value = json.loads(body) if body else {}
+    except _state_store.StateError as e:
+        print(f"[recreate] legacy note for {run_name} unreadable: {e}")
+        return {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    pairs = (("checkpoint", value.get("location")), ("app", value.get("app")))
+    return {key: field for key, field in pairs if isinstance(field, str) and field}
 
 
 def _aborted_by_own_key(run_name: str, app: str) -> bool:
@@ -64,7 +103,7 @@ def recreate_aborted() -> None:
     Apart from `dispatch`, which an empty queue makes free: this asks Flyte for the aborted runs of
     every slot, which only the periodic sweep should pay for.
     """
-    if _factory_base.PROFILE.planner.admission == "planner" or not _factory_base.PROFILE.state.uri:
+    if _factory_base.PROFILE.planner.admission == "planner":
         return
     queue = _factory_base.queue_root()
     after = datetime.now(timezone.utc) - _recreate_lookback()
@@ -90,9 +129,7 @@ def recreate_aborted() -> None:
                 continue
             if _queue.marker(queue, name, gen, "started").get("run") != run.name:
                 continue
-            if not _aborted_by_own_key(
-                run.name, _queue.read_app_client_id(_factory_base.PROFILE.state.uri, run.name)
-            ):
+            if not _aborted_by_own_key(run.name, _report_note(run).get("app", "")):
                 continue
             recreated = {
                 _queue.marker(queue, name, gen, f"attempt-{n}").get("recreated_from")
@@ -138,7 +175,10 @@ def _recreated_workspace(queue: str, entry: _queue.Entry) -> tuple[flyte.io.Dir 
     else:
         return None
     workspace = None
-    location = _queue.read_checkpoint_uri(_factory_base.PROFILE.state.uri, source)
+    try:
+        location = _report_note(remote.Run.get(name=source)).get("checkpoint", "")
+    except REMOTE_ERRORS:  # the run is gone: no note
+        location = ""
     if location:
         try:
             workspace = _load_checkpoint_workspace(location)

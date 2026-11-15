@@ -31,6 +31,8 @@ TOOLING_FIXED = frozenset(
 
 #: The fixed variables that are not policy and not forwarded from the shell: what a deploy sets on a slot's
 #: environment (`_profile.Profile.deploy_env`), and what the supervisor and its session set for themselves.
+#: `AGENT_FACTORY_STATE_REMOTE` and `AGENT_FACTORY_STATE_BRANCH` are neither: an operator or test sets them
+#: for one process, and they are not forwarded to a pod.
 #: `AGENT_FACTORY_AUTHOR_ENGINE` (the author-engine pin, a policy key) and
 #: `AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE` (the engine the run chose, set by the session) are different things.
 POD_FIXED = frozenset(
@@ -53,7 +55,8 @@ POD_FIXED = frozenset(
         "AGENT_FACTORY_BRIDGE_DIR",
         "AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE",
         "AGENT_FACTORY_ENGINE_SHA",
-        "AGENT_FACTORY_STATE_URI",
+        "AGENT_FACTORY_STATE_BRANCH",
+        "AGENT_FACTORY_STATE_REMOTE",
         "AGENT_FACTORY_WORKSPACE",
     }
 )

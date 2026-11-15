@@ -11,9 +11,11 @@ from obstore.exceptions import BaseError as ObstoreError
 
 #: What a call into Flyte's control plane or object store raises. `flyte.errors.*` are all
 #: RuntimeError subclasses and an RPC failure is a ConnectError. Object storage raises obstore's
-#: own errors -- `flyte.storage.put`, `Dir.from_local` and fsspec reads and writes raise
+#: own errors -- flyte's storage `put`, `Dir.from_local` and fsspec reads and writes raise
 #: `obstore.exceptions.GenericError`, which is not an OSError (flyte itself catches
 #: `(OSError, GenericError)`) -- or OSError; sockets raise OSError (TimeoutError included) or
 #: httpx.HTTPError, and a half-formed response surfaces as ValueError (JSON included) or
-#: KeyError. Anything else is a bug and should be loud.
+#: KeyError. The state store's `StateError` (a failed git fetch or push) is a RuntimeError, so it is in
+#: here too: a path that survives a bucket error survives a state error. Anything else is a bug and should
+#: be loud.
 REMOTE_ERRORS = (ConnectError, RuntimeError, OSError, ObstoreError, httpx.HTTPError, ValueError, KeyError)

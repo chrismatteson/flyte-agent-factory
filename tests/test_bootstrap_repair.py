@@ -55,7 +55,7 @@ def test_sign_in_calls_project_listall_the_way_the_sdk_allows(monkeypatch):
         return iter([])
 
     monkeypatch.setattr(remote.Project, "listall", classmethod(lambda cls, *a, **k: listall(*a, **k)))
-    sdk = FlyteSdk(Settings("h", "p", "o/r", "s3://b/p"))
+    sdk = FlyteSdk(Settings("h", "p", "o/r"))
     sdk._ready = True
     sdk.sign_in()
     assert called == [{}]
@@ -89,7 +89,7 @@ def test_without_the_app_the_deploy_key_may_push_to_the_default_branch():
 def test_the_ruleset_step_passes_no_app_on(world, monkeypatch):
     seen = []
     out: list[str] = []
-    ctx = make_context(world, Settings("h", "p", "pat/agent-workspace", "s3://b/p", no_app=True), out)
+    ctx = make_context(world, Settings("h", "p", "pat/agent-workspace", no_app=True), out)
     original = ctx.github.create_ruleset
 
     def create_ruleset(repo, name, deploy_key_bypass=False):
@@ -138,7 +138,7 @@ def test_a_rerun_does_not_add_direction_when_the_person_turned_auto_off(world):
     path = world.root / "clone/profile.toml"
     path.write_text(path.read_text() + "\n[deploy]\nauto = false\n")
     subprocess.run(["git", "commit", "-qam", "auto off"], cwd=world.root / "clone", check=True)
-    s = Settings("h", "p", "pat/agent-workspace", "s3://b/p")
+    s = Settings("h", "p", "pat/agent-workspace")
     added = _bootstrap_profile.fill_missing(path, s, "424242")
     assert "direction.repo" not in added and "deploy.auto" not in added
     assert "[direction]" not in path.read_text() and "auto = false" in path.read_text()
@@ -1038,7 +1038,7 @@ def test_status_before_sign_in_shows_the_flyte_steps_as_todo_not_blocked(world):
 
 
 def test_the_sdk_adapter_says_sign_in_first_when_there_is_no_config(tmp_path):
-    settings = Settings(endpoint="flyte.example.com", project="p", workspace="pat/ws", state_uri="s3://b/x")
+    settings = Settings(endpoint="flyte.example.com", project="p", workspace="pat/ws")
     flyte_ops = FlyteSdk(settings, config_path=tmp_path / "absent.yaml")
     with pytest.raises(NotSignedIn, match="sign in first"):
         flyte_ops.project_exists()
@@ -1047,7 +1047,7 @@ def test_the_sdk_adapter_says_sign_in_first_when_there_is_no_config(tmp_path):
 def test_an_invalid_profile_names_the_file_to_edit(world):
     assert run(world, "--no-app")[0] == 0
     path = world.root / "clone" / "profile.toml"
-    path.write_text(path.read_text().replace('uri = "s3://example-bucket/state"', 'uri = "az://c/p"'))
+    path.write_text(path.read_text().replace('kind = "union"', 'kind = "bogus"'))
     code, out = run(world, "--no-app")
     assert code == 3 and statuses(out)["profile"] == "blocked", out
     text = next(line for line in out if line.startswith("next:"))
@@ -1103,7 +1103,7 @@ def _git_config(world: World, key: str, value: str) -> None:
 
 
 def _settings() -> Settings:
-    return Settings("flyte.example.test", "p", "pat/ws", "s3://b/p")
+    return Settings("flyte.example.test", "p", "pat/ws")
 
 
 # --- the GitHub App, profile, deploy and connect steps -------------------------------------------------
@@ -1330,7 +1330,7 @@ def test_create_config_runs_the_sdk_cli_and_a_local_cluster_gets_insecure(tmp_pa
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    local = FlyteSdk(Settings("localhost:30080", "p", "o/r", "s3://b/p"), tmp_path / "a/config.yaml")
+    local = FlyteSdk(Settings("localhost:30080", "p", "o/r"), tmp_path / "a/config.yaml")
     local.create_config()
     remote = FlyteSdk(_settings(), tmp_path / "b/config.yaml")
     remote.create_config()

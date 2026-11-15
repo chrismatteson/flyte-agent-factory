@@ -3,17 +3,21 @@ import sys
 import tempfile
 from pathlib import Path
 
-import fsspec  # type: ignore[import-untyped]  # fsspec ships no stubs
 import pytest
-from fsspec.implementations.memory import MemoryFileSystem  # type: ignore[import-untyped]  # no stubs
-from fsspec.utils import stringify_path  # type: ignore[import-untyped]  # no stubs
 
+from tests import _cpu_budget
 from tests._git import git
 
 # Pytest loads this file as `conftest`; tests that `from tests.conftest import ...` would otherwise run it a
 # second time, as `tests.conftest`, and its environment scrub below would then delete the variables the
 # autouse fixtures set (a Union tier key) halfway through whichever test imported it first.
 sys.modules.setdefault("tests.conftest", sys.modules[__name__])
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config | None) -> int:
+    """Return the `-n auto` worker count: the CPUs the cgroup quota grants, not those the node has."""
+    return _cpu_budget.cpus(visible=_cpu_budget.visible())
+
 
 # Fixture projects (the benchmark's reference service) carry tests of their own, run from a copy.
 collect_ignore = ["fixtures"]
@@ -398,76 +402,40 @@ def _no_queue_read_in_flight(monkeypatch):
     monkeypatch.setattr(_supervise_support, "_queue_read", None)
 
 
+@pytest.fixture(autouse=True)
+def state_store(tmp_path_factory):
+    """The factory's state store over a real local bare git repository, for every test.
+
+    Without it a test that reaches the store would build one from the profile and push to its real
+    repository. `ttl` is the production one; a test that needs another writer builds a second
+    `StateStore` (own cache) on `Path(state_store.remote)` with `tests.state_git.make_store(remote=...)`.
+    """
+    from flyte_agent_factory import _state_store
+    from tests.state_git import make_store
+
+    store = make_store(tmp_path_factory.mktemp("state"), name="suite", ttl=1.0)
+    _state_store.configure(store)
+    yield store
+    _state_store.configure(None)
+
+
 @pytest.fixture
-def queue_state(tmp_path, monkeypatch) -> str:
-    """The launch queue's root under a real local directory, as `[state] uri = file://...`."""
-    import dataclasses
+def queue_state(state_store) -> str:
+    """The launch queue's root, on the state store `state_store` made."""
+    from flyte_agent_factory import _factory_base
 
-    from flyte_agent_factory import _factory_base, _profile, _queue
-
-    monkeypatch.setattr(_queue, "LEASE_SETTLE", 0)  # production waits a moment for racing writers
-    uri = f"file://{tmp_path / 'state'}"
-    monkeypatch.setattr(
-        _factory_base, "PROFILE", dataclasses.replace(_factory_base.PROFILE, state=_profile.State(uri=uri))
-    )
     return _factory_base.queue_root()
 
 
 @pytest.fixture
 def flyte_world(queue_state, monkeypatch):
-    """`_factory` against a fake Flyte remote and a real queue directory."""
+    """`_factory` against a fake Flyte remote and a real queue on a local git store."""
     from flyte_agent_factory import _factory
     from tests.fake_flyte import FakeFlyte
 
     world = FakeFlyte(monkeypatch, _factory)
     monkeypatch.setattr(world, "queue", queue_state, raising=False)  # the fake declares no `queue`
     return world
-
-
-class ObjectStoreFS(MemoryFileSystem):  # type: ignore[misc]  # base is Any: fsspec has no stubs
-    """Behaves like the obstore S3 store `flyte.storage` returns for `s3://`, where the state code cares.
-
-    Listings return `bucket/key` without the scheme, and deleting a missing object succeeds (S3 delete is
-    idempotent). Reading a missing object still raises FileNotFoundError, as obstore's does.
-    """
-
-    protocol = "fakes3"
-    root_marker = ""
-    store: dict[str, object] = {}  # not MemoryFileSystem's: the `memory://` store is shared with other tests
-    pseudo_dirs = [""]
-
-    @classmethod
-    def _strip_protocol(cls, path):
-        return stringify_path(path).removeprefix(f"{cls.protocol}://").rstrip("/")
-
-    def _rm(self, path):
-        self.store.pop(self._strip_protocol(path), None)
-
-
-fsspec.register_implementation(ObjectStoreFS.protocol, ObjectStoreFS, clobber=True)
-
-
-@pytest.fixture
-def s3_uri(tmp_path, monkeypatch) -> str:
-    """A `[state] uri` on a fresh, empty fake object store; see `ObjectStoreFS`."""
-    # A scheme-less path reaches the local filesystem, relative to the working directory: not the repo.
-    monkeypatch.chdir(tmp_path)
-    # A test module that imports `tests.conftest` loads this file a second time, and that copy's class is
-    # the one fsspec now serves the protocol with: empty the store fsspec really uses, or a test sees the
-    # last one's.
-    for fs_class in {ObjectStoreFS, fsspec.get_filesystem_class(ObjectStoreFS.protocol)}:
-        fs_class.store.clear()
-        fs_class.pseudo_dirs[:] = [""]
-    return f"{ObjectStoreFS.protocol}://bucket/state"
-
-
-@pytest.fixture(params=["file", "s3"])
-def state_uri(request: pytest.FixtureRequest, tmp_path: Path) -> str:
-    """A `[state] uri` on a local directory, then on the fake object store."""
-    if request.param == "file":
-        return tmp_path.as_uri()
-    uri: str = request.getfixturevalue("s3_uri")
-    return uri
 
 
 ENGINE_NAMES = ("claude", "codex")

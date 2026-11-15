@@ -1,12 +1,12 @@
 """The weekly reserve: k percent held back per hour left until a window resets, per account."""
 
 import json
-import secrets
 from datetime import datetime, timezone
 
 import pytest
 
 from flyte_agent_factory import _factory_base, _factory_meters, _meter, _planner, _queue
+from tests.state_git import rival_wins_first_push
 
 H = 3600.0
 NOW = 1_000_000.0
@@ -70,35 +70,23 @@ def test_a_window_that_has_reset_or_is_unknown_holds_nothing_back():
 # --- the stored constant -----------------------------------------------------------------------------
 
 
-@pytest.fixture
-def uri(state_uri):
-    """A prefix of its own: the fake object store outlives a test."""
-    return f"{state_uri}/{secrets.token_hex(4)}"
-
-
-def test_k_defaults_to_zero_and_is_changed_without_a_redeploy(uri):
-    assert _queue.read_reserves(uri).get("claude", 0) == 0
-    _queue.put_reserve(uri, "claude", 0.5)
-    assert _queue.read_reserves(uri).get("claude", 0) == 0.5
-    assert _queue.read_reserves(uri).get("codex", 0) == 0  # each account has its own
-    _queue.put_reserve(uri, "claude", 0.25)
-    assert _queue.read_reserves(uri) == {"claude": 0.25}
+def test_k_defaults_to_zero_and_is_changed_without_a_redeploy():
+    assert _queue.read_reserves().get("claude", 0) == 0
+    _queue.put_reserve("claude", 0.5)
+    assert _queue.read_reserves().get("claude", 0) == 0.5
+    assert _queue.read_reserves().get("codex", 0) == 0  # each account has its own
+    _queue.put_reserve("claude", 0.25)
+    assert _queue.read_reserves() == {"claude": 0.25}
 
 
 @pytest.mark.parametrize("account,k", [("gemini", 1), ("claude", -1), ("claude", float("nan"))])
-def test_a_bad_account_or_constant_is_refused(uri, account, k):
+def test_a_bad_account_or_constant_is_refused(account, k):
     with pytest.raises(ValueError):
-        _queue.put_reserve(uri, account, k)
-    assert _queue.read_reserves(uri) == {}
+        _queue.put_reserve(account, k)
+    assert _queue.read_reserves() == {}
 
 
-@pytest.fixture
-def stored(queue_state):
-    """The profile's `[state] uri` on a local directory (`queue_state` sets it)."""
-    return _factory_base.PROFILE.state.uri
-
-
-def test_admission_reads_the_constant_set_from_chat(stored, monkeypatch):
+def test_admission_reads_the_constant_set_from_chat(queue_state, monkeypatch):
     import asyncio
 
     from flyte_agent_factory import _factory
@@ -162,9 +150,18 @@ def test_the_queue_listing_and_overview_say_why_an_account_is_held(flyte_world, 
     monkeypatch.setattr(_factory_meters, "login_meters", lambda *a, **kw: {held.account: held})
     monkeypatch.setattr(_factory_meters, "match_claude_meter", lambda *a, **kw: held)
     assert "reserve" not in _factory.queue_view()
-    _queue.put_reserve(_factory_base.PROFILE.state.uri, "claude", 0.5)
+    _queue.put_reserve("claude", 0.5)
     [hold] = _factory_meters.reserve_holds(now=NOW)
     assert _factory.queue_view(now=NOW)["reserve"] == [hold]
     assert hold.startswith("claude reserve: weekly 22% left < 0.5%/h x 61h = 30.5% held back")
     view = operate.build_overview([], now=NOW, reserve=[hold])
     assert hold in operate.overview_text(view)
+
+
+def test_a_reserve_set_by_a_concurrent_writer_is_not_lost(state_store, tmp_path, monkeypatch):
+    # the other pod's push lands between this one's read and push: its account must survive the rewrite
+    rival_wins_first_push(
+        monkeypatch, state_store, tmp_path, {"reserve.json": json.dumps({"codex": 2.0}).encode()}
+    )
+    _queue.put_reserve("claude", 0.5)
+    assert _queue.read_reserves() == {"claude": 0.5, "codex": 2.0}

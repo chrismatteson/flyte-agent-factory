@@ -21,7 +21,6 @@ the non-secret values, one question at a time:
 
 - the project (a dedicated one) and domain (default `development`);
 - the GitHub owner and workspace name (default `agent-workspace`), personal or organization;
-- the state bucket URI (`s3://`, `gs://`, `abfs://`), see Prerequisites below;
 - the engine, `claude` (default) or `codex`. With `codex` the `engine-token` step ends `todo` and prints ONE filled-in
   command that signs in to ChatGPT on their machine and stores the login as `codex_login_agent_factory`; relay it as it
   is printed.
@@ -50,9 +49,9 @@ Check, and say plainly which are missing, before handing over anything:
   https://github.com/unionai-oss/flyte-agent-factory/blob/main/docs/oss-flyte-compat.md and explain the gaps
   before offering any Union-only step. The bootstrap runs the other steps against OSS with `--backend oss` and
   stops before the deploy, naming what is Union-only.
-- **State bucket** (`--state-uri`, the profile's `[state] uri`): a private, encrypted object-storage prefix that the factory's runtime identity and the person's
-  machine can list, read, write and delete under. A Union key does not grant native storage permissions; their
-  administrator provisions it. Stop here if the provider or access is unknown.
+- **No state bucket.** The factory keeps its own state on a git branch of the workspace repository, reached with
+  the deploy key the bootstrap creates, so there is nothing to provision and no `[state]` table. If the person
+  has an old command with `--state-uri`, it still runs: the flag is ignored and prints a note.
 - **Claude Pro or Max,** which supplies the workers' token (created at the bootstrap's hidden prompt, below). An
   Anthropic API key is not needed.
 - **Local tools:** `git`, `ssh-keygen`, `gh`, `uv`. The bootstrap checks them and prints the one install command for
@@ -71,7 +70,7 @@ Hand over ONE copy-paste command with the confirmed values filled in (use `--no-
 `--no-app` its `github-app` line says, and you repeat before they run it: "what is lost without the GitHub App: CI visibility (check-runs and statuses are read through the App); draft pull requests and the factory/verifier status; auto-deploy and the [direction] repository; issue intake. The backlog board is kept: it is made with gh and needs no App"):
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace
 ```
 
 It is idempotent: each step checks live state first and is skipped when done, so a rerun after any interruption
@@ -105,7 +104,7 @@ Explain each prompt before they meet it:
   never chat).
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --union-keys
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --union-keys
 ```
 
 Never ask for a credential, token or key in chat, and never use the MCP `create_secret` for engine credentials.
@@ -184,7 +183,7 @@ ruleset lets through; the engine token (`engine-token`) comes after the board.
    at the end:
 
    ```bash
-   d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --redeploy
+   d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --redeploy
    ```
 
 ## Connect the factory MCP, then verify
@@ -202,7 +201,7 @@ filled-in command for that admin, with `--grant factory-chat` and the key's non-
 `--chat-key`; tell them to send it as printed.
 
 ```bash
-d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --state-uri s3://my-agent-state/factory/mine --chat-key
+d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --chat-key
 ```
 
 The connector URL is `<public_url>/flyte-mcp/mcp`. The block for adding it to Claude Code by hand is in

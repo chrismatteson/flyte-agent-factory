@@ -52,7 +52,8 @@ log = logging.getLogger(__name__)
 _missing_reports: set[str] = set()
 
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
-_secrets: list[str | flyte.Secret] = []
+# `queued_issues` reads the launch queue, which is on the state branch.
+_secrets: list[str | flyte.Secret] = [*_factory_base.state_secrets(PROFILE)]
 if PROFILE.board:
     _secrets.append(flyte.Secret(key=PROFILE.board.pat_secret, as_env_var=_board.TOKEN_ENV))
 if PROFILE.github.configured:
@@ -256,11 +257,9 @@ def latest_run(ref: str, now: float | None = None) -> tuple[bool, str, _issues.S
 
 
 def queued_issues(profile: _profile.Profile) -> set[str]:
-    """Lower-case `owner/repo#N` of each issue a pending launch request names; none without `[state]`."""
-    if not profile.state.uri:
-        return set()
+    """Lower-case `owner/repo#N` of each issue a pending launch request names."""
     queued = set()
-    for entry in _queue.pending(_queue.root(profile.state.uri)):
+    for entry in _queue.pending(_factory_base.queue_root()):
         if entry.request and entry.request.issue:
             try:
                 queued.add(_board.normalise_issue(entry.request.issue, profile.repos.values()))
@@ -272,9 +271,8 @@ def queued_issues(profile: _profile.Profile) -> set[str]:
 def _run_issue(profile: _profile.Profile, labels: dict[str, str]) -> str:
     """Return the issue a run's `factory-issue` label stands for, from the launch request that started it.
 
-    The label is a hash, so the reference comes from the queue (still in `[state]` until state step 3,
-    which passes it to the run as its `issue` input instead). A request that names a different issue
-    than the label is not trusted.
+    The label is a hash, so the reference comes from the launch request on the state branch.
+    A request that names a different issue than the label is not trusted.
     """
     issue = _issues.linked_issue(profile, labels.get(_factory_base.LABEL_PROJECT, ""))
     return issue if issue and _issues.issue_label(issue) == labels.get(LABEL_ISSUE) else ""

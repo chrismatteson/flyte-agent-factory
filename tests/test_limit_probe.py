@@ -12,9 +12,11 @@ from flyte_agent_factory import (
     _limit_share,
     _meter,
     _policy,
+    _queue,
     _reviewer,
     _router,
     _session_config,
+    _state_store,
     _timeline,
     _usage,
 )
@@ -336,10 +338,8 @@ async def test_a_delegation_routed_as_the_probe_makes_that_call(engines, monkeyp
     ],
 )
 async def test_a_malformed_shared_record_does_not_fail_the_probe_call(engines, tmp_path, record):
-    uri = str(tmp_path / "state")
-    (tmp_path / "state" / "limits").mkdir(parents=True)
-    (tmp_path / "state" / "limits" / "engine-claude.json").write_text(json.dumps(record))
-    engines.store.share = _limit_share.LimitShare(uri, clock=lambda: engines.now["t"])
+    _queue.write_json(f"{_state_store.ROOT}/limits/engine-claude.json", record)
+    engines.store.share = _limit_share.LimitShare(clock=lambda: engines.now["t"])
     engines.store.note_limit("claude", T0 + 12 * H, engines.account)
     engines.now["t"] = T0 + PROBE
     await _reviewer._call_reviewer(purpose="planner")

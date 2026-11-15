@@ -46,24 +46,18 @@ def clear_limit(engine: str) -> dict[str, str]:
     engine = engine.strip().lower()  # `/clear-limit` ignores case too
     if engine not in ("claude", "codex"):
         raise ValueError(f"unknown engine {engine!r}; the engines are claude, codex")
-    uri = _factory_base.PROFILE.state.uri
-    if not uri:
-        raise ValueError("clearing a limit for every pod needs [state] uri in the deployment profile")
-    if not _limit_share.LimitShare(uri).clear_engine(engine):
+    if not _limit_share.LimitShare().clear_engine(engine):
         return {
             "engine": engine,
             "status": "not cleared",
-            "error": "the state store could not be written, so no pod was told; check [state] uri and retry",
+            "error": "the state branch could not be written, so no pod was told; retry once it is reachable",
         }
     return {"engine": engine, "status": "cleared"}
 
 
 def _apply_shared_clears(found: dict[str, _meter.Meter], now: float) -> None:
     """Drop the limit of each meter that another pod or a person has since cleared, as the pods do."""
-    uri = _factory_base.PROFILE.state.uri
-    if not uri:
-        return
-    share = _limit_share.LimitShare(uri)
+    share = _limit_share.LimitShare()
     for meter in found.values():
         if (meter.limited_until or 0) > now and share.read_cleared_at(meter.engine, meter.account) >= (
             meter.limit_noted_at or meter.observed_at
@@ -216,8 +210,7 @@ def reserve_holds(*, now: float | None = None) -> list[str]:
 
     Empty when no reserve is set or every account clears it. For the queue listing and the overview.
     """
-    state = _factory_base.PROFILE.state.uri
-    reserves = _queue.read_reserves(state) if state else {}
+    reserves = _queue.read_reserves()
     if not reserves or not _factory_base.PROFILE.slots:
         return []
     now = time.time() if now is None else now
@@ -245,9 +238,7 @@ def slot_headroom(slots: Sequence[str], *, now: float | None = None) -> dict[str
     found: dict[str, float | None] = {}
     # Busy slots can observe a refusal on the same credential a free slot would use.
     reports = slot_meters(_factory_base.SLOTS)
-    reserves = (
-        _queue.read_reserves(_factory_base.PROFILE.state.uri) if _factory_base.PROFILE.state.uri else {}
-    )
+    reserves = _queue.read_reserves()
     cached = login_meters(_factory_base.SLOTS, now=now, raw=True, reports=reports, bench=False)
     bindings = {slot.task: slot for slot in _factory_base.PROFILE.slots}
     for slot in slots:

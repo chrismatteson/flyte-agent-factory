@@ -3,9 +3,9 @@
 The loop stalled twice waiting on a deploy (the deployment's operations log, inbox/007): merged
 fixes sat inert because nothing said, where a human would see it, that the
 deployed code was behind. Task versions cannot answer that -- the same commit
-deployed twice gets two versions -- so this identifies the deployed commit by
-content: download the task's code bundle, hash its Python files, and find the
-newest commit on main whose `src/flyte_agent_factory` has exactly those blobs.
+deployed twice gets two versions -- so this reads the engine commit the deploy
+stamped into the task spec (`AGENT_FACTORY_ENGINE_SHA`) and counts what main has
+added since. Nothing is downloaded.
 
     python ops/deploy_status.py            # all agent tasks, human-readable
     python ops/deploy_status.py --json     # for the supervisor / scripts
@@ -21,11 +21,10 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
-import tarfile
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +43,8 @@ PACKAGE = "flyte_agent_factory"
 PROFILE = _profile.require()
 # Only the slots' project tasks: the retired self-agent envs are never listed as behind.
 TASKS = PROFILE.tasks
+# Written by the deploy into the task spec (agent.py); `_names` has no constant for it.
+STAMP = "AGENT_FACTORY_ENGINE_SHA"
 
 
 def _git(*args: str) -> str:
@@ -77,107 +78,49 @@ def _fetch(timeout: float = 60) -> str:
     return "" if rc == 0 else f"git fetch exited {rc}"
 
 
-def bundle_blobs(extracted: Path) -> dict[str, str]:
-    """`{relative path under the package: git blob sha}` for the bundle's .py files."""
-    root = next((p for p in extracted.rglob(PACKAGE) if p.is_dir()), None)
-    if root is None:
-        return {}
-    out = {}
-    for path in sorted(root.rglob("*.py")):
-        sha = subprocess.run(
-            ["git", "hash-object", str(path)], check=True, capture_output=True, text=True
-        ).stdout.strip()
-        out[str(path.relative_to(root))] = sha
-    return out
-
-
-def commit_blobs(commit: str) -> dict[str, str]:
-    """Return the same map for `src/flyte_agent_factory` at `commit`."""
-    listing = _git("ls-tree", "-r", commit, f"src/{PACKAGE}")
-    out = {}
-    for line in listing.splitlines():
-        meta, path = line.split("\t", 1)
-        if path.endswith(".py"):
-            out[path.removeprefix(f"src/{PACKAGE}/")] = meta.split()[2]
-    return out
-
-
-def match_commit(blobs: dict[str, str], commits: list[str]) -> str | None:
-    """Return the newest commit that has every one of the bundle's files, byte for byte."""
-    newest, _ = match_range(blobs, commits)
-    return newest
-
-
-def match_range(blobs: dict[str, str], commits: list[str]) -> tuple[str | None, str | None]:
-    """(newest, oldest) of the run of consecutive commits that carry the bundle's files.
-
-    A subset match, because a bundle carries only the modules that were loaded at
-    deploy time (`copy_style="loaded_modules"`). So the deploy is *somewhere* in
-    that run: a commit inside it that changed a module the bundle lacks is
-    indistinguishable from the deploy itself. `commits` is newest first.
-    """
-    if not blobs:
-        return None, None
-    newest = oldest = None
-    for commit in commits:
-        have = commit_blobs(commit)
-        if all(have.get(path) == sha for path, sha in blobs.items()):
-            newest = newest or commit
-            oldest = commit
-        elif newest is not None:
-            break
-    return newest, oldest
-
-
 def behind(commit: str, head: str) -> list[str]:
     """Return commits on main after `commit` that change the deployed package, newest first."""
     out = _git("log", "--format=%h %s", f"{commit}..{head}", "--", f"src/{PACKAGE}")
     return [line for line in out.splitlines() if line.strip()]
 
 
-def _deployed_bundle(task_name: str, workdir: Path) -> tuple[str, Path]:
-    from flyte import remote, storage
+def _deployed_commit(task_name: str) -> tuple[str, str]:
+    """(task version, engine commit) from the stamp the deploy put in the task spec; no bundle is read."""
+    from flyte import remote
 
     task = remote.Task.get(task_name, auto_version="latest").fetch()
-    args = list(task.pb2.spec.task_template.container.args)
-    if "--tgz" not in args:
-        raise LookupError("not fast-registered (no code bundle), so its commit cannot be identified")
-    tgz = args[args.index("--tgz") + 1]
-    local = workdir / "bundle.tgz"
-    got = storage.get(tgz, str(local))
-    if asyncio.iscoroutine(got):
-        asyncio.run(got)
-    with tarfile.open(local) as tar:  # filter="data": no traversal, no links
-        tar.extractall(workdir / "x", filter="data")
-    return task.version, workdir / "x"
+    env = {kv.key: kv.value for kv in task.pb2.spec.task_template.container.env}
+    sha = env.get(STAMP, "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise LookupError(
+            f"no {STAMP} stamp in the task spec (deployed from a tree without git, or before the stamp); "
+            "redeploy to identify it"
+        )
+    return task.version, sha
 
 
-def status(task_name: str, head: str, commits: list[str]) -> dict[str, Any]:
-    """Return which main commit `task_name` is deployed from and how many deploy-relevant commits it lags."""
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            version, extracted = _deployed_bundle(task_name, Path(tmp))
-        except (
-            *REMOTE_ERRORS,
-            LookupError,
-            tarfile.TarError,
-        ) as e:  # one bad task must not hide the others
-            return {"task": task_name, "error": f"{type(e).__name__}: {e}"[:300]}
-        blobs = bundle_blobs(extracted)
-    newest, oldest = match_range(blobs, commits)
-    row: dict[str, Any] = {"task": task_name, "version": version, "commit": newest}
-    if newest is None:
-        row["note"] = "deployed code matches no commit on main (an unmerged branch or local edits)"
+def status(task_name: str, head: str, ref: str) -> dict[str, Any]:
+    """Return which commit `task_name` is deployed from and how many deploy-relevant commits it lags."""
+    try:
+        version, sha = _deployed_commit(task_name)
+    except (*REMOTE_ERRORS, LookupError) as e:  # one bad task must not hide the others
+        return {"task": task_name, "error": f"{type(e).__name__}: {e}"[:300]}
+    row: dict[str, Any] = {"task": task_name, "version": version, "commit": sha}
+    if subprocess.run(
+        ["git", "-C", str(REPO), "cat-file", "-e", f"{sha}^{{commit}}"], capture_output=True
+    ).returncode:
+        row["commit"] = None
+        row["note"] = (
+            f"deployed from {sha[:7]}, which is not in the local clone (fetch failed, or an unpushed deploy)"
+        )
         return row
-    # Counted from the *oldest* candidate, so nothing is under-reported: a change in
-    # the run to a module the bundle lacks may or may not be deployed.
-    assert oldest is not None  # match_range returns both ends or neither
-    row["behind"] = behind(oldest, head)
-    if oldest != newest:
-        unsure = behind(oldest, newest)
-        if unsure:
-            row["oldest"] = oldest
-            row["uncertain"] = unsure
+    if subprocess.run(
+        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", sha, head], capture_output=True
+    ).returncode:
+        row["commit"] = None
+        row["note"] = f"deployed from {sha[:7]}, which is not on {ref} (an unmerged branch or local deploy)"
+        return row
+    row["behind"] = behind(sha, head)
     return row
 
 
@@ -191,14 +134,6 @@ def render(rows: list[dict[str, Any]]) -> str:
             lines.append(f"{r['task']} {r['version'][:8]}: {r['note']}")
         elif not r["behind"]:
             lines.append(f"{r['task']} {r['version'][:8]}: up to date (main@{r['commit'][:7]})")
-        elif r.get("uncertain"):
-            lines.append(
-                f"{r['task']} {r['version'][:8]}: deployed somewhere in "
-                f"main@{r['oldest'][:7]}..{r['commit'][:7]}; "
-                f"up to {len(r['behind'])} src change(s) behind ({len(r['uncertain'])} uncertain: they touch "
-                f"modules the bundle does not carry):"
-            )
-            lines += [f"    {c}" for c in r["behind"]]
         else:
             lines.append(
                 f"{r['task']} {r['version'][:8]}: main@{r['commit'][:7]}, BEHIND by {len(r['behind'])} "
@@ -253,8 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     if stale:
         print(f"warning: {stale}; using the local {args.ref}, which may be stale", file=sys.stderr)
     head = _git("rev-parse", args.ref).strip()
-    commits = _git("rev-list", head).split()
-    rows = [status(t, head, commits) for t in TASKS]
+    rows = [status(t, head, args.ref) for t in TASKS]
     try:
         count = deployer_runs_24h()
         measurement = {"task": _deploy.DEPLOYER_TASK, "runs_24h": count}

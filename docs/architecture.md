@@ -356,7 +356,7 @@ factory's and are not listed.
 |---|---|
 | `AGENT_FACTORY_PROFILE`, `AGENT_FACTORY_PROFILES_DIR` | which profile to use (name or path), and the folder holding named profiles |
 | `AGENT_FACTORY_PROFILE_TOML` | the profile's text, set on deployed pods, which cannot read `profiles/` |
-| `AGENT_FACTORY_DEPLOY_REPORT`, `AGENT_FACTORY_ENGINE_SHA` | the file a deploy child writes its report to; the engine commit a pod runs |
+| `AGENT_FACTORY_DEPLOY_REPORT`, `AGENT_FACTORY_ENGINE_SHA` | the file a deploy child writes its report to; the engine commit a pod runs; `ops/deploy_status.py` reads it back from the task spec |
 | `AGENT_FACTORY_LIVE_TESTS` | `1` runs the live, billed model test; off by default |
 | `AGENT_FACTORY_BROWSER`, `AGENT_FACTORY_BROWSER_ISOLATED`, `AGENT_FACTORY_BROWSER_EXIT_NODE`, `AGENT_FACTORY_BROWSER_TAILSCALE_SECRET` | the browser: on or off per deploy, isolated per project, and the optional exit-node egress ([browser-exit-node.md](browser-exit-node.md)) |
 | `AGENT_FACTORY_BROWSER_IDENTITIES`, `AGENT_FACTORY_BROWSER_GATE` | a project's personal browser grant (identity names) and the address of the supervisor's gate that serves it; set per run, never in a profile ([personal-browser.md](personal-browser.md)) |
@@ -364,6 +364,7 @@ factory's and are not listed.
 | `AGENT_FACTORY_TOKEN_IN_ENV` | `1` hands the Claude token to the session as `CLAUDE_CODE_OAUTH_TOKEN` instead of through a pipe, for a Claude Code build that ignores the descriptor |
 | `AGENT_FACTORY_REPO_KEYS`, `AGENT_FACTORY_SECRETS` | which deploy key belongs to which repository; the optional extra secrets a deploy mounts |
 | `AGENT_FACTORY_ENV_NAME`, `AGENT_FACTORY_SUBAGENT_ENV_NAME` | the Flyte environment a slot runs as, and its sub-agent environment |
+| `AGENT_FACTORY_STATE_REMOTE`, `AGENT_FACTORY_STATE_BRANCH` | the repository and branch of the factory's state store; when set they override the profile ([state-store.md](state-store.md)) |
 | `AGENT_FACTORY_BASE`, `AGENT_FACTORY_WORKSPACE`, `AGENT_FACTORY_BRIDGE_DIR` | where the supervisor and session keep their state, the session's workspace, and the bridge files (default `$HOME`); set by the supervisor itself |
 | `AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE` | the engine the run chose for the coordinator; set by the session |
 | `AGENT_FACTORY_ADMISSION_NOTE`, `AGENT_FACTORY_ADMITTED_ENGINE` | the policy keys of the same name, as variables |
@@ -372,7 +373,7 @@ factory's and are not listed.
 | `AGENT_FACTORY_AUTHOR_ENGINE` | the deprecated alias of `AGENT_FACTORY_COORDINATOR_ENGINE` (the policy key `AUTHOR_ENGINE`); setting both to different engines is an error |
 | `AGENT_FACTORY_JUDGE_EFFORT`, `AGENT_FACTORY_JUDGE_ENGINE`, `AGENT_FACTORY_JUDGE_MODEL`, `AGENT_FACTORY_PARK_RELEASE_MIN`, `AGENT_FACTORY_QA_DIFFERENT_ENGINE` | the policy keys of the same name, as variables. `JUDGE_ENGINE` pins all three judges; a per-judge key (`CORRECTNESS_ENGINE`, `COMPLETENESS_ENGINE`, `CRAFT_ENGINE`) wins over it |
 | `AGENT_FACTORY_PLANNER_CODEX_EFFORT`, `AGENT_FACTORY_PLANNER_CODEX_MODEL`, `AGENT_FACTORY_PLANNER_EFFORT`, `AGENT_FACTORY_PLANNER_ENGINE` | the policy keys of the same name, as variables |
-| `AGENT_FACTORY_CODEX_SECRET`, `AGENT_FACTORY_CREDENTIALS_SECRET`, `AGENT_FACTORY_AGENT_REPO`, `AGENT_FACTORY_STATE_URI` | names in `_names.py` that nothing reads |
+| `AGENT_FACTORY_CODEX_SECRET`, `AGENT_FACTORY_CREDENTIALS_SECRET`, `AGENT_FACTORY_AGENT_REPO` | names in `_names.py` that nothing reads |
 
 ### Standards
 
@@ -409,7 +410,7 @@ A launch carries a `priority`: `normal` (the default), `low` (starts only when a
 or `expedite` (goes first). An account (`claude`, `codex`) can hold back `k` percent of each usage window per hour left
 until that window resets: a launch waits when its account has less than `k` times the hours to reset left, and it
 reopens as the reset nears. Set it from chat with `factory.set_reserve` and read it with `factory.get_reserve`; it
-needs `[state] uri`.
+is kept on the factory's state branch ([state-store.md](state-store.md)).
 
 ## Why it works this way
 
@@ -537,7 +538,7 @@ the session role definitions, the browser image files and the workspace template
 | `_factory_meters.py` | login meters, slot headroom and what the loop may spend |
 | `_factory_recreate.py` | recreating runs the deployer aborted, and the workspace a new run starts from |
 | `_factory_status.py` | reading an older project report's HTML for the timeline and activity |
-| `_queue.py` | the launch queue's storage and the reserve file under `[state] uri` |
+| `_queue.py` | the launch queue's storage and the reserve file on the factory's state branch |
 | `_factory_mcp.py` | the factory MCP server: every stock tool, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
 
 **Planning, the loop and the board**

@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, TypedDict, cast
 
-from . import _git, _github, _names, _profile_policy, _profile_union, _standards
+from . import _git, _github, _names, _profile_policy, _profile_union, _standards, _state_store
 from ._profile_policy import Gardening as Gardening
 from ._profile_policy import JudgementPolicy as JudgementPolicy
 
@@ -51,10 +51,7 @@ BACKENDS = ("union", "oss")
 _GCP_ROLE = re.compile(r"(projects/[a-z0-9-]+/|organizations/\d+/)?roles/[A-Za-z0-9_.]+")
 #: `compute` (short form) or `compute.googleapis.com`.
 _GCP_API = re.compile(r"[a-z0-9-]+(\.googleapis\.com)?")
-#: `s3://bucket/prefix`, `file:///tmp/x`: a URI with a scheme `flyte.storage` reaches, from the list below.
 _TAILSCALE_TAG = re.compile(r"tag:[a-z0-9-]+")
-_URI_SCHEME = re.compile(r"([a-z][a-z0-9+.-]*)://\S+")
-_STATE_SCHEMES = ("s3", "gs", "gcs", "abfs", "abfss", "file")
 
 
 class _GcpFields(TypedDict, total=False):
@@ -172,7 +169,8 @@ class Planner:
 
 @dataclass(frozen=True)
 class State:
-    uri: str = ""  # object-storage prefix for legacy queue state
+    branch: str = ""  # the state branch; "" is `_state_store.default_branch`
+    uri: str = ""  # retired: read only so that a profile that still sets it loads; nothing uses it
 
 
 @dataclass(frozen=True)
@@ -941,17 +939,19 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         raise ProfileError(f"{where}: [deploy] webhook must be true or false")
     if deploy_table:
         raise ProfileError(f"{where}: unknown key(s) in [deploy]: {', '.join(sorted(deploy_table))}")
-    state = State(**_fields(_table(data, "state", where, required=False), "state", where, (), ("uri",)))
+    state = State(
+        **_fields(_table(data, "state", where, required=False), "state", where, (), ("branch", "uri"))
+    )
     if state.uri:
-        scheme = _URI_SCHEME.fullmatch(state.uri)
-        if not scheme:
-            raise ProfileError(
-                f"{where}: [state] uri must start with a scheme such as s3://, not {state.uri!r}"
-            )
-        if scheme[1] not in _STATE_SCHEMES:
-            raise ProfileError(
-                f"{where}: [state] uri scheme must be one of {', '.join(_STATE_SCHEMES)}, not {scheme[1]!r}"
-            )
+        _warn_once(
+            f"{where}: [state] uri is no longer read and is ignored: the factory's state lives on a git "
+            "branch of [repo] project (docs/state-store.md)"
+        )
+    if state.branch and not _state_store.valid_branch(state.branch):
+        raise ProfileError(
+            f"{where}: [state] branch must be a branch name git accepts (`git check-ref-format --branch`), "
+            f"not {state.branch!r}"
+        )
     github_table = dict(_table(data, "github", where, required=False))
     # The App id is a number on GitHub's settings page, so a TOML integer is what people write.
     if isinstance(github_table.get("app_id"), int) and not isinstance(github_table["app_id"], bool):
@@ -1359,14 +1359,10 @@ def current() -> Profile | None:
 
 def planner_ready(profile: Profile) -> None:
     if profile.planner.admission == "planner" and not (
-        profile.direction
-        and profile.board
-        and profile.github.configured
-        and profile.github.webhook_secret
-        and profile.state.uri
+        profile.direction and profile.board and profile.github.configured and profile.github.webhook_secret
     ):
         raise ProfileError(
-            "planner cutover needs [direction], [board], GitHub App, webhook and [state]; "
+            "planner cutover needs [direction], [board], GitHub App and webhook; "
             "one replica and stop-before-start replacement remain deployment safeguards"
         )
 

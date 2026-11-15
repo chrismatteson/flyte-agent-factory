@@ -20,7 +20,7 @@ from typing import TypedDict, cast
 
 from flyte import remote
 
-from . import _git, _github, _profile, _queue
+from . import _git, _github, _profile, _queue, _state_store
 from ._errors import REMOTE_ERRORS
 
 log = logging.getLogger(__name__)
@@ -283,7 +283,7 @@ def linked_project(profile: _profile.Profile, issue: str) -> str:
         return f"{_git._repo_identity(canonical)}#{number}"
 
     wanted = identity(issue)
-    queue = _queue.root(profile.state.uri)
+    queue = _queue.root(_state_store.ROOT)
     for entry in reversed(_queue.entries(queue)):
         request = _queue.load(queue, entry).request
         if request and request.issue and identity(request.issue) == wanted:
@@ -331,9 +331,9 @@ def process_event(
     accepted = accept_event(profile, event, payload, app=app)
     if accepted is None:
         return {"status": "ignored"}
-    root = f"{profile.state.uri.rstrip('/')}/github/intake"
+    root = f"{_state_store.ROOT}/github/intake"
     holder = secrets.token_hex(16)
-    # Reuse dispatch's approximate lease; queue records, rather than webhook delivery IDs, dedupe launches.
+    # Reuse dispatch's lease; queue records, rather than webhook delivery IDs, dedupe launches.
     if _queue.take_lease(root, holder) is not None:
         raise RuntimeError("another issue intake is running; retry this task")
     try:
@@ -355,15 +355,15 @@ def process_event(
             return {"status": "reported" if issue else "ignored"}
         if accepted["kind"] == "direction":
             path = f"{root}/comment-{accepted['data']['id']}.json"
-            if _queue._fs(path).exists(path):
+            if _queue.exists(path):
                 return {"status": "duplicate"}
             delivered = deliver_comment(profile, accepted)
             if delivered:
-                _queue._write(path, b"{}")
+                _queue.write_json(path, {})
             return {"status": "delivered" if delivered else "ignored"}
         if linked_project(profile, accepted["issue"]):
             return {"status": "duplicate"}
-        queue = _queue.root(profile.state.uri)
+        queue = _queue.root(_state_store.ROOT)
         taken = {entry.name for entry in _queue.entries(queue)}
         taken.update(
             _factory_base.run_labels(run).get(_factory_base.LABEL_PROJECT, "")
@@ -521,10 +521,10 @@ class Milestones:
 
 def linked_issue(profile: _profile.Profile | None, name: str) -> str:
     """Return the issue the project's latest launch request links, or "". Read with or without intake."""
-    if not (profile and profile.state.uri):
+    if profile is None:
         return ""
     try:
-        queue = _queue.root(profile.state.uri)
+        queue = _queue.root(_state_store.ROOT)
         for entry in reversed(_queue.entries(queue, name)):
             request = _queue.load(queue, entry).request
             if request and request.issue:

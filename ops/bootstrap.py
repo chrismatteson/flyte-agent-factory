@@ -4,7 +4,7 @@ It creates the Flyte project, workspace repository, secrets, GitHub App and prof
 factory. Idempotent: run it again after any interruption.
 
     uv run python ops/bootstrap.py --endpoint <host> --project <id> --workspace <owner>/agent-workspace \\
-        --state-uri s3://<bucket>/<prefix> [--backend union|oss] [--engine claude|codex] \\
+        [--backend union|oss] [--engine claude|codex] \\
         [--domain <name>] [--dir <clone>] [--redeploy] [--no-app] [--no-board]
     uv run python ops/bootstrap.py --status ...   # read-only: print each step's check
     uv run python ops/bootstrap.py --dry-run ...  # print what each step would do; change nothing

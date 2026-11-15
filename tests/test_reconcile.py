@@ -673,6 +673,25 @@ def test_reconciler_posts_derived_milestones_once_and_skips_fresh_keys_of_live_r
     assert any(body.startswith(f"PR opened: {pr}") for body in bodies)
 
 
+def test_state_report_counts_the_old_outboxes_and_lists_what_will_not_heal(world):
+    """Bucket-era name; now checks the heal counts what it posts and leaves what Flyte cannot prove."""
+    from flyte_agent_factory import _factory, _reconcile
+
+    now = time.time()
+    done = _factory.launch_project("brief", "done-widget", issue="you/repo#12")["run"]
+    world.runs[done].phase = "SUCCEEDED"
+    stale = _factory.launch_project("brief", "stale-widget", issue="you/repo#14")["run"]
+    world.runs[stale].phase = "SUCCEEDED"
+    ended(world.runs[done], 1)
+    ended(world.runs[stale], 30)  # past the heal window: it will not heal
+    world.runs[done].report = _dashboard.status_script(snapshot(phase="released"))
+    app = App()
+    healed = _reconcile.heal_milestones(world.profile, github(app), now=now)
+    assert healed == len(app.keys(done, "you/repo#12")) > 0
+    assert app.posted("you/repo#14") == []
+    assert _reconcile.heal_milestones(world.profile, github(app), now=now) == 0  # nothing left to post
+
+
 def test_a_failing_app_fails_the_milestone_heal(world):
     from flyte_agent_factory import _factory, _reconcile
 
@@ -784,7 +803,7 @@ def test_reconcile_task_is_named_as_deployed_and_mounts_the_app_key():
     import subprocess
     import sys
 
-    from flyte_agent_factory import _deploy, _pull_requests, _union_identity
+    from flyte_agent_factory import _deploy, _git, _pull_requests, _union_identity
 
     profile = board_profile(app=True)
     env = {key: value for key, value in os.environ.items() if key != _profile.PROFILE_ENV}
@@ -795,6 +814,7 @@ def test_reconcile_task_is_named_as_deployed_and_mounts_the_app_key():
 from flyte_agent_factory import _reconcile
 assert _reconcile.reconcile.name == {_deploy.RECONCILE_TASK!r}, _reconcile.reconcile.name
 assert [(s.key, s.as_env_var) for s in _reconcile.env.secrets] == [
+    ({profile.secrets.deploy_key!r}, {_git.GIT_DEPLOY_KEY_ENV_VAR!r}),
     ("github_board_pat", "GITHUB_BOARD_PAT"), ("github_key_x", {_pull_requests.KEY_ENV_VAR!r}),
     ({profile.union.key_for("queue")!r}, {_union_identity.KEY_ENV!r}),
 ], _reconcile.env.secrets
@@ -854,41 +874,6 @@ def test_retired_triggers_name_the_tasks_that_carried_them():
         "issue_outbox": "factory-issues.drain_outbox",
         "factory-board-sync": "factory-board-sync.sync_board",
     }
-
-
-def test_state_report_counts_the_old_outboxes_and_lists_what_will_not_heal(tmp_path):
-    import importlib.util
-    from pathlib import Path
-
-    spec = importlib.util.spec_from_file_location(
-        "state_report", Path(__file__).resolve().parents[1] / "ops/state_report.py"
-    )
-    assert spec is not None and spec.loader is not None
-    report = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(report)
-    board = tmp_path / "board/outbox"
-    board.mkdir(parents=True)
-    bootstrap = {"op": "bootstrap", "target": "project", "value": {}, "key": "b" * 64}
-    for n in range(300):
-        (board / f"{n}.json").write_text(json.dumps(bootstrap))
-    (board / "x.json").write_text("{trunc")
-    github = tmp_path / "github/outbox"
-    github.mkdir(parents=True)
-    now = 100_000.0
-    (github / "a.json").write_text(
-        json.dumps({"issue": "o/r#1", "body": "Started: run", "created": now - 60})
-    )
-    (github / "b.json").write_text(
-        json.dumps({"issue": "o/r#1", "body": "Blocked/escalated: checks\nfailing", "created": now - 60})
-    )
-    lines = report.report(tmp_path.as_uri(), now)
-    assert "board/outbox: 301 pending record(s), 2 distinct" in lines
-    assert f"  300 x bootstrap {'b' * 12}" in lines
-    assert any("re-derived: Started: run" in line and "NOT" not in line for line in lines)
-    assert any("NOT re-derived: Blocked/escalated: checks" in line for line in lines)
-    assert "    Blocked/escalated: checks\n    failing" in lines
-    # Read-only: nothing was moved, written or removed.
-    assert len(list(board.iterdir())) == 301 and len(list(github.iterdir())) == 2
 
 
 def test_missing_report_is_an_empty_snapshot_on_the_board(world, monkeypatch):

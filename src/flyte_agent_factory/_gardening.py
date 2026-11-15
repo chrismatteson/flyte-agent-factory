@@ -9,13 +9,14 @@ and decides how urgently a queued gardening launch should take a slot (`priority
 from __future__ import annotations
 
 import configparser
+import json
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import _profile, _queue
+from . import _profile, _queue, _state_store
 
 FILE = "gardening.toml"
 #: The project the weekly task launches; the queue and the overview know it by this name.
@@ -171,8 +172,7 @@ def describe(level: str, reasons: Sequence[str]) -> str:
     return f"gardening: {level} priority" + (f" ({'; '.join(reasons)})" if reasons else "")
 
 
-def _counts_path(uri: str) -> str:
-    return f"{uri.rstrip('/')}/gardening/counts.json"
+_COUNTS = f"{_state_store.ROOT}/gardening/counts.json"
 
 
 Counts = dict[str, dict[str, int]]  # target -> standards rule -> findings
@@ -188,24 +188,34 @@ def _clean_counts(raw: object) -> Counts:
     }
 
 
-def read_counts(uri: str) -> dict[str, Counts]:
+def read_counts() -> dict[str, Counts]:
     """Standards-gate findings per target and rule: `clean` is the baseline, `latest` the newest scan."""
-    body = _queue.read_json(_counts_path(uri))
+    return _counts_in(_queue.read_json(_COUNTS))
+
+
+def _counts_in(body: dict[str, Any]) -> dict[str, Counts]:
     return {key: _clean_counts(body.get(key)) for key in ("clean", "latest")}
 
 
-def record_counts(uri: str, scans: Mapping[str, Mapping[str, int]]) -> None:
+def record_counts(scans: Mapping[str, Mapping[str, int]]) -> None:
     """Store `scans` as `latest`, and move a target's `clean` baseline to its scan unless a rule got worse.
 
     The first scan of a target is its baseline. Whether a gardening project finished is the agent's to
     know, which the factory module cannot hook, so a scan with no more findings than the baseline on
     every rule is taken as the new clean one, and a worse one leaves the baseline where it was.
     """
-    clean = read_counts(uri)["clean"]
-    for target, rules in scans.items():
-        if target not in clean or all(n <= clean[target].get(rule, 0) for rule, n in rules.items()):
-            clean[target] = dict(rules)
-    _queue.write_json(_counts_path(uri), {"clean": clean, "latest": {t: dict(r) for t, r in scans.items()}})
+    key = _state_store.key_of(_COUNTS)
+
+    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+        # The baseline is rewritten whole, so it is read here, on the tip the push is made against.
+        clean = _counts_in(_queue.json_object(snap.read(key)))["clean"]
+        for target, rules in scans.items():
+            if target not in clean or all(n <= clean[target].get(rule, 0) for rule, n in rules.items()):
+                clean[target] = dict(rules)
+        value = {"clean": clean, "latest": {t: dict(r) for t, r in scans.items()}}
+        return {key: json.dumps(value, sort_keys=True).encode()}, None
+
+    _state_store.current().transact(decide, "gardening counts")
 
 
 def regressed(counts: Mapping[str, Mapping[str, Mapping[str, int]]]) -> list[str]:

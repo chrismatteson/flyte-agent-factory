@@ -61,7 +61,6 @@ def build_command(settings: Settings, flag: str = "") -> str:
         f"--endpoint {shlex.quote(settings.endpoint)}",
         f"--project {shlex.quote(settings.project)}",
         f"--workspace {shlex.quote(settings.workspace)}",
-        f"--state-uri {shlex.quote(settings.state_uri)}",
     ]
     if settings.domain != DEFAULT_DOMAIN:
         parts.append(f"--domain {shlex.quote(settings.domain)}")

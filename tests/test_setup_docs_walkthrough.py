@@ -66,7 +66,7 @@ def test_the_walkthrough_hands_over_one_command_and_the_skill_does_too():
             allowed = [command.strip(), *(f"{command.strip()} {flag}" for flag in ("--redeploy", *keys))]
             assert again.strip() in allowed
         assert command.count("\n") == 1, f"{path}: the one-liner must be a single line"
-        for part in ("git clone -q", "uv sync -q --python 3.12", "--project", "--workspace", "--state-uri"):
+        for part in ("git clone -q", "uv sync -q --python 3.12", "--project", "--workspace"):
             assert part in command, f"{path}: one-liner lacks {part}"
 
 
@@ -177,7 +177,6 @@ def test_the_documented_key_commands_are_the_ones_the_bootstrap_prints():
         endpoint="flyte.example.com",
         project="my-agents",
         workspace="you/agent-workspace",
-        state_uri="s3://my-agent-state/factory/mine",
     )
     docs = {
         "--chat-key": (SKILL_SETUP, "docs/chat-operator.md", "docs/factory-mcp-setup.md"),
