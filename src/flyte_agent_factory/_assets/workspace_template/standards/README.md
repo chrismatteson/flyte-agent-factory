@@ -9,7 +9,7 @@ A command, lint or script rule may add Timeout: <seconds> for each of its comman
 The engine's docs/standards.md is the full format: how a rule is written, every Enforced: kind, and how your IDs map to the factory's built-in checks.
 
 engineering.md covers delivery and maintenance; security.md covers trust boundaries.
-brand.md is a neutral template for visual and customer-facing work only. Fill its placeholders.
+brand.md is Union branding (palette from the Nov 2024 brand deck, official logos in ../brand/), for visual and customer-facing work only. Replace it with your own identity if you are not Union.
 languages/ holds Python, Terraform, TypeScript and shell packs; configs/ holds tool baselines.
 Auto selection matches each pack's detect stanza in the project directory, at startup and review.
 Explicit languages replace auto detection. Add a pack as languages/<name>.md with a detect
