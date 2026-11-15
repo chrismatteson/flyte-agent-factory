@@ -31,6 +31,7 @@ from flyte_agent_factory import (
     _github_mode,
     _local_browser,
     _policy,
+    _project_folder,
     _pull_requests,
     _push_guard,
     _reviewer,
@@ -406,6 +407,9 @@ async def _prepare_workspace(
         timeline.row("👥", f"team: {', '.join(installed)}")
     else:
         timeline.row("⚠️", "no role definitions found; the swarm roles are unavailable")
+
+    # Route once the clone exists, from the launch's brief: refused here rather than judged empty later.
+    _session_config._project_folder = _project_folder.route(_session_config._project_name, brief, timeline)
 
 
 def _kickoff_prompt() -> str:

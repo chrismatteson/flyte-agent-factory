@@ -309,3 +309,130 @@ def test_instructions_say_images_can_be_built_in_place_with_podman():
 
     memory = _instructions._project_memory(browser_enabled=False, name="proj")
     assert "podman build" in memory and "vfs" in memory and "chroot" in memory
+
+
+# --- attaching from a project folder ---------------------------------------------------------
+
+
+def _make_workspace_with_context(tmp_path):
+    """A workspace root holding the run context, and a project folder under it."""
+    (tmp_path / ".flyte").mkdir()
+    child.context_path(tmp_path).write_text("{}")
+    project = tmp_path / "projects" / "app"
+    project.mkdir(parents=True)
+    return project
+
+
+@pytest.fixture
+def loaded(monkeypatch):
+    """The paths `attach` asked flyte to load; the SDK and controller are faked, no cluster is needed."""
+    import flyte
+    from flyte._internal import controllers
+
+    paths = []
+    monkeypatch.delenv("AGENT_FACTORY_RUN_CONTEXT", raising=False)  # by name: old code has no constant
+
+    def load(path=None):
+        paths.append(path)
+        return "ctx"
+
+    monkeypatch.setattr(flyte, "load_interactive_ctx", load)
+    monkeypatch.setattr(controllers, "get_controller", lambda: None)
+    return paths
+
+
+def test_attach_from_a_project_folder_finds_the_workspace_roots_context(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    child.attach()
+    assert loaded == [child.context_path(tmp_path.resolve())]
+
+
+def test_attach_prefers_the_cwds_own_context(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    (project / ".flyte").mkdir()
+    child.context_path(project).write_text("{}")
+    monkeypatch.chdir(project)
+    child.attach()
+    assert [p.parent.parent.name for p in loaded] == ["app"]
+
+
+def test_attach_uses_the_context_the_engine_names(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path / ".flyte"))
+    child.attach()
+    assert loaded == [child.context_path(tmp_path)]
+
+
+def test_the_engine_may_name_the_context_file_rather_than_its_directory(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(child.context_path(tmp_path)))
+    child.attach()
+    assert loaded == [child.context_path(tmp_path)]
+
+
+def test_the_engines_context_beats_one_planted_in_the_project_folder(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    (project / ".flyte").mkdir()
+    child.context_path(project).write_text("{}")  # a decoy
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path / ".flyte"))
+    child.attach()
+    assert loaded == [child.context_path(tmp_path)]
+
+
+def test_no_context_anywhere_falls_back_to_the_cwd_so_the_error_names_it(monkeypatch, tmp_path, loaded):
+    monkeypatch.delenv(child.RUN_CONTEXT_ENV, raising=False)
+    assert child.find_base_dir(tmp_path) == tmp_path
+
+
+def test_no_context_anywhere_reports_every_place_it_looked(monkeypatch, tmp_path, loaded):
+    """The lane falls back to running here saying why: the variable's state and each path searched."""
+    project = tmp_path / "projects/app"
+    project.mkdir(parents=True)
+    monkeypatch.chdir(project)
+    with pytest.raises(FileNotFoundError) as missing:
+        child.attach()
+    message = str(missing.value)
+    assert f"{child.RUN_CONTEXT_ENV} is not set" in message
+    for base in (project, tmp_path / "projects", tmp_path):
+        assert str(child.context_path(base.resolve())) in message
+    assert loaded == [], "nothing is loaded from a path known to be empty"
+    stale = tmp_path / "gone/.flyte"
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(stale))
+    with pytest.raises(FileNotFoundError, match=f"{child.RUN_CONTEXT_ENV}='{stale}'"):
+        child.attach()
+
+
+def test_a_stale_engine_path_falls_back_to_the_search(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path / "gone/.flyte"))
+    child.attach()
+    assert loaded == [child.context_path(tmp_path.resolve())]
+
+
+def test_the_engine_may_name_the_directory_holding_the_context(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path))
+    child.attach()
+    assert loaded == [child.context_path(tmp_path)]
+
+
+def test_the_base_dir_is_the_one_holding_the_named_context(monkeypatch, tmp_path, loaded):
+    project = _make_workspace_with_context(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path / ".flyte"))
+    assert child.find_base_dir() == tmp_path
+
+
+def test_the_lane_launchers_environment_names_the_workspace_context(monkeypatch, tmp_path):
+    """The head run's launcher gets the variable the supervisor set, not a project's own `.flyte`."""
+    from flyte_agent_factory import _gate_tests
+
+    monkeypatch.setenv(child.RUN_CONTEXT_ENV, str(tmp_path / ".flyte"))
+    _, env = _gate_tests._launcher_command(tmp_path / "j.xml", [])
+    assert env[child.RUN_CONTEXT_ENV] == str(tmp_path / ".flyte")

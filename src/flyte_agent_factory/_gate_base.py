@@ -118,27 +118,36 @@ def is_workspace(checkout: Path) -> bool:
     return not code and kind.strip() == "tree"
 
 
-def project_rel(name: str, layout: str = "sandbox") -> str:
-    """Return the project's directory relative to the workspace: `.` for a root-layout project."""
-    return {"root": ".", "workspace": f"projects/{name}"}.get(layout, name)
+def project_rel(name: str, layout: str = "sandbox", folder: str = "") -> str:
+    """Return the project's directory relative to the workspace: `.` for a root-layout project.
+
+    `folder` is the `projects/<folder>/` a workspace launch is judged in when it is not the launch's
+    name (`_project_folder`); other layouts have no such choice.
+    """
+    return {"root": ".", "workspace": f"projects/{folder or name}"}.get(layout, name)
 
 
-def project_dir(workspace: Path, name: str, layout: str = "sandbox") -> Path:
+def project_dir(workspace: Path, name: str, layout: str = "sandbox", folder: str = "") -> Path:
     """Return what the gates treat as "the project".
 
-    That is `<workspace>/<name>` in the shared sandbox repo, `<workspace>/projects/<name>` in a workspace,
-    and the whole repo for a project on any other repo (see `_git.project_layout`).
+    That is `<workspace>/<name>` in the shared sandbox repo, `<workspace>/projects/<folder or name>` in a
+    workspace (`folder` is the launch's routed folder), and the whole repo for a project on any other repo
+    (see `_git.project_layout`).
     """
-    return workspace / project_rel(name, layout)
+    return workspace / project_rel(name, layout, folder)
 
 
-def checks_rel(name: str, layout: str = "sandbox") -> str:
+def checks_rel(name: str, layout: str = "sandbox", folder: str = "") -> str:
     """Where the project's `checks.sh` is, relative to the workspace.
 
     A root-layout project has no `<name>/` directory to keep it in; the harness directory is
     git-ignored there, so the script is committed with `git add -f`.
     """
-    return f".claude-flyte/{name}/checks.sh" if layout == "root" else f"{project_rel(name, layout)}/checks.sh"
+    return (
+        f".claude-flyte/{name}/checks.sh"
+        if layout == "root"
+        else f"{project_rel(name, layout, folder)}/checks.sh"
+    )
 
 
 def _project_files(project: Path) -> list[str]:

@@ -251,7 +251,7 @@ _LANE_NOT_RUN = 75
 
 #: Prints `image=<the image this run's root action runs on>`. In the supervisor `FLYTE_INTERNAL_IMAGE` names
 #: the plain Flyte image (no git, Node or Playwright), where most of a suite errors; lanes need the run's own.
-#: Run by the deployed interpreter in the project directory, where the run context file is.
+#: Run by the deployed interpreter in the project directory; `attach` finds the run context from there.
 _RUN_IMAGE_LOOKUP = """
 import os, re
 import flyte.remote as remote
@@ -518,6 +518,7 @@ def fail_to_pass(
     start: Path | None = None,
     layout: str = "sandbox",
     work: GateWork | None = None,
+    folder: str = "",
 ) -> tuple[int | _gate_base.Status, str]:
     """Run HEAD tests against the start tree's code, after checking tests were not weakened.
 
@@ -531,14 +532,25 @@ def fail_to_pass(
         try:
             with _gate_start._start_tree(workspace, base, commits) as built:
                 return fail_to_pass(
-                    workspace, name, base, changes, brief, demo, note, commits, built.path, layout, work
+                    workspace,
+                    name,
+                    base,
+                    changes,
+                    brief,
+                    demo,
+                    note,
+                    commits,
+                    built.path,
+                    layout,
+                    work,
+                    folder,
                 )
         except _gate_start._GateError as exc:
             return _gate_base.Status.HARNESS_FAULT, _gate_start.describe_harness_fault(str(exc))
-    project = _gate_base.project_dir(workspace, name, layout)
+    project = _gate_base.project_dir(workspace, name, layout, folder)
     upstreams = _vendored.load(project, _gate_base._SKIP_DIRS, trusted_base=base)
     code, output = _judge_tests(
-        workspace, name, layout, project, upstreams, changes, brief, demo, note, start, work
+        workspace, name, layout, project, upstreams, changes, brief, demo, note, start, work, folder
     )
     # Every outcome says which trees were taken as upstream's, and why any could not be: a passing rule too.
     return code, "\n".join(filter(None, [output, upstreams.describe()]))
@@ -556,6 +568,7 @@ def _judge_tests(
     note: str,
     start: Path,
     work: GateWork | None,
+    folder: str = "",
 ) -> tuple[int | _gate_base.Status, str]:
     """Return `fail_to_pass`'s code and output for a start tree that exists."""
 
@@ -602,7 +615,7 @@ def _judge_tests(
     # A refactor preserves behaviour that tests describe; a project that started with none has
     # nothing to preserve, so it owes tests like any other new code.
     started_with_tests = any(
-        _is_test(p) for p in _gate_base._project_files(_gate_base.project_dir(start, name, layout))
+        _is_test(p) for p in _gate_base._project_files(_gate_base.project_dir(start, name, layout, folder))
     )
     if started_with_tests and re.search(r"refactor:\s*no behaviour change", note, re.IGNORECASE):
         return 0, "EXEMPT: refactor: no behaviour change"
@@ -625,10 +638,10 @@ def _judge_tests(
     command = [interpreter, "-m", "pytest", "-q", *relative]
     python_tests = all(Path(p).suffix == ".py" for p in tests)
     if not python_tests:
-        script = workspace / _gate_base.checks_rel(name, layout)
+        script = workspace / _gate_base.checks_rel(name, layout, folder)
         if not script.is_file():
             # The sandbox script is `<name>/checks.sh`; its message predates the root layout and stays.
-            missing = _gate_base.checks_rel(name, layout) if layout == "root" else "checks.sh"
+            missing = _gate_base.checks_rel(name, layout, folder) if layout == "root" else "checks.sh"
             return 127, f"no project {missing} to run non-Python tests"
         command = ["bash", str(script)]
     # The head tree's tests may already have run (checks.sh, or the one run a pytest rule shares): the changed
@@ -648,12 +661,12 @@ def _judge_tests(
         target = start / path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(workspace / path, target)
-    base_project = _gate_base.project_dir(start, name, layout)
+    base_project = _gate_base.project_dir(start, name, layout, folder)
     env = _secret_env.child_env(PYTHONPATH=str(base_project / "src") + os.pathsep + str(base_project))
     base_command = command
     if not python_tests:
         # The head runner is test infrastructure; its relative paths must resolve inside base.
-        runner = start / _gate_base.checks_rel(name, layout)
+        runner = start / _gate_base.checks_rel(name, layout, folder)
         runner.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(script, runner)
         base_command = ["bash", str(runner)]

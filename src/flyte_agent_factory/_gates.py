@@ -263,20 +263,20 @@ def _net_changes(workspace: Path, start: Path, paths: list[str]) -> list[str]:
     ]
 
 
-def untracked_checks(workspace: Path, name: str, layout: str) -> bool:
+def untracked_checks(workspace: Path, name: str, layout: str, folder: str = "") -> bool:
     """Return a root-layout `checks.sh` that exists but was never `git add -f`ed.
 
     The harness directory is git-ignored, so `git status` cannot see it; it is the one file in
     there that is the project's work rather than harness state.
     """
-    script = _gate_base.checks_rel(name, layout)
+    script = _gate_base.checks_rel(name, layout, folder)
     if layout != "root" or not (workspace / script).is_file():
         return False
     code, _ = _gate_base._run(["git", "ls-files", "--error-unmatch", "--", script], workspace)
     return bool(code)
 
 
-def _uncommitted(workspace: Path, name: str, layout: str = "sandbox") -> list[str]:
+def _uncommitted(workspace: Path, name: str, layout: str = "sandbox", folder: str = "") -> list[str]:
     """Tracked changes anywhere, plus untracked files in the project: work that is in no commit."""
     root = layout == "root"
     paths: list[str] = []
@@ -286,7 +286,7 @@ def _uncommitted(workspace: Path, name: str, layout: str = "sandbox") -> list[st
         [
             "--untracked-files=all",
             "--",
-            *(["."] if root else [_gate_base.project_rel(name, layout), "standards", _waivers.FILE]),
+            *(["."] if root else [_gate_base.project_rel(name, layout, folder), "standards", _waivers.FILE]),
         ],
     )
     for scope in scopes:
@@ -296,8 +296,8 @@ def _uncommitted(workspace: Path, name: str, layout: str = "sandbox") -> list[st
         if not code:
             # Entries are "XY path"; the harness's own state is not the project's work.
             paths += [e[3:] for e in output.split("\0") if len(e) > 3]
-    script = _gate_base.checks_rel(name, layout)
-    if untracked_checks(workspace, name, layout):
+    script = _gate_base.checks_rel(name, layout, folder)
+    if untracked_checks(workspace, name, layout, folder):
         paths.append(script)
     return [
         p
@@ -338,6 +338,7 @@ def _judge_project(
     layout: str = "sandbox",
     work: _gate_tests.GateWork | None = None,
     fail_to_pass_rules: Sequence[str] = (),
+    folder: str = "",
 ) -> None:
     """Record attribution, scope and fail-to-pass for the project's net change since `base`.
 
@@ -361,6 +362,19 @@ def _judge_project(
         return
     commits = output.splitlines()
     identity = commit_identity(name)
+    try:
+        foreign = _gate_start.list_foreign_commits(workspace, base, commits) if layout == "workspace" else []
+    except _gate_start._GateError as exc:
+        foreign = [str(exc)]
+    if foreign:
+        listed = "; ".join(line[:60] for line in foreign[:5])
+        record(
+            "attribution",
+            _gate_base.Status.FAIL,
+            f"commits not attributed to {name}: {listed}. Commit as "
+            f"{identity} (GIT_AUTHOR_EMAIL is set for you; do not override --author)",
+        )
+        return
     if commits:
         record("attribution", _gate_base.Status.PASS, f"{len(commits)} commit(s) attributed to {name}")
     else:
@@ -373,7 +387,7 @@ def _judge_project(
                 base,
                 "HEAD",
                 "--",
-                _gate_base.project_rel(name, layout),
+                _gate_base.project_rel(name, layout, folder),
             ],
             workspace,
         )
@@ -397,9 +411,15 @@ def _judge_project(
             return
         record("attribution", _gate_base.Status.NOT_APPLICABLE, "no project changes yet")
     try:
-        with _gate_start._start_tree(workspace, base, commits) as built:
+        # A workspace project's change is everything its branch holds beyond the upstream it merged.
+        upstream = _gate_start.find_upstream_start(workspace) if layout == "workspace" else None
+        with _gate_start._start_tree(workspace, upstream or base, None if upstream else commits) as built:
             start = built.path
-            code, touched = _changed_paths(workspace, commits)
+            code, touched = (
+                _gate_start.list_paths_since(workspace, upstream)
+                if upstream
+                else _changed_paths(workspace, commits)
+            )
             if code:
                 raise _gate_start._GateError(f"git diff-tree failed: {''.join(touched)}")
             touched = _gate_start.add_merge_paths(workspace, built, touched)
@@ -423,8 +443,8 @@ def _judge_project(
             state = workspace / ".claude-flyte"
             if state.is_dir():
                 owned.update(p.name for p in state.iterdir() if p.is_dir())
-            violations = _gate_scope.scope_violations(changes, name, brief, owned, layout)
-            flagged = _gate_scope.scope_flagged(changes, name, brief, owned, layout)
+            violations = _gate_scope.scope_violations(changes, name, brief, owned, layout, folder)
+            flagged = _gate_scope.scope_flagged(changes, name, brief, owned, layout, folder)
             outside = (
                 "outside the brief's May edit: paths"
                 if layout in {"root", "workspace"}
@@ -447,7 +467,7 @@ def _judge_project(
             if not fail_to_pass_rules:
                 return
             result, output = _gate_tests.fail_to_pass(
-                workspace, name, base, changes, brief, demo, note, commits, start, layout, work
+                workspace, name, base, changes, brief, demo, note, commits, start, layout, work, folder
             )
             record(
                 _standards.FAIL_TO_PASS,
@@ -743,7 +763,7 @@ def standards_results(
     extra project-relative scripts for shellcheck. A rule's `Timeout: <seconds>` line bounds each of
     its commands (default `_gate_base._TOOL_TIMEOUT`). `changed` (see `changed_lines`) limits the suppression
     policy to the lines a project added; None checks every line. `start` is the project's starting tree
-    (root layout): a language-pack rule that fails on `project` and has no finding the start
+    (the project's folder of it): a language-pack rule that fails on `project` and has no finding the start
     lacks passes as pre-existing, so inherited debt does not block (see `_judge_against_start`; tsc output is
     not parsed, so TS rules keep failing). The start's results are kept by the start tree's content (see
     `_cached_run`), and mypy keeps its incremental cache between runs, head and start apart. `work`
@@ -1219,17 +1239,19 @@ def run(
     directions: Sequence[str] = (),
     work: _gate_tests.GateWork | None = None,
     repo_url: str = "",
+    folder: str = "",
 ) -> str:
     """Return blocking failures and record every per-rule result for operators.
 
     `repo_url` is the repository the supervisor works on; owner waivers are read from its default branch.
 
     `directions` is the owner's later direction; a `May edit:` line in it grants scope. `work` carries
-    in the pytest run `checks.sh` made, and carries out how long each part took.
+    in the pytest run `checks.sh` made, and carries out how long each part took. `folder` is the
+    `projects/<folder>/` a workspace launch is judged in; "" means the project's name.
     """
     started = time.monotonic()
     work = work or _gate_tests.GateWork()
-    project = _gate_base.project_dir(workspace, name, layout)
+    project = _gate_base.project_dir(workspace, name, layout, folder)
     brief = brief + _owner_direction(directions)
     results = []
     today = datetime.datetime.now(datetime.timezone.utc).date()
@@ -1287,9 +1309,11 @@ def run(
     )
     tested = mapped.get(_standards.FAIL_TO_PASS, [])
     base = work.trusted_base = resolve_base(workspace, name) if in_repo else ""
-    uncommitted = _uncommitted(workspace, name, layout) if in_repo else []
+    uncommitted = _uncommitted(workspace, name, layout, folder) if in_repo else []
     if base:
-        _judge_project(workspace, name, base, brief, demo, note, uncommitted, record, layout, work, tested)
+        _judge_project(
+            workspace, name, base, brief, demo, note, uncommitted, record, layout, work, tested, folder
+        )
     else:
         # Without a repository, or a commit to measure from, nothing can be proved either way.
         reason = "no git" if not in_repo else "starting commit unavailable"
@@ -1311,15 +1335,23 @@ def run(
     )
     changed = changed_lines(project, base) if base else None
     with contextlib.ExitStack() as stack:
-        # A root-layout project is a whole repository: judge its language tools on regressions from
-        # the starting tree, as the suppressions gate does on `changed`, not on debt it inherited.
+        # Judge the project's language tools and module sizes on regressions from the starting tree, as
+        # the suppressions gate does on `changed`, not on debt it inherited (a root-layout project is a
+        # whole repository; a workspace project is judged on its own folder of it). The shared sandbox
+        # repo judges without a start tree.
         start = None
-        if layout == "root" and base:
-            code, output = _project_commits(workspace, name, base)
+        if layout in {"root", "workspace"} and base:
+            # A workspace project starts from the upstream its branch merged (`find_upstream_start`).
+            upstream = _gate_start.find_upstream_start(workspace) if layout == "workspace" else None
+            commits = None
+            if not upstream:
+                code, output = _project_commits(workspace, name, base)
+                commits = None if code else output.splitlines()
             try:
-                start = stack.enter_context(
-                    _gate_start._start_tree(workspace, base, None if code else output.splitlines())
-                ).path
+                start = _gate_start.make_start_folder(
+                    stack.enter_context(_gate_start._start_tree(workspace, upstream or base, commits)).path,
+                    _gate_base.project_rel(name, layout, folder),
+                )
             except _gate_start._GateError as exc:
                 # `scope` reports this once, in `_judge_project`. Without a start tree a language rule
                 # cannot tell inherited debt from the project's: its failure is the factory's fault.

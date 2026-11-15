@@ -60,6 +60,11 @@ from . import _names
 CONTEXT_SUBPATH = Path(".flyte") / "run_context.json"
 CHILDREN_SUBPATH = Path(".flyte") / "children.json"
 
+#: Names the workspace root's `.flyte` directory (the one holding `run_context.json`). The engine sets it
+#: wherever it starts lanes or checks, so a tool running in `projects/<x>/` attaches to the run's context
+#: and not to whatever `.flyte` the project folder holds.
+RUN_CONTEXT_ENV = "AGENT_FACTORY_RUN_CONTEXT"
+
 #: What an action name looks like. Anything else (a glob, a list, a path) is refused rather than
 #: interpreted: an abort by pattern is how a project's root action was once killed.
 _ACTION_NAME = re.compile(r"[A-Za-z0-9_-]+")
@@ -70,14 +75,48 @@ def context_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / CONTEXT_SUBPATH
 
 
-def find_base(start: str | Path | None = None) -> Path:
-    """Return the nearest directory, from `start` (default the cwd) upwards, holding a run context.
+def find_base_dir(start: str | Path | None = None) -> Path:
+    """Return the directory whose `.flyte` holds the run context `attach` should use.
 
-    A workspace project's commands run in `projects/<name>/` while the supervisor drops the context at
-    the workspace root, so the cwd alone would miss it. With none found, `start` itself.
+    `RUN_CONTEXT_ENV` wins when it names a context, so a `.flyte` inside a project folder is never preferred
+    to the engine's. Otherwise `start` (default: the cwd) if it has a context, else its nearest ancestor that
+    does: a lane launched from `projects/<x>/` finds the workspace root's. With none, `start` itself
+    (`attach` then reports every place it looked, see `describe_missing_context`).
     """
     here = Path(start) if start is not None else Path.cwd()
-    return next((d for d in (here, *here.resolve().parents) if context_path(d).is_file()), here)
+    for directory in _list_candidate_bases(here):
+        if context_path(directory).is_file():
+            return directory
+    return here
+
+
+def _list_candidate_bases(here: Path) -> list[Path]:
+    """List the base directories `find_base_dir` tries, in order: the engine-named one, then `here` upward."""
+    bases = []
+    if explicit := os.environ.get(RUN_CONTEXT_ENV):
+        # The context file, its `.flyte` directory, or the directory holding that: all name the same base.
+        named = Path(explicit)
+        if named.name == CONTEXT_SUBPATH.name:
+            named = named.parent.parent
+        elif named.name == CONTEXT_SUBPATH.parent.name:
+            named = named.parent
+        bases.append(named)
+    # Once each, in order: the engine may name the cwd or one of its ancestors.
+    return list(dict.fromkeys([*bases, here, *here.resolve().parents]))
+
+
+def describe_missing_context(start: str | Path | None = None) -> str:
+    """Return the error for a run context found nowhere: the variable's state and every path searched."""
+    here = Path(start) if start is not None else Path.cwd()
+    explicit = os.environ.get(RUN_CONTEXT_ENV)
+    named = f"{RUN_CONTEXT_ENV}={explicit!r}" if explicit else f"{RUN_CONTEXT_ENV} is not set"
+    searched = ", ".join(str(context_path(base)) for base in _list_candidate_bases(here))
+    return f"no run context found ({named}); searched {searched}"
+
+
+def find_base(start: str | Path | None = None) -> Path:
+    """Return the run-context directory for `start`; the same lookup as `find_base_dir`."""
+    return find_base_dir(start)
 
 
 def write_context(base_dir: str | Path) -> Path:
@@ -85,7 +124,9 @@ def write_context(base_dir: str | Path) -> Path:
 
     Called by the supervisor, which *is* in a task. Only the debug-mode VS Code
     path does this normally, so the parameters are assembled from the live
-    context rather than read from somewhere.
+    context rather than read from somewhere. It also names the context in
+    `RUN_CONTEXT_ENV`, so tools this process starts from a project folder,
+    where `<cwd>/.flyte` is not this one, attach to it (see `find_base_dir`).
     """
     import flyte
     from flyte._interactive_run_context import write_interactive_run_context
@@ -114,7 +155,9 @@ def write_context(base_dir: str | Path) -> Path:
         "pkl": bundle.pkl if bundle else None,
         "dest": bundle.destination if bundle else None,
     }
-    return Path(write_interactive_run_context(params, base_dir=base_dir))
+    path = Path(write_interactive_run_context(params, base_dir=base_dir))
+    os.environ[RUN_CONTEXT_ENV] = str(path.parent)
+    return path
 
 
 def attach(base_dir: str | Path | None = None) -> TaskContext:
@@ -127,7 +170,12 @@ def attach(base_dir: str | Path | None = None) -> TaskContext:
 
     from . import _union_identity
 
-    base = Path(base_dir) if base_dir is not None else find_base()
+    if base_dir is None:
+        base = find_base_dir()
+        if not context_path(base).is_file():
+            raise FileNotFoundError(describe_missing_context())
+    else:
+        base = Path(base_dir)
     ctx = flyte.load_interactive_ctx(path=context_path(base))
 
     # `load_interactive_ctx` installs the context but deliberately creates no
@@ -250,7 +298,7 @@ def abort_children(names: Sequence[str], reason: str, base_dir: str | Path | Non
     if ctx is None or ctx.action is None:
         raise RuntimeError("abort_children must be called after attach()")
     own, run_name = ctx.action.name, ctx.action.run_name
-    mine = recorded_children(base_dir if base_dir is not None else Path.cwd(), own)
+    mine = recorded_children(base_dir if base_dir is not None else find_base_dir(), own)
 
     if not names:
         raise AbortRefused("no action names given")

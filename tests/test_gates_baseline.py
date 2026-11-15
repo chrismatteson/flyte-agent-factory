@@ -349,9 +349,16 @@ def gate_calls(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
 @pytest.mark.parametrize(("layout", "has_start"), [("root", True), ("sandbox", False)])
 def test_done_gate_passes_the_start_tree_for_root_layout_only(project, gate_calls, layout, has_start):
-    """Only the root layout hands the start tree to the DONE gate."""
+    """The root and workspace layouts hand the start tree to the DONE gate; the shared sandbox does not."""
     _gates.run(project, "app", "", "", "DONE", {}, _Timeline(), layout)
     assert [s is not None for s in gate_calls] == [has_start]
+
+
+def test_done_gate_passes_a_workspace_project_its_folder_of_the_start_tree(project, gate_calls):
+    """A workspace project is judged against its own folder of the start tree, as root is against all."""
+    (project / "projects/app").mkdir(parents=True)
+    _gates.run(project, "app", "", "", "DONE", {}, _Timeline(), "workspace")
+    assert [s is not None and s.parts[-2:] == ("projects", "app") for s in gate_calls] == [True]
 
 
 def test_done_gate_reports_a_start_tree_it_cannot_build(project, gate_calls, monkeypatch):
