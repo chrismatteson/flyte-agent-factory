@@ -11,7 +11,7 @@ from flyte.ai.mcp._flyte_mcp_app import ALL_MCP_TOOLS, TOOL_REGISTRY
 from flyte.models import ActionPhase
 from mcp.server.fastmcp.exceptions import ToolError
 
-from flyte_agent_factory import _factory, _factory_base
+from flyte_agent_factory import _factory, _factory_base, _git
 from flyte_agent_factory import _factory_mcp as factory
 
 ROOT = Path(factory.__file__).resolve().parents[2]
@@ -658,6 +658,42 @@ def test_the_grant_page_adds_no_mcp_tool():
     assert factory.app.enabled_tools == set(factory.TOOLS)
     assert factory.app.mcp is not None
     assert {tool.name for tool in factory.app.mcp._tool_manager.list_tools()} == set(factory.TOOLS)
+
+
+def test_instructions_declare_the_operator_state_file_and_write_targets():
+    # The takeover chat takes these from the server, so they must be the profile's own values.
+    text = " ".join(factory.INSTRUCTIONS.split())
+    workspace = _git.get_repo_slug(_factory.REPO)
+    assert f"operator/STATE.md in the workspace repo {workspace}" in text
+    writes = ", ".join(_git.get_repo_slug(url) for url in factory.REPOS.values())
+    assert f"writes STATE.md, issues and pull-request branches to: {writes}" in text
+    assert workspace == "team/work-sandbox"
+
+
+def test_instructions_say_a_state_md_elsewhere_is_reported_in_the_first_reply_and_not_used():
+    # #185: a skill or note from before the move may still name the old STATE.md home.
+    text = " ".join(factory.INSTRUCTIONS.split())
+    assert "a STATE.md elsewhere is not the operator's" in text
+    assert "say so in the first reply and do not use it" in text
+
+
+def test_instructions_tell_a_takeover_to_report_a_stale_or_unversioned_skill():
+    # A skill saved before versioned skills has no takeover step of its own; the server instructions reach it.
+    text = " ".join(factory.INSTRUCTIONS.split())
+    assert "Skill version: <digest>" in text and "If it has no such line" in text
+    assert factory.SKILL_VERSION_URL.endswith("/skills/dist/VERSION") and factory.SKILL_VERSION_URL in text
+    assert "say in the first reply that the installed skill is stale" in text
+
+
+def test_write_targets_always_hold_the_workspace_even_when_mcp_repos_leave_it_out():
+    # `[mcp] repos = ["factory"]`: STATE.md's repo is still one the operator writes to, and listed once.
+    assert factory.list_write_targets("git@github.com:team/work.git", ["git@github.com:team/engine.git"]) == [
+        "team/work",
+        "team/engine",
+    ]
+    assert factory.list_write_targets(
+        "git@github.com:team/work.git", ["https://github.com/team/work", "git@github.com:team/engine.git"]
+    ) == ["team/work", "team/engine"]
 
 
 # --- signal_condition: any answer to an ask reaches the project ---------------------------------

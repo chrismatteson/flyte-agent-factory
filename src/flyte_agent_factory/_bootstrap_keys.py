@@ -83,7 +83,7 @@ def find_connector_url(ctx: Context) -> str:
         url = tomllib.loads(ctx.profile_path.read_text())["mcp"]["public_url"]
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         url = ""
-    url = url or ctx.flyte.factory_mcp_url() or ""
+    url = url or ctx.flyte.get_factory_mcp_url() or ""
     return f"{url.rstrip('/')}/flyte-mcp/mcp" if url else ""
 
 
@@ -174,7 +174,7 @@ def _show_once(ctx: Context, key: IssuedKey, lines: str) -> Outcome | None:
     return None
 
 
-def _connector_present(ctx: Context) -> bool:
+def _is_connector_present(ctx: Context) -> bool:
     proc = ctx.run_command(["claude", "mcp", "list"])
     listing = proc.stdout.lower() if proc.returncode == 0 else ""
     return any(f"{name}:" in listing for name in CONNECTOR_NAMES)
@@ -186,7 +186,7 @@ def make_chat_key(ctx: Context) -> Outcome:
     if not connector:
         return Outcome(TODO, "factory-mcp has no public URL yet; run the bootstrap without --chat-key first")
     have_claude = ctx.which("claude") is not None
-    if have_claude and _connector_present(ctx):
+    if have_claude and _is_connector_present(ctx):
         return Outcome(DONE, "the agent-factory connector is already in Claude Code; no new key made")
     made = _make_key(ctx, CHAT_KEY)
     if isinstance(made, Outcome):
@@ -318,9 +318,7 @@ class UnionKeysStep:
 
     def _find_missing(self, ctx: Context) -> list[tuple[str, str]]:
         return [
-            (secret, policy)
-            for secret, policy in self._list_wanted(ctx)
-            if not ctx.flyte.secret_exists(secret)
+            (secret, policy) for secret, policy in self._list_wanted(ctx) if not ctx.flyte.has_secret(secret)
         ]
 
     def check(self, ctx: Context) -> Check:

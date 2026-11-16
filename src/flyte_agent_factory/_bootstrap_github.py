@@ -94,16 +94,16 @@ class GhCli:
         except ValueError:
             raise BootstrapError(f"gh returned something other than JSON for {what}") from None
 
-    def authenticated(self) -> bool:
+    def is_authenticated(self) -> bool:
         return self._call(["auth", "status"]).returncode == 0
 
-    def owner_is_org(self, owner: str) -> bool:
+    def is_owner_an_org(self, owner: str) -> bool:
         return self._run_gh("api", f"users/{owner}", "--jq", ".type").strip() == "Organization"
 
-    def viewer_login(self) -> str:
+    def get_viewer_login(self) -> str:
         return self._run_gh("api", "user", "--jq", ".login").strip()
 
-    def repo_visibility(self, repo: str) -> str | None:
+    def get_repo_visibility(self, repo: str) -> str | None:
         proc = self._call(["repo", "view", repo, "--json", "visibility", "--jq", ".visibility"])
         if proc.returncode == 0:
             return proc.stdout.strip().lower()
@@ -114,8 +114,8 @@ class GhCli:
             return None
         raise BootstrapError(f"gh repo view {repo} failed ({proc.returncode}): {err[-300:]}")
 
-    def clone_origin_is(self, checkout: Path, repo: str) -> bool:
-        url = _workspace.git(checkout, "config", "--get", "remote.origin.url", placeholder_identity=False)
+    def has_clone_origin(self, checkout: Path, repo: str) -> bool:
+        url = _workspace.run_git(checkout, "config", "--get", "remote.origin.url", neutral_identity=False)
         match = _REMOTE.match(url.strip())
         return match is not None and f"{match[1]}/{match[2]}".lower() == repo.lower()
 
@@ -126,16 +126,16 @@ class GhCli:
         self._run_gh("repo", "clone", repo, str(dest), timeout=300)
 
     def push(self, checkout: Path) -> None:
-        _workspace.git(checkout, "push", "-q", "-u", "origin", "HEAD", placeholder_identity=False)
+        _workspace.run_git(checkout, "push", "-q", "-u", "origin", "HEAD", neutral_identity=False)
 
     def _find_ruleset_id(self, repo: str, name: str) -> int | None:
         listed = self._parse_json(self._run_gh("api", f"repos/{repo}/rulesets"), "the rulesets") or []
         return next((r["id"] for r in listed if r.get("name") == name and "id" in r), None)
 
-    def ruleset_exists(self, repo: str, name: str) -> bool:
+    def has_ruleset(self, repo: str, name: str) -> bool:
         return self._find_ruleset_id(repo, name) is not None
 
-    def ruleset_deploy_key_bypass(self, repo: str, name: str) -> bool:
+    def has_ruleset_deploy_key_bypass(self, repo: str, name: str) -> bool:
         # The listing leaves out `bypass_actors`; only the ruleset itself has them.
         found = self._find_ruleset_id(repo, name)
         if found is None:
@@ -159,7 +159,7 @@ class GhCli:
             stdin=json.dumps(build_ruleset_body(name, deploy_key_bypass)),
         )  # fmt: skip
 
-    def deploy_key_titles(self, repo: str) -> list[str]:
+    def list_deploy_key_titles(self, repo: str) -> list[str]:
         keys = self._parse_json(self._run_gh("api", f"repos/{repo}/keys"), "the deploy keys") or []
         return [k.get("title", "") for k in keys]
 
@@ -182,7 +182,7 @@ class GhCli:
             if key.get("title") == title and "id" in key:
                 self._run_gh("api", "-X", "DELETE", f"repos/{repo}/keys/{key['id']}")
 
-    def board_linked(self, repo: str) -> bool:
+    def is_board_linked(self, repo: str) -> bool:
         owner, name = repo.split("/", 1)
         query = "query($o:String!,$n:String!){repository(owner:$o,name:$n){projectsV2(first:1){totalCount}}}"
         out = self._run_gh("api", "graphql", "-f", f"query={query}", "-f", f"o={owner}", "-f", f"n={name}")
@@ -214,13 +214,13 @@ class GhCli:
         self._run_gh("project", "link", str(board["number"]), "--owner", owner, "--repo", f"{owner}/{repo}")
         return str(board.get("url", ""))
 
-    def app_installations(self, owner: str) -> list[str]:
+    def list_app_installations(self, owner: str) -> list[str]:
         """Slugs of the Apps installed on an organization; a user account has no such listing."""
         out = self._run_gh("api", f"orgs/{owner}/installations", "--jq", "[.installations[].app_slug]")
         slugs: list[str] = self._parse_json(out, "the installations") or []
         return slugs
 
-    def app_exists(self, owner: str, slug: str) -> bool:
+    def has_app(self, owner: str, slug: str) -> bool:
         proc = self._call(["api", f"apps/{slug}", "--jq", ".owner.login"])
         if proc.returncode == 0:
             # App names are global: one of that name held by someone else is not the owner's.
@@ -243,7 +243,7 @@ class GhCli:
         except (KeyError, TypeError):
             raise BootstrapError("GitHub's reply to the App conversion lacked its id, slug or key") from None
 
-    def app_installed(self, registration: AppRegistration, repo: str) -> bool:
+    def is_app_installed(self, registration: AppRegistration, repo: str) -> bool:
         # `gh` cannot sign an App JWT and GitHub lists a user account's installations only to the App itself,
         # so the check is the App's own: asking for an installation token on the repository.
         try:
@@ -258,7 +258,7 @@ class GhCli:
 
     def register_app(self, owner: str, repo: str, say: Callable[[str], None]) -> str:
         """Run the manifest flow in the browser; return GitHub's one-time code."""
-        return register_app(owner, repo, self.owner_is_org(owner), self._open_url, say)
+        return register_app(owner, repo, self.is_owner_an_org(owner), self._open_url, say)
 
 
 def build_ruleset_body(name: str, deploy_key_bypass: bool) -> dict[str, object]:

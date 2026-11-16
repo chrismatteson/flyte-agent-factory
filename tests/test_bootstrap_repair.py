@@ -358,14 +358,14 @@ def test_a_failing_lookup_is_not_taken_for_a_missing_repository():
         return subprocess.CompletedProcess(cmd, 1, "", "error connecting to api.github.com")
 
     with pytest.raises(BootstrapError):
-        _bootstrap_github.GhCli(run=fake_run).repo_visibility("pat/ws")
+        _bootstrap_github.GhCli(run=fake_run).get_repo_visibility("pat/ws")
 
     def missing(cmd, **kwargs):
         return subprocess.CompletedProcess(
             cmd, 1, "", "GraphQL: Could not resolve to a Repository with the name 'pat/ws'."
         )
 
-    assert _bootstrap_github.GhCli(run=missing).repo_visibility("pat/ws") is None
+    assert _bootstrap_github.GhCli(run=missing).get_repo_visibility("pat/ws") is None
 
 
 def test_the_app_name_is_cut_to_githubs_limit_and_the_slug_follows():
@@ -451,7 +451,9 @@ def test_a_failed_deploy_script_is_a_bootstrap_error_naming_it(tmp_path):
 
 def test_the_deployer_has_no_key_to_release():
     """Nothing is minted, so nothing is closed: the deploy leaves no Union key behind."""
-    assert not hasattr(DeployScripts, "close") and not hasattr(DeployScripts, "api_key_available")
+    assert not hasattr(DeployScripts, "close")
+    assert not hasattr(DeployScripts, "api_key_available")
+    assert not hasattr(DeployScripts, "is_api_key_available")
 
 
 # The bootstrap used to mint a temporary deploy API key per run, record it in the clone's git config and
@@ -674,7 +676,7 @@ def _deploy_key_bypasses(world: World) -> bool:
 
 
 def test_an_app_that_is_not_installed_is_not_written_to_the_profile(world):
-    world.app_installed = False
+    world.is_app_installed = False
     code, out = run(world)
     assert code == 3 and statuses(out)["github-app"] == "todo", out
     assert not _has_app(world)
@@ -682,7 +684,7 @@ def test_an_app_that_is_not_installed_is_not_written_to_the_profile(world):
 
 
 def test_a_failed_install_then_no_app_leaves_a_consistent_app_free_setup(world):
-    world.app_installed = False
+    world.is_app_installed = False
     assert run(world)[0] == 3
     code, out = run(world, "--no-app")
     assert code == 0, out
@@ -748,8 +750,8 @@ def _gh_with_ruleset(actors: list[dict[str, Any]]):
 def test_the_adapter_reads_the_deploy_key_bypass_from_the_ruleset_itself():
     with_key, _ = _gh_with_ruleset([{"actor_type": "DeployKey"}, {"actor_type": "RepositoryRole"}])
     without, _ = _gh_with_ruleset([{"actor_type": "RepositoryRole"}])
-    assert with_key.ruleset_deploy_key_bypass("pat/ws", "n") is True
-    assert without.ruleset_deploy_key_bypass("pat/ws", "n") is False
+    assert with_key.has_ruleset_deploy_key_bypass("pat/ws", "n") is True
+    assert without.has_ruleset_deploy_key_bypass("pat/ws", "n") is False
 
 
 def test_the_adapter_updates_the_existing_ruleset_with_put():
@@ -824,7 +826,7 @@ def test_a_dir_that_is_neither_empty_nor_a_checkout_says_what_to_do(world):
 def test_the_origin_check_pins_the_host(tmp_path, origin, matches):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "remote", "add", "origin", origin], check=True)
-    assert _bootstrap_github.GhCli().clone_origin_is(tmp_path, "pat/agent-workspace") is matches
+    assert _bootstrap_github.GhCli().has_clone_origin(tmp_path, "pat/agent-workspace") is matches
 
 
 def test_package_check_on_a_missing_path_is_one_line_and_exit_2(tmp_path):
@@ -918,7 +920,7 @@ def test_a_crash_after_the_key_is_stored_resumes_with_the_recorded_app(world, mo
     # Scoped, not `monkeypatch.undo()`: that would also undo the autouse fixtures' patches, the commit
     # identity among them, and the second run would depend on the machine's own git config.
     with monkeypatch.context() as patch:
-        patch.setattr(_bootstrap_fakes.FakeGitHub, "app_installed", crash_once)
+        patch.setattr(_bootstrap_fakes.FakeGitHub, "is_app_installed", crash_once)
         code, out = run(world)
     assert code == 3 and calls == ["424242"]
     assert "agent_factory_github_app_key" in world.secrets
@@ -961,13 +963,13 @@ def test_an_organizations_app_is_deleted_on_the_organizations_settings_page(worl
 
 def test_the_install_link_uses_the_slug_github_returned(world):
     world.app_slug = "agent-factory-pat-2"  # GitHub's slug, not the one derived from the name
-    world.app_installed = False
+    world.is_app_installed = False
     code, out = run(world)
     assert code == 3
     text = "\n".join(out)
     assert "https://github.com/apps/agent-factory-pat-2/installations/new" in text
     assert "https://github.com/apps/agent-factory-pat/installations" not in text
-    world.app_installed = True
+    world.is_app_installed = True
     code, out = run(world, "--status")
     assert "https://github.com/apps/agent-factory-pat-2/installations/new" in _app_line(out)
 
@@ -1015,7 +1017,7 @@ def test_the_adapter_asks_github_whether_the_owner_has_the_app(returncode, stdou
         assert cmd[:3] == ["gh", "api", "apps/agent-factory-pat"]
         return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
-    assert _bootstrap_github.GhCli(run=fake_run).app_exists("pat", "agent-factory-pat") is expected
+    assert _bootstrap_github.GhCli(run=fake_run).has_app("pat", "agent-factory-pat") is expected
 
 
 def test_a_failed_app_lookup_is_not_taken_for_a_missing_app():
@@ -1023,7 +1025,7 @@ def test_a_failed_app_lookup_is_not_taken_for_a_missing_app():
         return subprocess.CompletedProcess(cmd, 1, "", "error connecting to api.github.com")
 
     with pytest.raises(BootstrapError):
-        _bootstrap_github.GhCli(run=fake_run).app_exists("pat", "agent-factory-pat")
+        _bootstrap_github.GhCli(run=fake_run).has_app("pat", "agent-factory-pat")
 
 
 def test_status_before_sign_in_shows_the_flyte_steps_as_todo_not_blocked(world):
@@ -1041,7 +1043,7 @@ def test_the_sdk_adapter_says_sign_in_first_when_there_is_no_config(tmp_path):
     settings = Settings(endpoint="flyte.example.com", project="p", workspace="pat/ws")
     flyte_ops = FlyteSdk(settings, config_path=tmp_path / "absent.yaml")
     with pytest.raises(NotSignedIn, match="sign in first"):
-        flyte_ops.project_exists()
+        flyte_ops.has_project()
 
 
 def test_an_invalid_profile_names_the_file_to_edit(world):
@@ -1139,7 +1141,7 @@ def test_an_organization_that_may_not_list_installations_falls_back_to_the_recei
     def refuse(self, owner):
         raise NotAllowed("HTTP 403")
 
-    monkeypatch.setattr(FakeGitHub, "app_installations", refuse)
+    monkeypatch.setattr(FakeGitHub, "list_app_installations", refuse)
     how = GithubAppStep()._describe_installation(ctx, "424242")
     assert how is not None and "registered" in how and "not re-checked" in how
     assert GithubAppStep()._describe_installation(ctx, "999") is None  # a receipt for another App is none
@@ -1186,7 +1188,7 @@ def test_an_installation_confirmed_on_an_earlier_run_is_adopted_without_asking(w
     from flyte_agent_factory._bootstrap_base import DONE
     from flyte_agent_factory._bootstrap_finish import GithubAppStep
 
-    world.app_installed = False
+    world.is_app_installed = False
     code, _ = run(world)
     assert code == 3 and "app_id" not in (world.root / "clone/profile.toml").read_text()
     ctx = _finished_with_a_person_who_cannot_be_asked(world)
@@ -1220,7 +1222,7 @@ def test_an_install_nobody_can_confirm_without_a_terminal_is_a_todo_with_the_lin
     from flyte_agent_factory._bootstrap_base import TODO
     from flyte_agent_factory._bootstrap_finish import GithubAppStep
 
-    world.app_installed = False
+    world.is_app_installed = False
     assert run(world)[0] == 3
     ctx = _finished_with_a_person_who_cannot_be_asked(world)
     outcome = GithubAppStep().do(ctx)
@@ -1317,9 +1319,9 @@ def _sdk(monkeypatch=None, config_path=None) -> FlyteSdk:
 
 def test_a_missing_flyte_config_has_no_endpoint_and_one_without_one_has_an_empty_endpoint(tmp_path):
     config = tmp_path / "config.yaml"
-    assert _sdk(config_path=config).config_endpoint() is None
+    assert _sdk(config_path=config).get_config_endpoint() is None
     config.write_text("admin:\n  insecure: true\n")
-    assert _sdk(config_path=config).config_endpoint() == ""
+    assert _sdk(config_path=config).get_config_endpoint() == ""
 
 
 def test_create_config_runs_the_sdk_cli_and_a_local_cluster_gets_insecure(tmp_path, monkeypatch):
@@ -1376,14 +1378,14 @@ def test_the_project_and_secret_lookups_treat_only_not_found_as_missing(monkeypa
 
     monkeypatch.setattr(remote.Project, "get", get)
     monkeypatch.setattr(remote.Secret, "get", get)
-    assert sdk.project_exists() is True and sdk.secret_exists("s") is True
+    assert sdk.has_project() is True and sdk.has_secret("s") is True
     state["error"] = ConnectError(Code.NOT_FOUND, "no such thing")
-    assert sdk.project_exists() is False and sdk.secret_exists("s") is False
+    assert sdk.has_project() is False and sdk.has_secret("s") is False
     state["error"] = ConnectError(Code.UNAVAILABLE, "the network is down")
     with pytest.raises(ConnectError):
-        sdk.project_exists()
+        sdk.has_project()
     with pytest.raises(ConnectError):
-        sdk.secret_exists("s")
+        sdk.has_secret("s")
 
 
 def test_create_project_names_it_by_the_projects_id(monkeypatch):
@@ -1406,9 +1408,9 @@ def test_the_factory_is_registered_when_its_launch_task_is_listed(monkeypatch):
         return iter(tasks)
 
     monkeypatch.setattr(remote.Task, "listall", listall)
-    assert _sdk().factory_registered() is False
+    assert _sdk().is_factory_registered() is False
     tasks.append("factory.launch")
-    assert _sdk().factory_registered() is True
+    assert _sdk().is_factory_registered() is True
     assert listed[0] == {"by_task_name": "factory.launch", "limit": 1}
 
 
@@ -1425,22 +1427,22 @@ def test_the_factory_url_is_the_apps_endpoint_when_it_has_one(monkeypatch):
         return state["found"]
 
     monkeypatch.setattr(remote.App, "get", get)
-    assert _sdk().factory_mcp_url() == "https://factory-mcp.example.test"
+    assert _sdk().get_factory_mcp_url() == "https://factory-mcp.example.test"
     app.endpoint = ""  # deployed, but no public URL yet
-    assert _sdk().factory_mcp_url() is None
+    assert _sdk().get_factory_mcp_url() is None
     state["found"] = ConnectError(Code.NOT_FOUND, "not deployed")
-    assert _sdk().factory_mcp_url() is None
+    assert _sdk().get_factory_mcp_url() is None
     state["found"] = ConnectError(Code.UNAVAILABLE, "down")
     with pytest.raises(ConnectError):
-        _sdk().factory_mcp_url()
+        _sdk().get_factory_mcp_url()
 
 
 def test_the_adapter_can_manage_keys_exactly_when_the_union_plugin_is_there(monkeypatch):
     from flyte_agent_factory import _bootstrap_flyte
 
-    monkeypatch.setattr(_bootstrap_flyte, "_union_plugin_present", lambda: True)
+    monkeypatch.setattr(_bootstrap_flyte, "_is_union_plugin_present", lambda: True)
     assert _sdk().can_manage_keys() is True
-    monkeypatch.setattr(_bootstrap_flyte, "_union_plugin_present", lambda: False)
+    monkeypatch.setattr(_bootstrap_flyte, "_is_union_plugin_present", lambda: False)
     assert _sdk().can_manage_keys() is False
 
 
@@ -1718,7 +1720,7 @@ def test_a_ruleset_that_cannot_be_read_is_reported_not_raised(world, monkeypatch
     def refuse(self, repo, name):
         raise NotAllowed("HTTP 403")
 
-    monkeypatch.setattr(FakeGitHub, "ruleset_exists", refuse)
+    monkeypatch.setattr(FakeGitHub, "has_ruleset", refuse)
     check = RulesetStep().check(ctx)
     assert not check.ok and check.detail == "cannot read rulesets on this repository"
 
@@ -1730,7 +1732,7 @@ def test_a_process_that_is_somebody_elses_still_counts_as_alive(monkeypatch):
         raise PermissionError
 
     monkeypatch.setattr(os, "kill", kill)
-    assert _bootstrap_steps._process_is_alive(1) is True
+    assert _bootstrap_steps._is_process_alive(1) is True
 
 
 def test_a_key_directory_that_vanishes_during_the_sweep_is_skipped(tmp_path, monkeypatch):

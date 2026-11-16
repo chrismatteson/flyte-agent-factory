@@ -24,14 +24,15 @@ _IDENTITY = ("-c", "user.name=agent-workspace", "-c", "user.email=agent-workspac
 _GITHUB_INIT_FILES = frozenset({"README.md", "LICENSE", ".gitignore"})
 
 
-def git(repo: Path, *args: str, timeout: int = 300, placeholder_identity: bool = True) -> str:
+def run_git(repo: Path, *args: str, timeout: int = 300, neutral_identity: bool = True) -> str:
     """Run `git` in `repo` and return stdout; a failure or a timeout raises `RuntimeError`.
 
-    `placeholder_identity=False` leaves the commit identity to the person's own git configuration.
+    `neutral_identity=True` (the default) commits as the fixed neutral identity `_IDENTITY`; `False` leaves
+    the commit identity to the person's own git configuration.
     """
     try:
         proc = subprocess.run(
-            ["git", *(_IDENTITY if placeholder_identity else ()), *args],
+            ["git", *(_IDENTITY if neutral_identity else ()), *args],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -80,7 +81,7 @@ def copy_template(dest: Path) -> None:
 def require_identity(cwd: Path) -> None:
     """Fail clearly unless git has a commit identity: the person's own, never a placeholder."""
 
-    def configured(key: str, env: str) -> bool:
+    def is_configured(key: str, env: str) -> bool:
         if os.environ.get(env):
             return True
         try:
@@ -91,7 +92,9 @@ def require_identity(cwd: Path) -> None:
             raise RuntimeError(f"git config --get {key} timed out after 30s") from exc
         return bool(proc.stdout.strip())
 
-    if not (configured("user.name", "GIT_AUTHOR_NAME") and configured("user.email", "GIT_AUTHOR_EMAIL")):
+    if not (
+        is_configured("user.name", "GIT_AUTHOR_NAME") and is_configured("user.email", "GIT_AUTHOR_EMAIL")
+    ):
         raise RuntimeError(
             'git has no commit identity: run `git config --global user.name "Your Name"` and '
             "`git config --global user.email you@example.com`, then run this again"
@@ -101,8 +104,8 @@ def require_identity(cwd: Path) -> None:
 def commit_all(repo: Path, message: str) -> None:
     """Stage everything in `repo` and commit it as the person whose git configuration this is."""
     require_identity(repo)
-    git(repo, "add", "-A", placeholder_identity=False)
-    git(repo, "commit", "-q", "-m", message, placeholder_identity=False)
+    run_git(repo, "add", "-A", neutral_identity=False)
+    run_git(repo, "commit", "-q", "-m", message, neutral_identity=False)
 
 
 def create(dest: Path, *, commit: bool = False) -> None:
@@ -117,6 +120,6 @@ def create(dest: Path, *, commit: bool = False) -> None:
         require_identity(dest if dest.is_dir() else dest.parent if dest.parent.is_dir() else Path.cwd())
     copy_template(dest)
     if not clone:
-        git(dest, "init", "-q", "-b", "main")
+        run_git(dest, "init", "-q", "-b", "main")
     if commit:
         commit_all(dest, "Workspace from template")

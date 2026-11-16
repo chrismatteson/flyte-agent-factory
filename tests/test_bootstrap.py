@@ -330,7 +330,7 @@ def test_a_board_without_the_project_scope_says_how_to_get_it(world):
 
 def test_no_board_skips_the_board(world):
     code, out = run(world, "--no-board")
-    assert code == 0 and world.board_linked is False
+    assert code == 0 and world.is_board_linked is False
     assert any(line.startswith("[skip] board") for line in out)
 
 
@@ -732,7 +732,7 @@ def test_a_forbidden_ruleset_update_is_reported_like_a_forbidden_create(world):
 def test_the_fakes_refuse_a_repository_that_is_not_there_and_a_command_nobody_expects(world):
     gh = FakeGitHub(world)
     with pytest.raises(BootstrapError, match="Could not resolve to a Repository"):
-        gh.deploy_key_titles("pat/missing")
+        gh.list_deploy_key_titles("pat/missing")
     with pytest.raises(AssertionError, match="unexpected command"):
         fakes._run_command(world, ["rm", "-rf", "/"])
 

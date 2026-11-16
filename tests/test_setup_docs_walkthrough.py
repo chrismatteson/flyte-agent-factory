@@ -198,3 +198,43 @@ def test_every_setup_page_says_the_deploy_key_is_the_only_required_github_creden
     for path in (QUICKSTART, "docs/setup.md", "docs/github-app.md"):
         assert "only GitHub credential" in read(path), path
         assert "](github-app.md)" in read(path) or path == "docs/github-app.md", path
+
+
+#: The pages that hand a person an `ops/bootstrap.py` command; the skill's SKILL.md must follow too.
+BOOTSTRAP_COMMAND_PAGES = (
+    QUICKSTART,
+    SKILL_SETUP,
+    "skills/agent-factory/SKILL.md",
+    "docs/chat-operator.md",
+    "docs/factory-mcp-setup.md",
+    "docs/github-app.md",
+)
+
+
+def test_every_bootstrap_command_in_the_docs_is_the_one_line_the_bootstrap_prints():
+    from flyte_agent_factory._bootstrap_base import Settings
+    from flyte_agent_factory._bootstrap_keys import build_command
+
+    example = Settings(
+        endpoint="flyte.example.com",
+        project="my-agents",
+        workspace="you/agent-workspace",
+    )
+    # What the bootstrap prints before its flags: clone or update the engine, then run the bootstrap.
+    prefix = build_command(example).split(" --endpoint ")[0]
+    assert "cd " in prefix and prefix.endswith("uv run python ops/bootstrap.py")
+    seen = 0
+    for path in BOOTSTRAP_COMMAND_PAGES:
+        text = read(path)
+        for block in re.findall(r"```\w*\n(.*?)```", text, re.DOTALL):
+            for line in block.splitlines():
+                if "ops/bootstrap.py" in line:
+                    seen += 1
+                    assert line.strip().startswith(prefix), f"{path}: {line[:120]}"
+                    assert " --endpoint " in line and " --workspace " in line, f"{path}: {line[-120:]}"
+        # Prose may name the script, never give it flags: a flag after the script name is a command that
+        # does not run from anywhere.
+        for span in re.findall(r"`([^`\n]*ops/bootstrap\.py[^`\n]*)`", text):
+            assert " --" not in span, f"{path}: `{span}` is not the one-line command"
+    assert seen >= 8, "the docs lost their bootstrap commands, or this test no longer finds them"
+    assert "**Recovery commands.**" in read(SKILL_SETUP)

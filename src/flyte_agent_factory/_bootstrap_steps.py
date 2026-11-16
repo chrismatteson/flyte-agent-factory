@@ -70,10 +70,10 @@ def build_codex_login_command(settings: Settings) -> str:
 def describe_unclean_or_unpushed(checkout: Path, paths: tuple[str, ...] = ()) -> str | None:
     """None when `paths` (or everything) is committed and pushed; else what is left to do."""
     pathspec = ["--", *paths] if paths else []
-    if _workspace.git(checkout, "status", "--porcelain", *pathspec, placeholder_identity=False).strip():
+    if _workspace.run_git(checkout, "status", "--porcelain", *pathspec, neutral_identity=False).strip():
         return "uncommitted changes"
     try:
-        ahead = _workspace.git(checkout, "rev-list", "--count", "@{u}..HEAD", placeholder_identity=False)
+        ahead = _workspace.run_git(checkout, "rev-list", "--count", "@{u}..HEAD", neutral_identity=False)
     except RuntimeError:  # no upstream yet: a first push is due (or this is not a repository)
         return "not pushed"
     return "not pushed" if ahead.strip() != "0" else None
@@ -82,8 +82,8 @@ def describe_unclean_or_unpushed(checkout: Path, paths: tuple[str, ...] = ()) ->
 def commit_paths(checkout: Path, paths: tuple[str, ...], message: str) -> None:
     """Commit just `paths`, as the person: a rerun must not sweep their other edits into the commit."""
     _workspace.require_identity(checkout)
-    _workspace.git(checkout, "add", "--", *paths, placeholder_identity=False)
-    _workspace.git(checkout, "commit", "-q", "-m", message, "--", *paths, placeholder_identity=False)
+    _workspace.run_git(checkout, "add", "--", *paths, neutral_identity=False)
+    _workspace.run_git(checkout, "commit", "-q", "-m", message, "--", *paths, neutral_identity=False)
 
 
 def check_waiting_on_repository(ctx: Context) -> Check | None:
@@ -92,7 +92,7 @@ def check_waiting_on_repository(ctx: Context) -> Check | None:
     A check that asks GitHub about a repository that is not there yet (`--status` on a fresh install) would
     otherwise end in GitHub's "Could not resolve to a Repository".
     """
-    if ctx.github.repo_visibility(ctx.settings.workspace) is None:
+    if ctx.github.get_repo_visibility(ctx.settings.workspace) is None:
         return Check(False, f"waits on the repository {ctx.settings.workspace}, which does not exist yet")
     return None
 
@@ -126,7 +126,7 @@ _INSTALL_COMMANDS: dict[str, dict[str, str]] = {
 assert set(_INSTALL_COMMANDS) == set(REQUIRED_TOOLS)
 
 
-def _platform_key(platform: str) -> str:
+def _get_platform_key(platform: str) -> str:
     return {"darwin": "macos", "linux": "linux"}.get(platform, "other")
 
 
@@ -138,26 +138,26 @@ class ToolsStep:
     def _find_missing_tools(self, ctx: Context) -> list[str]:
         return [tool for tool in REQUIRED_TOOLS if not ctx.which(tool)]
 
-    def _next_action(self, ctx: Context) -> str:
+    def _get_next_action(self, ctx: Context) -> str:
         """Return what the person has to do now: the install line of each missing tool, else sign in to gh."""
         if missing := self._find_missing_tools(ctx):
-            key = _platform_key(ctx.platform)
+            key = _get_platform_key(ctx.platform)
             lines = [f"{tool}: {_INSTALL_COMMANDS[tool][key]}" for tool in missing]
             return f"install {'; '.join(lines)}, then run this again"
         return "run `gh auth login`, then run this again"
 
     def check(self, ctx: Context) -> Check:
         if missing := self._find_missing_tools(ctx):
-            return Check(False, f"not on PATH: {', '.join(missing)}; {self._next_action(ctx)}")
-        if not ctx.github.authenticated():
-            return Check(False, f"gh is not signed in; {self._next_action(ctx)}")
+            return Check(False, f"not on PATH: {', '.join(missing)}; {self._get_next_action(ctx)}")
+        if not ctx.github.is_authenticated():
+            return Check(False, f"gh is not signed in; {self._get_next_action(ctx)}")
         return Check(True, "git, ssh-keygen, gh (signed in), uv")
 
     def plan(self, ctx: Context) -> str:
-        return f"ask you to {self._next_action(ctx)}"
+        return f"ask you to {self._get_next_action(ctx)}"
 
     def do(self, ctx: Context) -> Outcome:
-        return Outcome(BLOCKED, self._next_action(ctx))
+        return Outcome(BLOCKED, self._get_next_action(ctx))
 
 
 class SignInStep:
@@ -166,7 +166,7 @@ class SignInStep:
     advisory = False
 
     def check(self, ctx: Context) -> Check:
-        found = ctx.flyte.config_endpoint()
+        found = ctx.flyte.get_config_endpoint()
         if found is None:
             return Check(False, f"no Flyte config at {ctx.flyte.config_path}")
         if normalise_endpoint(found) != ctx.settings.endpoint:
@@ -183,7 +183,7 @@ class SignInStep:
         return f"write {ctx.flyte.config_path} and open the browser sign-in for {ctx.settings.endpoint}"
 
     def do(self, ctx: Context) -> Outcome:
-        found = ctx.flyte.config_endpoint()
+        found = ctx.flyte.get_config_endpoint()
         if found is None:
             ctx.flyte.create_config()
         elif normalise_endpoint(found) != ctx.settings.endpoint:
@@ -203,7 +203,7 @@ class ProjectStep:
     advisory = False
 
     def check(self, ctx: Context) -> Check:
-        found = ctx.flyte.project_exists()
+        found = ctx.flyte.has_project()
         return Check(found, f"project {ctx.settings.project}" + ("" if found else " does not exist"))
 
     def plan(self, ctx: Context) -> str:
@@ -233,7 +233,7 @@ class WorkspaceStep:
         )
 
     def check(self, ctx: Context) -> Check:
-        visibility = ctx.github.repo_visibility(ctx.settings.workspace)
+        visibility = ctx.github.get_repo_visibility(ctx.settings.workspace)
         if visibility is None:
             return Check(False, ctx.settings.workspace + " does not exist")
         if visibility == "public":
@@ -244,7 +244,7 @@ class WorkspaceStep:
         return f"create the private repository {ctx.settings.workspace}"
 
     def do(self, ctx: Context) -> Outcome:
-        visibility = ctx.github.repo_visibility(ctx.settings.workspace)
+        visibility = ctx.github.get_repo_visibility(ctx.settings.workspace)
         if visibility is not None:  # the check failed because it is public
             return Outcome(BLOCKED, self._describe_public_problem(ctx, visibility))
         ctx.github.create_repo(ctx.settings.workspace)
@@ -270,7 +270,7 @@ class TemplateStep:
         """Why `--dir` cannot be used: another repository's checkout, or a directory of somebody's files."""
         clone, workspace = ctx.settings.clone, ctx.settings.workspace
         if (clone / ".git").exists():
-            if not ctx.github.clone_origin_is(clone, workspace):
+            if not ctx.github.has_clone_origin(clone, workspace):
                 return f"{clone} is not a clone of {workspace} (check its `origin`); pick another --dir"
         elif not self._needs_clone(ctx):
             return (
@@ -311,8 +311,8 @@ class TemplateStep:
         try:
             if not (clone / "profile.example.toml").is_file():
                 _workspace.create(clone, commit=True)
-            elif _workspace.git(
-                clone, "status", "--porcelain", "--", *self._list_template_paths(), placeholder_identity=False
+            elif _workspace.run_git(
+                clone, "status", "--porcelain", "--", *self._list_template_paths(), neutral_identity=False
             ).strip():
                 commit_paths(clone, self._list_template_paths(), "Workspace from template")
             self._name_the_owner(ctx)
@@ -336,8 +336,8 @@ class TemplateStep:
         # A bare @org is not a valid code owner (only users and @org/team are), so an organization's
         # workspace names the person running setup.
         owner = ctx.settings.owner
-        if ctx.github.owner_is_org(owner):
-            owner = ctx.github.viewer_login()
+        if ctx.github.is_owner_an_org(owner):
+            owner = ctx.github.get_viewer_login()
         path.write_text(_OWNER_PLACEHOLDER.sub(f"@{owner}", path.read_text()))
         commit_paths(clone, (_CODEOWNERS,), "CODEOWNERS: name the workspace owner")
 
@@ -354,9 +354,9 @@ class RulesetStep:
         if waiting := check_waiting_on_repository(ctx):
             return waiting
         try:
-            if not ctx.github.ruleset_exists(ctx.settings.workspace, RULESET_NAME):
+            if not ctx.github.has_ruleset(ctx.settings.workspace, RULESET_NAME):
                 return Check(False, f"{RULESET_NAME} does not exist")
-            has = ctx.github.ruleset_deploy_key_bypass(ctx.settings.workspace, RULESET_NAME)
+            has = ctx.github.has_ruleset_deploy_key_bypass(ctx.settings.workspace, RULESET_NAME)
         except NotAllowed:
             return Check(False, "cannot read rulesets on this repository")
         if has != want:
@@ -373,7 +373,7 @@ class RulesetStep:
     def do(self, ctx: Context) -> Outcome:
         repo, want = ctx.settings.workspace, ctx.settings.no_app
         try:
-            if ctx.github.ruleset_exists(repo, RULESET_NAME):
+            if ctx.github.has_ruleset(repo, RULESET_NAME):
                 ctx.github.update_ruleset(repo, RULESET_NAME, deploy_key_bypass=want)
                 return Outcome(
                     DONE, f"updated ruleset {RULESET_NAME}: deploy key bypass {'on' if want else 'off'}"
@@ -391,7 +391,7 @@ _KEY_DIR_PREFIX = ".agent-factory-key-"
 _KEY_DIR_OWNER = re.compile(rf"{re.escape(_KEY_DIR_PREFIX)}(\d+)-")
 
 
-def _process_is_alive(pid: int) -> bool:
+def _is_process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -411,7 +411,7 @@ def _remove_stale_key_dirs(home: Path) -> None:
     """
     for path in home.glob(f"{_KEY_DIR_PREFIX}*"):
         owner = _KEY_DIR_OWNER.match(path.name)
-        if owner and _process_is_alive(int(owner[1])):
+        if owner and _is_process_alive(int(owner[1])):
             continue
         try:
             info = path.lstat()
@@ -427,8 +427,8 @@ class DeployKeyStep:
     advisory = False
 
     def _read_state(self, ctx: Context) -> tuple[bool, bool]:
-        secret = ctx.flyte.secret_exists(SECRET_DEPLOY_KEY)
-        key = DEPLOY_KEY_TITLE in ctx.github.deploy_key_titles(ctx.settings.workspace)
+        secret = ctx.flyte.has_secret(SECRET_DEPLOY_KEY)
+        key = DEPLOY_KEY_TITLE in ctx.github.list_deploy_key_titles(ctx.settings.workspace)
         return secret, key
 
     def check(self, ctx: Context) -> Check:
@@ -513,14 +513,14 @@ class EngineTokenStep:
         return [SECRET_CLAUDE] + ([SECRET_CODEX_LOGIN] if ctx.settings.engine == "codex" else [])
 
     def check(self, ctx: Context) -> Check:
-        missing = [n for n in self._list_secret_names(ctx) if not ctx.flyte.secret_exists(n)]
+        missing = [n for n in self._list_secret_names(ctx) if not ctx.flyte.has_secret(n)]
         return Check(not missing, f"secret {', '.join(missing)} missing" if missing else "secrets present")
 
     def plan(self, ctx: Context) -> str:
         return f"ask for your `claude setup-token` token (hidden) and store it as secret {SECRET_CLAUDE}"
 
     def do(self, ctx: Context) -> Outcome:
-        if not ctx.flyte.secret_exists(SECRET_CLAUDE):
+        if not ctx.flyte.has_secret(SECRET_CLAUDE):
             try:
                 token = ctx.ask_secret(
                     "Paste the token `claude setup-token` printed (input is hidden; Enter to do it later): "
@@ -534,7 +534,7 @@ class EngineTokenStep:
                     "at the prompt (it goes straight into Flyte and is never shown)",
                 )
             ctx.flyte.create_secret(SECRET_CLAUDE, token)
-        if ctx.settings.engine == "codex" and not ctx.flyte.secret_exists(SECRET_CODEX_LOGIN):
+        if ctx.settings.engine == "codex" and not ctx.flyte.has_secret(SECRET_CODEX_LOGIN):
             return Outcome(
                 TODO,
                 f"create the Codex login secret {SECRET_CODEX_LOGIN} (sign in to ChatGPT when asked; the "
@@ -556,7 +556,7 @@ class BoardStep:
         if waiting := check_waiting_on_repository(ctx):
             return waiting
         try:
-            found = ctx.github.board_linked(ctx.settings.workspace)
+            found = ctx.github.is_board_linked(ctx.settings.workspace)
         except NotAllowed:
             return Check(False, "cannot read boards: run `gh auth refresh -s project`")
         return Check(

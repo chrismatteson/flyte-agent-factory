@@ -17,6 +17,7 @@ from flyte_agent_factory._bootstrap_base import (
     AccessDenied,
     BootstrapError,
     KeyExists,
+    NotSignedIn,
     Outcome,
     Settings,
 )
@@ -361,6 +362,37 @@ def test_a_step_that_raises_a_subprocess_error_prints_its_class_not_its_command_
     outcome = _bootstrap._guard("step", call)
     assert isinstance(outcome, Outcome)
     assert KEY_SECRET not in outcome.detail and "TimeoutExpired" in outcome.detail
+
+
+def _sign_in_message(**kwargs) -> str:
+    def call():
+        raise NotSignedIn("not signed in")
+
+    outcome = _bootstrap._guard("step", call, **kwargs)
+    assert isinstance(outcome, Outcome)
+    return outcome.detail
+
+
+def test_the_sign_in_message_of_a_key_mode_or_a_normal_run_names_no_read_only_flag():
+    detail = _sign_in_message(read_only=False)  # a key mode and a normal run: neither can pass the flags
+    assert "browser sign-in" in detail and "run it again" in detail
+    assert "--status" not in detail and "--dry-run" not in detail
+
+
+def test_the_sign_in_message_of_a_read_only_run_says_to_leave_the_flag_off():
+    detail = _sign_in_message(read_only=True)
+    assert "without --status or --dry-run" in detail and "browser sign-in" in detail
+
+
+def test_a_status_run_before_any_sign_in_prints_the_read_only_sign_in_message(world, capsys):
+    (world.root / "flyte-config.yaml").unlink()
+    out: list[str] = []
+    code = _bootstrap.main(
+        [*ARGS, "--dir", str(world.root / "clone"), "--status"],
+        make_context=lambda settings: make_context(world, settings, out),
+    )
+    assert code == 3
+    assert any("sign in first: run it again without --status or --dry-run" in line for line in out), out
 
 
 def test_a_broader_existing_policy_stops_before_a_key_is_made(world, capsys):

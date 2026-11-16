@@ -28,14 +28,17 @@ chat changes nothing it already settled.
 2. **Rebuild state from live sources.** `factory.queue_list`, then `factory.status` for each live project; open
    pull requests and their CI on the workspace and engine repos (the repos named in the server instructions); the
    newest `factory-deployer.deploy_if_changed` run. Add the workspace's `operator/STATE.md` for what live sources
-   cannot tell: direction, authorizations, plans. Where they disagree, live sources win.
+   cannot tell: direction, authorizations, plans. Where they disagree, live sources win. Read STATE.md only at the
+   location the server instructions declare (see Operator state); if it is absent there, or a STATE.md you read
+   elsewhere (named by an older skill or a note) is not that one, say so in the first reply and do not operate on it.
 3. **Record this chat as the operator** in STATE.md (see Operator state). Create the file if it is absent, with the
    GitHub file tools.
 4. **Schedule this chat's own check-in**: a recurring "Factory check-in" every 30 to 60 minutes, unless this chat
    already has one. Where the client has no scheduled tasks, say that check-ins are unavailable in this client.
    A check-in does what Taking over steps 2 and 6 do, acts on routine items (see Engineering judgement) and writes
    only what changed.
-5. **Check this skill is current.** The last line of this skill is `Skill version: <digest>`. Read the engine's
+5. **Check this skill is current.** A skill with no `Skill version: <digest>` line is stale: tell the person to
+   replace it. Otherwise that line is the last of this skill. Read the engine's
    published `skills/dist/VERSION` (GitHub file tools or a web fetch of
    https://raw.githubusercontent.com/unionai-oss/flyte-agent-factory/main/skills/dist/VERSION). If the digests
    differ, tell the person to download the skills again and re-save them
@@ -51,7 +54,9 @@ chat changes nothing it already settled.
 ## Operator state
 
 The operator keeps one file in the person's workspace repo, `operator/STATE.md`, so a new chat can take over without
-the old one. It holds:
+the old one. The server instructions' operator paragraph names that repo and the repositories the operator writes
+to. They are the operator's declared write targets (STATE.md, issues, PR branches), so at takeover request write
+access to exactly those repos, and say plainly that this is why. It holds:
 
 - the person's standing direction, quoted, not paraphrased;
 - merges the person has authorized and the conditions on them;
@@ -67,9 +72,10 @@ use a branch and a pull request, and say so.
 ## Where the factory's values come from
 
 This skill holds no deployment values. On connect the factory MCP server instructions name the Flyte project, the
-domain and the allowed repositories, and `list_projects` returns only the factory's project. Read them there and pass
-`project` and `domain` on every MCP call below. The default project repo and the allowed chat repos are in the same
-instructions. The intake label is the profile's `[github] intake_label`.
+domain, the allowed repositories and the operator state file, and `list_projects` returns only the factory's project.
+Read them there and pass `project` and `domain` on every MCP call below. The default project repo, the repos the
+operator writes to and the location of STATE.md are in the same instructions, rendered from the deployed profile, and
+they win over anything a note or an older copy of this skill says. The intake label is the profile's `[github] intake_label`.
 
 ## Your role: the operator
 

@@ -72,19 +72,19 @@ def test_any_other_failure_is_a_bootstrap_error_with_the_exit_code_and_the_end_o
 @pytest.mark.parametrize(("answer", "expected"), [("Organization\n", True), ("User\n", False)])
 def test_the_owner_is_an_org_when_github_says_so(answer, expected):
     gh, calls = scripted(answer)
-    assert gh.owner_is_org("acme") is expected
+    assert gh.is_owner_an_org("acme") is expected
     assert calls == [["api", "users/acme", "--jq", ".type"]]
 
 
 def test_the_viewer_login_is_stripped():
     gh, calls = scripted("pat\n")
-    assert gh.viewer_login() == "pat"
+    assert gh.get_viewer_login() == "pat"
     assert calls == [["api", "user", "--jq", ".login"]]
 
 
 def test_the_visibility_is_lowercased():
     gh, _ = scripted("PRIVATE\n")
-    assert gh.repo_visibility("pat/ws") == "private"
+    assert gh.get_repo_visibility("pat/ws") == "private"
 
 
 # --- repositories ----------------------------------------------------------------------------------------
@@ -129,14 +129,14 @@ LISTING = json.dumps([{"id": 7, "name": "main-rules"}, {"name": "no-id"}])
 @pytest.mark.parametrize(("name", "expected"), [("main-rules", True), ("other", False), ("no-id", False)])
 def test_ruleset_exists_looks_the_name_up_in_the_listing(name, expected):
     gh, calls = scripted(LISTING)
-    assert gh.ruleset_exists(CHECKOUT_REPO, name) is expected
+    assert gh.has_ruleset(CHECKOUT_REPO, name) is expected
     assert calls == [["api", "repos/pat/ws/rulesets"]]
 
 
 def test_a_ruleset_that_is_not_there_cannot_be_inspected_or_updated():
     gh, _ = scripted(LISTING)
     with pytest.raises(BootstrapError, match="ruleset nope does not exist on pat/ws"):
-        gh.ruleset_deploy_key_bypass(CHECKOUT_REPO, "nope")
+        gh.has_ruleset_deploy_key_bypass(CHECKOUT_REPO, "nope")
     gh, calls = scripted(LISTING)
     with pytest.raises(BootstrapError, match="ruleset nope does not exist on pat/ws"):
         gh.update_ruleset(CHECKOUT_REPO, "nope", deploy_key_bypass=True)
@@ -148,10 +148,10 @@ def test_a_ruleset_that_is_not_there_cannot_be_inspected_or_updated():
 
 def test_deploy_key_titles_lists_the_titles_and_tolerates_an_empty_answer():
     gh, calls = scripted(json.dumps([{"title": "a"}, {"id": 2}]))
-    assert gh.deploy_key_titles(CHECKOUT_REPO) == ["a", ""]
+    assert gh.list_deploy_key_titles(CHECKOUT_REPO) == ["a", ""]
     assert calls == [["api", "repos/pat/ws/keys"]]
     gh, _ = scripted("")
-    assert gh.deploy_key_titles(CHECKOUT_REPO) == []
+    assert gh.list_deploy_key_titles(CHECKOUT_REPO) == []
 
 
 def test_add_deploy_key_gives_gh_the_public_key_file_with_write_access():
@@ -185,7 +185,7 @@ def _count(n: int) -> str:
 @pytest.mark.parametrize(("count", "expected"), [(0, False), (1, True)])
 def test_board_linked_reads_the_projects_count(count, expected):
     gh, calls = scripted(_count(count))
-    assert gh.board_linked(CHECKOUT_REPO) is expected
+    assert gh.is_board_linked(CHECKOUT_REPO) is expected
     assert calls[0][:3] == ["api", "graphql", "-f"] and "o=pat" in calls[0] and "n=ws" in calls[0]
 
 
@@ -193,7 +193,7 @@ def test_board_linked_reads_the_projects_count(count, expected):
 def test_board_linked_names_an_answer_it_cannot_read(answer):
     gh, _ = scripted(answer)
     with pytest.raises(BootstrapError, match="unexpected answer to the board query"):
-        gh.board_linked(CHECKOUT_REPO)
+        gh.is_board_linked(CHECKOUT_REPO)
 
 
 def test_create_board_makes_and_links_a_board_when_none_has_the_title():
@@ -217,10 +217,10 @@ def test_a_board_without_a_number_is_an_error_and_is_not_linked(made):
 
 def test_app_installations_lists_the_slugs():
     gh, calls = scripted('["a", "b"]')
-    assert gh.app_installations("acme") == ["a", "b"]
+    assert gh.list_app_installations("acme") == ["a", "b"]
     assert calls == [["api", "orgs/acme/installations", "--jq", "[.installations[].app_slug]"]]
     gh, _ = scripted("")
-    assert gh.app_installations("acme") == []
+    assert gh.list_app_installations("acme") == []
 
 
 @pytest.mark.parametrize("code", ["", "a b", "../x", "x" * 101])
@@ -273,19 +273,19 @@ REGISTRATION = AppRegistration("42", "agent-factory-pat", "KEY")
 
 
 def test_the_app_is_installed_when_it_can_get_an_installation_token(fake_app):
-    assert GhCli().app_installed(REGISTRATION, CHECKOUT_REPO) is True
+    assert GhCli().is_app_installed(REGISTRATION, CHECKOUT_REPO) is True
     assert fake_app.asked == [("42", "KEY", "pat/ws")]
 
 
 def test_the_app_is_not_installed_when_github_has_no_installation_for_it(fake_app):
     fake_app.error = _github.GithubError("not found", status=404)
-    assert GhCli().app_installed(REGISTRATION, CHECKOUT_REPO) is False
+    assert GhCli().is_app_installed(REGISTRATION, CHECKOUT_REPO) is False
 
 
 def test_any_other_failure_to_get_a_token_is_an_error_not_a_no(fake_app):
     fake_app.error = _github.GithubError("bad credentials", status=401)
     with pytest.raises(BootstrapError, match="checking the App installation failed: bad credentials"):
-        GhCli().app_installed(REGISTRATION, CHECKOUT_REPO)
+        GhCli().is_app_installed(REGISTRATION, CHECKOUT_REPO)
 
 
 def test_register_app_runs_the_flow_for_the_owner_kind_gh_reports(monkeypatch):

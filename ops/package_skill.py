@@ -16,6 +16,13 @@ DIST = SKILLS / "dist"
 VERSION_LINE = re.compile(r"^Skill version: ([0-9a-f]{12})$", re.MULTILINE)
 # A fixed timestamp keeps the zips byte-identical between builds; the committed copy is compared in CI.
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+#: Left behind by Finder, Explorer and archive tools; never part of a skill, so never drift.
+LITTER_NAMES = {".DS_Store", "Thumbs.db", "__MACOSX"}
+
+
+def is_litter(relative: str) -> bool:
+    """Return whether a path inside the skill or zip is an OS metadata file or folder."""
+    return any(part in LITTER_NAMES or part.startswith("._") for part in relative.split("/"))
 
 
 def list_skill_names() -> list[str]:
@@ -79,11 +86,20 @@ def build(dist: Path = DIST) -> list[Path]:
     return written
 
 
+def is_lone_skill_md(path: Path) -> bool:
+    """Return whether a SKILL.md sits in a folder that is not named for a skill, such as Downloads.
+
+    Only the name marks a skill directory: any folder may hold a `references/` of its own. A renamed copy is
+    checked whole by passing its directory instead.
+    """
+    return path.is_file() and not zipfile.is_zipfile(path) and path.parent.name not in list_skill_names()
+
+
 def read_installed(path: Path) -> tuple[str, dict[str, bytes]]:
     """Return the name and files (by path inside the skill) of an installed zip, directory or SKILL.md."""
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
-            entries = [n for n in archive.namelist() if not n.endswith("/")]
+            entries = [n for n in archive.namelist() if not n.endswith("/") and not is_litter(n)]
             # Without a top-level directory the skill's name is unknown: "" says so to `check`.
             top = entries[0].split("/")[0] if entries and "/" in entries[0] else ""
             files = {n.split("/", 1)[-1] if top else n: archive.read(n) for n in entries}
@@ -93,10 +109,17 @@ def read_installed(path: Path) -> tuple[str, dict[str, bytes]]:
     # The file given is the skill's SKILL.md whatever its name, read as text so a binary file is an error.
     skill_md = path if path.is_file() else directory / "SKILL.md"
     files = {"SKILL.md": skill_md.read_text(encoding="utf-8").encode()}
-    # Every file, not only references/: one the build does not make is drift, and `check` reports it.
-    for file in directory.rglob("*"):
-        if file.is_file() and file != skill_md and "__pycache__" not in file.parts:
-            files[file.relative_to(directory).as_posix()] = file.read_bytes()
+    # Every file, not only references/: one the build does not make is drift, and `check` reports it. A
+    # SKILL.md alone in some folder (Downloads) is not a skill directory: its neighbours are not part of it.
+    for file in [] if is_lone_skill_md(path) else directory.rglob("*"):
+        relative = file.relative_to(directory).as_posix()
+        if (
+            file.is_file()
+            and file != skill_md
+            and "__pycache__" not in file.parts
+            and not is_litter(relative)
+        ):
+            files[relative] = file.read_bytes()
     if directory.name in list_skill_names():
         return directory.name, files
     front = re.search(r"^name: *(\S+)", files["SKILL.md"].decode(), re.MULTILINE)
@@ -120,8 +143,14 @@ def check(path: Path) -> int:
     if not name:
         print("unknown: SKILL.md is not inside a <skill name>/ directory")
         return 2
-    match = VERSION_LINE.search(installed_files.get("SKILL.md", b"").decode(errors="replace"))
+    text = installed_files.get("SKILL.md", b"").decode(errors="replace")
+    match = VERSION_LINE.search(text)
     if match is None:
+        # A copy that names one of our skills is an old one (from before versions); anything else is not ours.
+        front = re.search(r"^name: *(\S+)", text, re.MULTILINE)
+        if front and front[1] in list_skill_names():
+            print("stale: SKILL.md predates versioned skills (no Skill version line); replace it")
+            return 1
         print("unknown: no Skill version line")
         return 2
     installed, source = match[1], compute_source_digest()
@@ -131,7 +160,8 @@ def check(path: Path) -> int:
     # A current version line can still sit on edited files, so compare content, not the container: a zip
     # re-saved with other compression or entry order is the same skill.
     fresh = build_files(name, source) if name in list_skill_names() else {}
-    for relative in sorted(fresh.keys() | installed_files.keys()):
+    wanted = {"SKILL.md"} if is_lone_skill_md(path) else fresh.keys() | installed_files.keys()
+    for relative in sorted(wanted):
         if fresh.get(relative) != installed_files.get(relative):
             # A zip is named as a whole (the file the person holds), with the path found after it.
             if zipfile.is_zipfile(path):

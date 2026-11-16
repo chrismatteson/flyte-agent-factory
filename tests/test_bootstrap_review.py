@@ -247,7 +247,11 @@ def test_a_gh_command_that_hangs_ends_as_a_clear_error():
         raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
 
     gh = _bootstrap_github.GhCli(run=hang)
-    for call in (gh.authenticated, lambda: gh.repo_visibility("pat/ws"), lambda: gh.app_exists("pat", "s")):
+    for call in (
+        gh.is_authenticated,
+        lambda: gh.get_repo_visibility("pat/ws"),
+        lambda: gh.has_app("pat", "s"),
+    ):
         with pytest.raises(BootstrapError, match="did not answer within"):
             call()
 
@@ -431,7 +435,7 @@ def test_a_reply_gh_gives_that_is_not_json_is_a_bootstrap_error():
         run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="<html>proxy</html>", stderr="")
     )
     with pytest.raises(BootstrapError, match="other than JSON"):
-        gh.deploy_key_titles("pat/ws")
+        gh.list_deploy_key_titles("pat/ws")
     with pytest.raises(BootstrapError):
         gh.exchange_manifest_code("abc")
 

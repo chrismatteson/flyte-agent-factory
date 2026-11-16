@@ -47,7 +47,7 @@ from pathlib import Path
 from ._bridge import find_credential_shape
 from ._grants import TOKEN_ENV, URL_ENV
 from ._secret_env import GIT_NO_DRIVERS
-from ._workspace import build_entry_command, git
+from ._workspace import build_entry_command, run_git
 
 # A push URL that starts with one of these is rewritten to the refused directory. "." covers "./" and "../".
 #: `git@` is the scp-style form GitHub hands out (`git@github.com:org/repo.git`), the one real remotes use.
@@ -86,11 +86,11 @@ def install(
     that changes `.github/workflows/`, which GitHub would reject anyway, with the reason. `None` (a deploy
     key, which has no such limit) leaves the hook as it always was.
     """
-    git(checkout, "config", "remote.pushDefault", remote)
-    if remote in git(checkout, "remote").split():
-        git(checkout, "remote", "set-url", remote, workspace_url)
+    run_git(checkout, "config", "remote.pushDefault", remote)
+    if remote in run_git(checkout, "remote").split():
+        run_git(checkout, "remote", "set-url", remote, workspace_url)
     else:
-        git(checkout, "remote", "add", remote, workspace_url)
+        run_git(checkout, "remote", "add", remote, workspace_url)
     hook = _git_path(checkout, "hooks/pre-push")
     _refuse_other_push_urls(checkout, workspace_url, _git_path(checkout, _REFUSED_DIR))
     hook.parent.mkdir(parents=True, exist_ok=True)
@@ -105,17 +105,17 @@ def install(
 
 
 def _git_path(checkout: Path, name: str) -> Path:
-    path = Path(git(checkout, "rev-parse", "--git-path", name).strip())
+    path = Path(run_git(checkout, "rev-parse", "--git-path", name).strip())
     return path if path.is_absolute() else checkout / path
 
 
 def _refuse_other_push_urls(checkout: Path, workspace_url: str, refused_dir: Path) -> None:
     # `--replace-all` on the first value of each key keeps a second `install` from stacking duplicates.
     refused = f"url.{refused_dir}/.pushInsteadOf"
-    git(checkout, "config", "--replace-all", refused, _REFUSED_PREFIXES[0])
+    run_git(checkout, "config", "--replace-all", refused, _REFUSED_PREFIXES[0])
     for prefix in _REFUSED_PREFIXES[1:]:
-        git(checkout, "config", "--add", refused, prefix)
-    git(checkout, "config", "--replace-all", f"url.{workspace_url}.pushInsteadOf", workspace_url)
+        run_git(checkout, "config", "--add", refused, prefix)
+    run_git(checkout, "config", "--replace-all", f"url.{workspace_url}.pushInsteadOf", workspace_url)
 
 
 class _Unscannable(Exception):
