@@ -34,7 +34,7 @@ def run(world, *extra, missing=(), platform="linux", signed_in=True):
         ctx.which = lambda name: None if name in missing else f"/usr/bin/{name}"
         ctx.platform = platform
         if not signed_in:
-            ctx.github.authenticated = lambda: False  # type: ignore[method-assign]
+            ctx.github.is_authenticated = lambda: False  # type: ignore[method-assign]
         return ctx
 
     code = _bootstrap.main([*ARGS, "--dir", str(world.root / "clone"), *extra], make_context=make)

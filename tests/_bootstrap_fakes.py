@@ -42,9 +42,9 @@ class World:
         self.rulesets: dict[str, bool] = {}  # name -> whether the DeployKey may bypass it
         self.ruleset_forbidden = False
         self.deploy_keys: dict[str, str] = {}
-        self.board_linked = False
+        self.is_board_linked = False
         self.board_scope_missing = False
-        self.app_installed = True
+        self.is_app_installed = True
         self.projects: set[str] = set()
         self.secrets: dict[str, str] = {}
         self.signed_in = False
@@ -90,7 +90,7 @@ class FakeGitHub:
     def __init__(self, world: World) -> None:
         self.w = world
 
-    def authenticated(self) -> bool:
+    def is_authenticated(self) -> bool:
         return True
 
     def _need_repo(self, repo: str) -> None:
@@ -100,19 +100,19 @@ class FakeGitHub:
                 f"gh api graphql failed (1): Could not resolve to a Repository with the name {repo!r}"
             )
 
-    def owner_is_org(self, owner: str) -> bool:
+    def is_owner_an_org(self, owner: str) -> bool:
         return self.w.org
 
-    def viewer_login(self) -> str:
+    def get_viewer_login(self) -> str:
         return self.w.login
 
-    def repo_visibility(self, repo: str) -> str | None:
+    def get_repo_visibility(self, repo: str) -> str | None:
         if repo not in self.w.repos:
             return None
         return self.w.visibility.get(repo, "private")
 
-    def clone_origin_is(self, checkout: Path, repo: str) -> bool:
-        url = _workspace.git(checkout, "config", "--get", "remote.origin.url", placeholder_identity=False)
+    def has_clone_origin(self, checkout: Path, repo: str) -> bool:
+        url = _workspace.run_git(checkout, "config", "--get", "remote.origin.url", neutral_identity=False)
         return Path(url.strip()) == self.w.bare(repo)
 
     def create_repo(self, repo: str) -> None:
@@ -128,12 +128,12 @@ class FakeGitHub:
 
     def push(self, checkout: Path) -> None:
         self.w.change("push")
-        _workspace.git(checkout, "push", "-q", "-u", "origin", "HEAD", placeholder_identity=False)
+        _workspace.run_git(checkout, "push", "-q", "-u", "origin", "HEAD", neutral_identity=False)
 
-    def ruleset_exists(self, repo: str, name: str) -> bool:
+    def has_ruleset(self, repo: str, name: str) -> bool:
         return name in self.w.rulesets
 
-    def ruleset_deploy_key_bypass(self, repo: str, name: str) -> bool:
+    def has_ruleset_deploy_key_bypass(self, repo: str, name: str) -> bool:
         return self.w.rulesets[name]
 
     def create_ruleset(self, repo: str, name: str, deploy_key_bypass: bool = False) -> None:
@@ -148,7 +148,7 @@ class FakeGitHub:
         self.w.change(f"update_ruleset {name}")
         self.w.rulesets[name] = deploy_key_bypass
 
-    def deploy_key_titles(self, repo: str) -> list[str]:
+    def list_deploy_key_titles(self, repo: str) -> list[str]:
         self._need_repo(repo)
         return list(self.w.deploy_keys)
 
@@ -162,20 +162,20 @@ class FakeGitHub:
         self.w.change(f"delete_deploy_key {title}")
         self.w.deploy_keys.pop(title, None)
 
-    def board_linked(self, repo: str) -> bool:
+    def is_board_linked(self, repo: str) -> bool:
         self._need_repo(repo)
         if self.w.board_scope_missing:
             raise NotAllowed("missing scope project")
-        return self.w.board_linked
+        return self.w.is_board_linked
 
     def create_board(self, owner: str, repo: str, title: str) -> str:
         if self.w.board_scope_missing:
             raise NotAllowed("missing scope project")
         self.w.change(f"create_board {title}")
-        self.w.board_linked = True
+        self.w.is_board_linked = True
         return f"https://github.com/users/{owner}/projects/1"
 
-    def app_installations(self, owner: str) -> list[str]:
+    def list_app_installations(self, owner: str) -> list[str]:
         return list(self.w.installations)
 
     def register_app(self, owner: str, repo: str, say) -> str:
@@ -190,11 +190,11 @@ class FakeGitHub:
         self.w.change("exchange_manifest_code")
         return AppRegistration(app_id=self.w.apps[self.w.app_slug], slug=self.w.app_slug, pem=APP_PEM)
 
-    def app_exists(self, owner: str, slug: str) -> bool:
+    def has_app(self, owner: str, slug: str) -> bool:
         return slug in self.w.apps
 
-    def app_installed(self, registration: AppRegistration, repo: str) -> bool:
-        return self.w.app_installed
+    def is_app_installed(self, registration: AppRegistration, repo: str) -> bool:
+        return self.w.is_app_installed
 
 
 class FakeFlyte:
@@ -203,7 +203,7 @@ class FakeFlyte:
         self.s = settings
         self.config_path = world.root / "flyte-config.yaml"
 
-    def config_endpoint(self) -> str | None:
+    def get_config_endpoint(self) -> str | None:
         if not self.config_path.exists():
             return None
         return self.config_path.read_text().split("endpoint:")[1].strip()
@@ -224,7 +224,7 @@ class FakeFlyte:
         if not self.config_path.exists():
             raise NotSignedIn(f"no Flyte config at {self.config_path}: sign in first")
 
-    def project_exists(self) -> bool:
+    def has_project(self) -> bool:
         self._init()
         return self.s.project in self.w.projects
 
@@ -233,7 +233,7 @@ class FakeFlyte:
         self.w.change(f"create_project {self.s.project}")
         self.w.projects.add(self.s.project)
 
-    def secret_exists(self, name: str) -> bool:
+    def has_secret(self, name: str) -> bool:
         self._init()
         return name in self.w.secrets
 
@@ -245,11 +245,11 @@ class FakeFlyte:
         self.w.change(f"create_secret {name}")
         self.w.secrets[name] = value
 
-    def factory_registered(self) -> bool:
+    def is_factory_registered(self) -> bool:
         self._init()
         return self.w.registered
 
-    def factory_mcp_url(self) -> str | None:
+    def get_factory_mcp_url(self) -> str | None:
         self._init()
         return self.w.mcp_url
 

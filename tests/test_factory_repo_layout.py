@@ -444,3 +444,17 @@ def test_an_uppercase_git_suffix_is_the_same_repository():
     from flyte_agent_factory import _git
 
     assert _git.project_layout("https://github.com/o/r.GIT", "git@github.com:o/r.git") == "sandbox"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "git@example.org:team/work-sandbox.git",
+        "git@example.org:team/work-sandbox",
+        "https://example.org/team/work-sandbox.git",
+        "https://example.org/team/work-sandbox/",
+        "ssh://git@example.org:22/team/work-sandbox.git",
+    ],
+)
+def test_repo_slug_is_owner_and_name_for_ssh_and_https_urls(url):
+    assert _git.get_repo_slug(url) == "team/work-sandbox"

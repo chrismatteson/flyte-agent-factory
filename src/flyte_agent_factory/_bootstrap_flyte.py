@@ -44,7 +44,7 @@ def _is_not_found(exc: ConnectError) -> bool:
     return exc.code == Code.NOT_FOUND
 
 
-def _union_plugin_present() -> bool:
+def _is_union_plugin_present() -> bool:
     """Return whether the Union plugin that makes API keys is installed."""
     try:
         return importlib.util.find_spec("flyteplugins.union.remote") is not None
@@ -78,7 +78,7 @@ class FlyteSdk:
         self.config_path = config_path or Path("~/.flyte/config.yaml").expanduser()
         self._ready = False
 
-    def config_endpoint(self) -> str | None:
+    def get_config_endpoint(self) -> str | None:
         try:
             text = self.config_path.read_text()
         except OSError:
@@ -122,7 +122,7 @@ class FlyteSdk:
         auth_type = re.search(r"^\s*authType:\s*(\S+)", text, re.MULTILINE)
         if auth_type and auth_type[1].strip("\"'") not in ("Pkce", "DeviceFlow"):
             return True
-        return KeyringStore.retrieve(self.config_endpoint() or "") is not None
+        return KeyringStore.retrieve(self.get_config_endpoint() or "") is not None
 
     def _init(self) -> None:
         if not self._ready:
@@ -149,7 +149,7 @@ class FlyteSdk:
         # `Project.listall` takes no `limit` (the SDK's signature): one page is enough to prove the sign-in.
         next(iter(remote.Project.listall()), None)
 
-    def project_exists(self) -> bool:
+    def has_project(self) -> bool:
         from flyte import remote
 
         self._init()
@@ -167,7 +167,7 @@ class FlyteSdk:
         self._init()
         remote.Project.create(id=self._settings.project, name=self._settings.project)
 
-    def secret_exists(self, name: str) -> bool:
+    def has_secret(self, name: str) -> bool:
         from flyte import remote
 
         self._init()
@@ -189,13 +189,13 @@ class FlyteSdk:
             # The class only: the SDK's message may quote the request.
             raise BootstrapError(f"creating secret {name} failed: {type(exc).__name__}") from None
 
-    def factory_registered(self) -> bool:
+    def is_factory_registered(self) -> bool:
         from flyte import remote
 
         self._init()
         return next(iter(remote.Task.listall(by_task_name="factory.launch", limit=1)), None) is not None
 
-    def factory_mcp_url(self) -> str | None:
+    def get_factory_mcp_url(self) -> str | None:
         from flyte import remote
 
         self._init()
@@ -207,7 +207,7 @@ class FlyteSdk:
             raise
 
     def can_manage_keys(self) -> bool:
-        return _union_plugin_present()
+        return _is_union_plugin_present()
 
     def create_api_key(self, name: str) -> IssuedKey:
         self._init()

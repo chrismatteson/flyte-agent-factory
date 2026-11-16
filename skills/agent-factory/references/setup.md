@@ -73,6 +73,12 @@ Hand over ONE copy-paste command with the confirmed values filled in (use `--no-
 d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace
 ```
 
+**Recovery commands.** Every command you hand a person to resume or fix setup is that one line from the first-run
+block: the clone-and-sync prefix, `uv run python ops/bootstrap.py`, the identifying arguments, then the flag the case
+needs (`--status`, `--redeploy`, `--union-keys`, `--chat-key`, `--grant ...`). It runs from any directory, so never hand
+over a bare `ops/bootstrap.py ...` or a `cd` that assumes where they are. The commands the bootstrap itself prints are
+this line too.
+
 It is idempotent: each step checks live state first and is skipped when done, so a rerun after any interruption
 resumes. Optional flags: `--domain`, `--backend union|oss`, `--engine claude|codex`, `--no-app`, `--no-board`,
 `--dir <path to the workspace clone>`, `--redeploy`, `--dry-run`.  The deploy runs as the person's Flyte CLI login, so it needs no API key of its own. Its output is one line per step,
@@ -112,8 +118,8 @@ If they paste something that looks like one, tell them to rotate it.
 
 ## Resume from `--status`
 
-`ops/bootstrap.py --status` with the same identifying arguments is read-only and prints the step table. Ask them to
-paste it back (it has no secrets). Read it and continue at the first `todo` or `blocked` line; do not redo `done` or
+The first-run command with `--status` added (the same line and arguments, one flag more) is read-only and prints the
+step table. Ask them to paste it back (it has no secrets). Read it and continue at the first `todo` or `blocked` line; do not redo `done` or
 `skip` steps. The steps, in the command's order, are: `tools`, `workspace`, `template`, `profile`, `signin`, `project`,
 `union-keys`, `deploy-key`, `github-app`, `ruleset`, `board`, `engine-token`, `deploy`, `mcp-url`, `connect`. Distinguish
 absent from inaccessible; an auth or network failure is not evidence that something is missing. If you cannot inspect

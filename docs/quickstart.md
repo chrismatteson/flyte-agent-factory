@@ -31,7 +31,7 @@ credential. The GitHub App is the guided-setup default (read-only on code; pushe
 workspace is the only GitHub credential setup requires, with no CI visibility
 ([github-app.md](github-app.md), which also says why two GitHub credentials remain for now). claude.ai has no local shell, so it ends the conversation part with **one copy-paste command**
 with those values filled in, which you run on your machine (Claude Code runs it for you). That command,
-`ops/bootstrap.py` in an engine checkout, does the machine work and prompts locally for anything secret.
+`ops/bootstrap.py` in a clone of the engine repository, does the machine work and prompts locally for anything secret.
 
 The setup it performs, in the order a person thinks of it:
 
@@ -230,7 +230,7 @@ these agent credentials.
 
 You need `git`, OpenSSH (`ssh-keygen`), [uv](https://docs.astral.sh/uv/getting-started/installation/), and
 [Claude Code](https://docs.claude.com/en/docs/claude-code/setup). Check each before installing it with its official
-instructions. `gh` is optional. All subsequent shell blocks run locally in the engine checkout unless stated.
+instructions. `gh` is optional. All subsequent shell blocks run locally in that engine clone unless stated.
 The Union key and policy commands in step 5 need Linux x86_64; on macOS, run those on a Linux machine
 ([factory-mcp-setup.md](factory-mcp-setup.md#connecting-a-client) has the platform note).
 
@@ -277,7 +277,7 @@ uv run flyte --config ~/.flyte/config.yaml create project --id my-agents --name 
 
 If the public workspace template in step 1 was unavailable, this local fallback generates the workspace.
 **Skip it if your workspace already exists.** Create an empty GitHub repository `you/my-workspace` first
-(GitHub, New repository, empty, no README), then run from the engine checkout. This fallback uses `gh` with
+(GitHub, New repository, empty, no README), then run from the engine clone. This fallback uses `gh` with
 HTTPS authentication for your local push; the factory will use its separate SSH deploy key. Check
 `gh auth status`; if needed run `gh auth login` and choose GitHub.com, HTTPS and browser sign-in. Then run
 `gh auth setup-git` to configure git's credential helper.

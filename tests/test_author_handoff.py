@@ -1,6 +1,7 @@
 """Author engine transitions preserve the work item and use fresh conversations."""
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -1207,7 +1208,9 @@ os._exit(asyncio.run(main()))
         assert thread.count("AUTHOR HANDOFF") == 1 and thread.count("queued direction") == 1
     finally:
         if tool_pid is not None and _alive(tool_pid):
-            os.kill(tool_pid, signal.SIGKILL)
+            # The released tool can exit between the check and the kill.
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(tool_pid, signal.SIGKILL)
         for proc in (old, new):
             if proc is not None and proc.returncode is None:
                 proc.kill()

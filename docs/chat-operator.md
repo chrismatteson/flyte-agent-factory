@@ -113,11 +113,27 @@ uv run python ops/package_skill.py --check ~/.claude/skills/agent-factory
 `--check` takes an installed skill zip, its unzipped directory, or its `SKILL.md`, and compares every file.
 
 It prints `current` (exit 0), `stale: installed X, source Y` (exit 1), `stale: <file> differs from a fresh build of source Y` (a zip is named, then the file in brackets) for a skill whose
-files were edited under a current version line (exit 1), or `unknown: no Skill version line` (exit 2); it exits 0 only for `current`. The same comparison happens in chat: the skill's last
+files were edited under a current version line (exit 1), `stale: SKILL.md predates versioned skills ...` for a copy of one of our skills with no version line (exit 1), or `unknown: no Skill version line` for any other SKILL.md (exit 2); it exits 0 only for `current`. OS litter (`.DS_Store`, `._*`, `__MACOSX/`, `Thumbs.db`) is ignored, and a `SKILL.md` alone in a folder such as Downloads is compared by itself, not with its neighbours. The same comparison happens in chat: the skill's last
 line is `Skill version: <digest>`, and on takeover it checks that against the published `skills/dist/VERSION`.
 A change to a chat-facing skill file without repackaging fails the engine's tests.
 Both zips carry one digest, taken over every file of both skills: a change to either skill marks both zips stale,
 so update `agent-factory.zip` and `since.zip` together.
+
+### Where takeover finds your values
+
+The skill holds no deployment values, so it is the same file for everyone and needs no edit when your setup moves.
+The factory MCP server's instructions are rendered from the deployed profile and name the Flyte project and domain,
+the allowed repositories (the first is the default project repo), the operator state file (`operator/STATE.md` in
+the `[repo] project` workspace repo) and the repositories the operator chat writes to (STATE.md, issues, pull-request
+branches). Takeover reads STATE.md only there and requests write access to exactly those repositories. After a change
+to the profile's repositories, the next deploy of `factory-mcp` carries the new values to every chat; a STATE.md found
+anywhere else is reported in the first reply, not used.
+
+The instructions also carry the skill check against the published `skills/dist/VERSION`, so a copy saved before
+versioned skills (it has no `Skill version:` line) is told in its first reply to be replaced, even though its own text
+predates that step. To replace it, download
+`agent-factory.zip` and `since.zip` from `skills/dist`, upload them in Settings, Capabilities, Skills over the old
+ones, and confirm with `--check` above.
 
 ## Setup
 

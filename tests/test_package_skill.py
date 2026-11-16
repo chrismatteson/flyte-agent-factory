@@ -260,3 +260,81 @@ def test_running_the_script_exits_with_main_status(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         runpy.run_path(str(Path(package_skill.__file__)), run_name="__main__")
     assert exc.value.code == 2
+
+
+# --- the --check fixes: versionless copies, OS litter, a lone SKILL.md ---------------------------
+
+
+def test_check_a_versionless_skill_that_names_a_known_skill_predates_versioned_skills(tmp_path, capsys):
+    skill = tmp_path / "agent-factory" / "SKILL.md"
+    skill.parent.mkdir()
+    skill.write_text("---\nname: agent-factory\ndescription: old\n---\n\nold hand-edited copy\n")
+    assert package_skill.main(["--check", str(skill)]) == 1
+    out = capsys.readouterr().out
+    assert "predates versioned skills" in out and "replace" in out
+
+
+LITTER = [".DS_Store", "._SKILL.md", "Thumbs.db", "__MACOSX/agent-factory/._SKILL.md", "references/.DS_Store"]
+
+
+def test_check_ignores_os_litter_in_a_directory(tmp_path, capsys):
+    installed = _extract(tmp_path)
+    for relative in LITTER:
+        target = installed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\0junk")
+    assert package_skill.main(["--check", str(installed)]) == 0
+    assert capsys.readouterr().out.strip() == "current"
+
+
+def test_check_ignores_os_litter_in_a_zip(tmp_path, capsys):
+    package_skill.build(tmp_path)
+    good = tmp_path / "agent-factory.zip"
+    littered = tmp_path / "littered.zip"
+    with zipfile.ZipFile(good) as src, zipfile.ZipFile(littered, "w") as out:
+        out.writestr("__MACOSX/agent-factory/._SKILL.md", b"junk")  # first, as Finder writes it
+        for info in src.infolist():
+            out.writestr(info, src.read(info))
+        out.writestr("agent-factory/.DS_Store", b"junk")
+    assert package_skill.main(["--check", str(littered)]) == 0
+    assert capsys.readouterr().out.strip() == "current"
+
+
+def test_check_of_a_lone_skill_md_ignores_its_unrelated_neighbours(tmp_path, capsys):
+    installed = _extract(tmp_path)
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    (downloads / "SKILL.md").write_bytes((installed / "SKILL.md").read_bytes())
+    (downloads / "taxes.pdf").write_bytes(b"neighbour")
+    (downloads / "photos").mkdir()
+    (downloads / "photos/a.jpg").write_bytes(b"neighbour")
+    assert package_skill.main(["--check", str(downloads / "SKILL.md")]) == 0
+    assert capsys.readouterr().out.strip() == "current"
+
+
+def test_check_of_a_lone_skill_md_ignores_a_references_folder_of_its_own(tmp_path, capsys):
+    # A Downloads folder may hold a references/ of its own; that does not make it a skill directory.
+    installed = _extract(tmp_path)
+    downloads = tmp_path / "Downloads"
+    (downloads / "references").mkdir(parents=True)
+    (downloads / "SKILL.md").write_bytes((installed / "SKILL.md").read_bytes())
+    (downloads / "references/notes.txt").write_bytes(b"neighbour")
+    (downloads / "binary.bin").write_bytes(b"\xff\xfe\x00")
+    assert package_skill.main(["--check", str(downloads / "SKILL.md")]) == 0
+    assert capsys.readouterr().out.strip() == "current"
+
+
+def test_check_of_a_lone_skill_md_still_flags_an_edit_to_it(tmp_path, capsys):
+    installed = _extract(tmp_path)
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    (downloads / "SKILL.md").write_text((installed / "SKILL.md").read_text() + "more\n")
+    assert package_skill.main(["--check", str(downloads / "SKILL.md")]) == 1
+    assert "SKILL.md differs" in capsys.readouterr().out
+
+
+def test_check_of_a_skill_md_in_a_skill_directory_still_reports_extra_files(tmp_path, capsys):
+    installed = _extract(tmp_path)
+    (installed / "extra.md").write_text("not part of the skill\n")
+    assert package_skill.main(["--check", str(installed / "SKILL.md")]) == 1
+    assert "extra.md differs" in capsys.readouterr().out

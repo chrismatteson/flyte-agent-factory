@@ -58,21 +58,21 @@ _WORK_RECEIPT, _FACTORY_RECEIPT = "agent-factory.deployed-work", "agent-factory.
 
 def _read_config(ctx: Context, key: str) -> str:
     try:
-        return _workspace.git(
-            ctx.settings.clone, "config", "--local", "--get", key, placeholder_identity=False
+        return _workspace.run_git(
+            ctx.settings.clone, "config", "--local", "--get", key, neutral_identity=False
         ).strip()
     except (RuntimeError, OSError):  # no such key, or no clone yet
         return ""
 
 
 def _remember(ctx: Context, key: str, value: str) -> None:
-    _workspace.git(ctx.settings.clone, "config", "--local", key, value, placeholder_identity=False)
+    _workspace.run_git(ctx.settings.clone, "config", "--local", key, value, neutral_identity=False)
 
 
 def _forget(ctx: Context, key: str) -> None:
     try:
-        _workspace.git(
-            ctx.settings.clone, "config", "--local", "--unset-all", key, placeholder_identity=False
+        _workspace.run_git(
+            ctx.settings.clone, "config", "--local", "--unset-all", key, neutral_identity=False
         )
     except RuntimeError:  # git exits 5 when the key is not set
         pass
@@ -83,7 +83,7 @@ def _build_app_settings_url(ctx: Context, slug: str) -> str:
     owner = ctx.settings.owner
     base = (
         f"https://github.com/organizations/{owner}/settings/apps"
-        if ctx.github.owner_is_org(owner)
+        if ctx.github.is_owner_an_org(owner)
         else "https://github.com/settings/apps"
     )
     return f"{base}/{slug}/advanced"
@@ -107,7 +107,7 @@ def build_install_url(slug: str) -> str:
 def _commit_and_push_profile(ctx: Context, message: str) -> None:
     """Commit just `profile.toml` as the person (when it changed) and push."""
     clone = ctx.settings.clone
-    if _workspace.git(clone, "status", "--porcelain", "--", PROFILE_FILE, placeholder_identity=False).strip():
+    if _workspace.run_git(clone, "status", "--porcelain", "--", PROFILE_FILE, neutral_identity=False).strip():
         commit_paths(clone, (PROFILE_FILE,), message)
     ctx.github.push(clone)
 
@@ -139,8 +139,8 @@ class GithubAppStep:
         is all there is and is labelled as such. An uninstall after that is invisible from this machine.
         """
         try:
-            if ctx.github.owner_is_org(ctx.settings.owner):
-                live = self._find_slug(ctx) in ctx.github.app_installations(ctx.settings.owner)
+            if ctx.github.is_owner_an_org(ctx.settings.owner):
+                live = self._find_slug(ctx) in ctx.github.list_app_installations(ctx.settings.owner)
                 return "checked just now" if live else None
         except NotAllowed:  # an org member who may not list installations: fall back to the receipt
             pass
@@ -160,7 +160,7 @@ class GithubAppStep:
         app_id = self._find_app_id(ctx)
         if not app_id:
             return Check(False, "no App registered")
-        if not ctx.flyte.secret_exists(SECRET_APP_KEY):
+        if not ctx.flyte.has_secret(SECRET_APP_KEY):
             return Check(False, f"secret {SECRET_APP_KEY} missing")
         how = self._describe_installation(ctx, app_id)
         if how is None:
@@ -184,7 +184,7 @@ class GithubAppStep:
         app_id = self._find_app_id(ctx)
         if app_id:
             return self._resume(ctx, app_id)
-        if ctx.flyte.secret_exists(SECRET_APP_KEY):
+        if ctx.flyte.has_secret(SECRET_APP_KEY):
             return Outcome(
                 BLOCKED,
                 f"secret {SECRET_APP_KEY} exists but no App is recorded (an earlier run stopped half-way); "
@@ -193,7 +193,7 @@ class GithubAppStep:
                 f"{_build_app_settings_url(ctx, self._find_slug(ctx))} , then run this again",
             )
         slug = build_app_name(ctx.settings.owner).lower()
-        if ctx.github.app_exists(ctx.settings.owner, slug):
+        if ctx.github.has_app(ctx.settings.owner, slug):
             # GitHub makes the App when the person submits the form and hands its key over afterwards, once:
             # a run that died in between left an App nobody holds a key for, and its name is taken.
             return Outcome(
@@ -222,7 +222,7 @@ class GithubAppStep:
         url = build_install_url(registration.slug)
         ctx.say(f"Install the App on {ctx.settings.workspace} only: {url}")
         for _ in range(_POLLS):
-            if ctx.github.app_installed(registration, ctx.settings.workspace):
+            if ctx.github.is_app_installed(registration, ctx.settings.workspace):
                 _remember(ctx, _INSTALLED_KEY, registration.app_id)
                 _remember(ctx, _HOW_KEY, "live")
                 return self._adopt(ctx, registration.app_id, "registered and installed")
@@ -236,7 +236,7 @@ class GithubAppStep:
         person deletes it, and the run after that starts over.
         """
         slug = self._find_slug(ctx)
-        if ctx.github.app_exists(ctx.settings.owner, slug):
+        if ctx.github.has_app(ctx.settings.owner, slug):
             return Outcome(
                 BLOCKED,
                 f"App {app_id} ({slug}) was registered but an earlier run stopped before storing its key in "
@@ -259,7 +259,7 @@ class GithubAppStep:
         Its key is gone from memory, so a user account's installation can only be confirmed by asking.
         """
         url = build_install_url(self._find_slug(ctx))
-        if not ctx.flyte.secret_exists(SECRET_APP_KEY):
+        if not ctx.flyte.has_secret(SECRET_APP_KEY):
             if profile_file.read_app_id(ctx.profile_path):  # an App in use whose secret went missing later
                 return Outcome(
                     BLOCKED,
@@ -368,7 +368,7 @@ class DeployStep:
             return Check(False, _GAP)
         if ctx.settings.redeploy:
             return Check(False, "redeploy requested (--redeploy)")
-        if not ctx.flyte.factory_registered():
+        if not ctx.flyte.is_factory_registered():
             return Check(False, "factory.launch is not registered")
         # Registered is not current: an earlier run may have stopped between deploys, or the profile may have
         # gained an App or slot since. The receipt is the digest of the profile the last finished deploy used.
@@ -417,7 +417,7 @@ class McpUrlStep:
     def do(self, ctx: Context) -> Outcome:
         if ctx.settings.backend == "oss":
             return Outcome(BLOCKED, _GAP)
-        url = ctx.facts.get("mcp_url") or ctx.flyte.factory_mcp_url()
+        url = ctx.facts.get("mcp_url") or ctx.flyte.get_factory_mcp_url()
         if not url:
             return Outcome(TODO, "factory-mcp has no public URL yet; wait a minute and run this again")
         profile_file.set_mcp_url(ctx.profile_path, url)

@@ -491,3 +491,15 @@ def test_migration_does_not_warn_when_every_owner_file_is_present(owner_content,
     args = ["--sandbox", sandbox, "--direction", direction, "--out", tmp_path / "out"]
     assert _migrate(*args, engine=engine) == 0
     assert capsys.readouterr().err == ""
+
+
+def test_git_commits_as_the_neutral_identity_only_when_asked(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "none"))
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    _workspace.run_git(tmp_path, "init", "-q", neutral_identity=False)
+    _workspace.run_git(tmp_path, "commit", "-q", "--allow-empty", "-m", "neutral")
+    assert _workspace.run_git(tmp_path, "log", "-1", "--format=%an").strip() == "agent-workspace"
+    with pytest.raises(RuntimeError):
+        _workspace.run_git(tmp_path, "commit", "-q", "--allow-empty", "-m", "own", neutral_identity=False)

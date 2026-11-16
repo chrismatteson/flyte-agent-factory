@@ -92,10 +92,11 @@ def _format_line(status: str, step: str, detail: str) -> str:
     return f"[{status}] {step}: {detail}"
 
 
-def _guard(label: str, call: Callable[[], _T]) -> _T | base.Outcome:
+def _guard(label: str, call: Callable[[], _T], *, read_only: bool = False) -> _T | base.Outcome:
     """Run one step method; an expected error becomes a `blocked` outcome naming it, never a traceback.
 
-    Anything else propagates.
+    Anything else propagates. `read_only` is whether the run was started with `--status` or `--dry-run`: only
+    then does a message name them, since the key modes cannot be given either.
 
     Adapters keep secret values out of their exceptions (see `_bootstrap_base`), so the text is safe to print.
     """
@@ -103,10 +104,8 @@ def _guard(label: str, call: Callable[[], _T]) -> _T | base.Outcome:
         return call()
     except base.NotSignedIn:
         # Not a failure of this step: everything that asks Flyte waits for the sign-in step.
-        return base.Outcome(
-            TODO,
-            "sign in first: run it again without --status or --dry-run and finish the browser sign-in",
-        )
+        again = "run it again without --status or --dry-run" if read_only else "run it again"
+        return base.Outcome(TODO, f"sign in first: {again} and finish the browser sign-in")
     except subprocess.SubprocessError as exc:
         # Its text is the command line, which may carry a credential given as an argument: the class only.
         return base.Outcome(BLOCKED, f"{label} failed: {type(exc).__name__}")
@@ -120,7 +119,7 @@ def run(ctx: Context, table: Sequence[Step]) -> int:
     read_only = ctx.settings.read_only
     pending: list[str] = []
     for step in table:
-        checked = _guard("check", functools.partial(step.check, ctx))
+        checked = _guard("check", functools.partial(step.check, ctx), read_only=read_only)
         if isinstance(checked, base.Outcome):  # the check itself raised
             ctx.say(_format_line(checked.status, step.id, checked.detail))
             pending.append(checked.detail)
@@ -130,7 +129,7 @@ def run(ctx: Context, table: Sequence[Step]) -> int:
             continue
         check: Check = checked
         if step.informational and not read_only:
-            outcome = _guard("step", functools.partial(step.do, ctx))
+            outcome = _guard("step", functools.partial(step.do, ctx), read_only=read_only)
             ctx.say(
                 _format_line("done" if outcome.status == DONE else outcome.status, step.id, outcome.detail)
             )
@@ -159,7 +158,7 @@ def run(ctx: Context, table: Sequence[Step]) -> int:
                 ctx.say(_WAITING)
                 break
             continue
-        outcome = _guard("step", functools.partial(step.do, ctx))
+        outcome = _guard("step", functools.partial(step.do, ctx), read_only=read_only)
         ctx.say(_format_line(outcome.status, step.id, outcome.detail))
         if outcome.status != DONE:
             pending.append(outcome.detail)

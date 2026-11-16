@@ -53,6 +53,16 @@ def _repo_identity(url: str) -> str:
     return f"{host.lower()}/{path}"
 
 
+def get_repo_slug(url: str) -> str:
+    """Return `owner/name` of a git clone URL, ssh (`git@host:owner/name.git`) or https, on any host.
+
+    Unlike `_github.parse_repo`, this accepts non-GitHub hosts: `[repo] project` is pushed with a deploy
+    key and need not be on github.com.
+    """
+    # Both forms end `<owner>/<name>[.git]`, after a `/` or, for the scp-like ssh form, a `:`.
+    return "/".join(re.split(r"[/:]", url.rstrip("/").removesuffix(".git"))[-2:])
+
+
 def project_layout(repo: str, sandbox_repo: str, is_workspace: bool = False) -> str:
     """`workspace`, `sandbox` or `root`: where a project on `repo` keeps its files.
 

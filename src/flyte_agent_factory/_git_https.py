@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import _github
 from ._auth import write_private
-from ._workspace import git
+from ._workspace import run_git
 
 #: Tokens last 60 minutes; re-minting at 45 leaves `TOKEN_MARGIN` and a failed attempt's retries.
 REFRESH_SECONDS = 45 * 60
@@ -33,13 +33,13 @@ def remote_url(repo: str) -> str:
 def install(checkout: Path, repo: str, store: Path) -> None:
     """Point `checkout` at `repo` over HTTPS, authenticating from the credential file `store`."""
     url = remote_url(repo)
-    if "origin" in git(checkout, "remote").split():
-        git(checkout, "remote", "set-url", "origin", url)
+    if "origin" in run_git(checkout, "remote").split():
+        run_git(checkout, "remote", "set-url", "origin", url)
     else:
-        git(checkout, "remote", "add", "origin", url)
-    git(checkout, "config", "credential.helper", f"store --file={store}")
+        run_git(checkout, "remote", "add", "origin", url)
+    run_git(checkout, "config", "credential.helper", f"store --file={store}")
     # One token per repo; by path would make git ask for a credential per URL path instead.
-    git(checkout, "config", "credential.useHttpPath", "false")
+    run_git(checkout, "config", "credential.useHttpPath", "false")
     # Nobody is at a terminal: a refused token must fail the push, not wait for a password.
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
 
