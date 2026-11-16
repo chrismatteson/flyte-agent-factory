@@ -256,8 +256,9 @@ passes goes to review; a DONE that fails goes back to the coordinator without sp
 | Role | Runs | Output |
 |---|---|---|
 | `contract` | once, before the first judge round | the grading contract: numbered, checkable assertions drawn from the brief, the criteria and the MUST standards. Judges grade this frozen contract |
-| `judge-correctness` | every round, in parallel with the other two judges, each in its own container | does it work: runs the tests and the thing itself, tries the edges |
-| `judge-completeness` | every round | is every clause of the brief delivered, with evidence for each |
+| `judge-correctness` | every round, in parallel with the other two judges, each in its own container | does it work: walks the contract's assertions first (running the brief's own examples as given), then the tests and the edges; reports `FINDING` blocks |
+| `judge-completeness` | every round | is every clause of the brief delivered, with evidence for each; same walk and block format |
+| finding check | after a correctness or completeness reply that has an evidenced finding or a bare `VERDICT: FAIL` | the finding check: re-runs each finding's evidence in a fresh copy (`sonnet`, `low`; `FINDING_CHECK_MODEL`, `FINDING_CHECK_EFFORT`) and drops the ones that do not reproduce, except a finding carrying the redaction marker (`<redacted>`), which is kept as CANNOT CHECK |
 | `judge-craft` | every round | would a maintainer accept this; advisory unless `CRAFT_BLOCKING` is `true` |
 | `arbitrate` | when judges' findings conflict | a binding ruling per conflict, one call at top effort |
 | `plan` | after a failed round | turns the findings into the coordinator's next plan and says whether review is converging |
@@ -286,6 +287,41 @@ A missing verdict is never a `FAIL` and never a pass:
   a verdict are not asked again. An advisory craft with no output, or whose reply is only a short tool or limit error,
   counts as no verdict: craft must have run. A reply is that error only when its first line starts like one
   (`API Error`, `HTTP 429`, `You've hit`, or the usage-limit mark); a report that mentions a rate limit is a report.
+- **Findings and the mechanical verdict (correctness and completeness).** The verdict is computed from the reply's
+  `FINDING` blocks, not read from its `VERDICT:` line (which still marks a usable reply). The pure code is
+  `_findings.py`; `_findings.decide` is the single rule.
+  - *What a block is.* A header line (`FINDING:`, `FINDING (blocking):`, `## FINDING 1 (blocking):`, `**FINDING:**`
+    and the like), an optional `Breaks:` line (contract id, acceptance criterion, brief words or blocking rule) and
+    `Evidence:` (the text may run over following lines or a fenced block; `command`, `test`,
+    `file: path:line -- what it shows`, `missing`, `clause` and `reproduction` forms are asked for). A block ends at
+    the next header or a section line, never at a plain markdown heading and never inside a code fence. A
+    section line is a header: `NON-BLOCKING`, `UNVERIFIED FROM HERE`, `DESIGN CONFLICT`, `NEW REQUIREMENT`,
+    `CRITERIA` or `BLOCKING: n`, with at most a short label (`Non-blocking findings`) or a parenthetical, then a
+    colon or nothing but markup to the end of the line (`BLOCKING: n` and `CRITERIA:` only with nothing but
+    markup after), or the verdict line. Prose that opens with one of those words (`Criteria: C3 says Z.`) stays
+    inside the finding. A reply
+    that fails with no `FINDING` header but has an `Evidence:` entry that would block is read as one finding
+    (title: the line above it).
+  - *When it blocks.* A finding blocks when it is not advisory (labelled minor, nit, advisory or non-blocking,
+    unless the same qualifier also calls it blocking, or listed under `NON-BLOCKING` as a list item; a top-level
+    `FINDING:` after that section starts a new blocking finding) and its evidence is in one of the asked-for forms
+    with content after the label (`command` and `test` also need `| output: <text>`, an `Output:` line or a fenced
+    block; a label may sit behind list or emphasis markup, as in `- **test:**`), or is a fenced block or a
+    `path:line` whose path has a letter in it (`1.5:2` is not one). A bare label or prose evidence is "no evidence"
+    and the finding is carried as advisory. A missing `Breaks:` line does not demote it. The round fails if and only
+    if a blocking finding is kept, even under `VERDICT: PASS`.
+  - *What the prompt fixes.* What blocks (what it breaks and whether there is evidence, not likelihood, fix cost or
+    pre-existing causes), and a criteria walk: one `CRITERIA:` line per contract assertion or brief requirement,
+    run on the brief's own examples first.
+- **The finding check.** When there is a blocking finding, or the reply is a `FAIL` with none, one more call
+  (metered as `correctness-check` or `completeness-check`, `sonnet`/`low` by default, `FINDING_CHECK_MODEL`/`FINDING_CHECK_EFFORT`, 40 turns, one retry)
+  re-runs each finding's evidence in a fresh copy and answers `CHECK <n>: REPRODUCED | NOT REPRODUCED | CANNOT CHECK`.
+  A `NOT REPRODUCED` finding is dropped to non-blocking (the timeline says how many); `CANNOT CHECK` and a missing
+  line keep it; a finding is only ever dropped, never added. A finding whose block carries the redaction marker
+  (`<redacted>`) is kept as `CANNOT CHECK` whatever the checker answered: the engine masked part of it before the
+  checker saw it, so the checker did not see what the judge saw. If the check cannot run, every finding is kept and
+  a timeline row says so. A `FAIL` with no evidenced finding is a `PASS` unless the checker, restating the reply's
+  blocking claims as `CLAIM <n>`, reproduces one.
 - **The round.** Any `FAIL` fails the round, and the findings also list the judges with no verdict, as does
   the PR's failure status (`review rejected round N; no verdict from craft`). Otherwise,
   if every judge is `PASS` or `ADVISORY` the round passes. Otherwise it is **undecided**: `ReviewLimited` when a judge
@@ -335,6 +371,7 @@ ones the code reads.
 | `QA_DIFFERENT_ENGINE` | `true` | the judges prefer an engine other than the coordinator's when the profile has both a `claude_token` and a `codex_token`; `false` keeps explicit or default routing |
 | `AUTHOR_MODEL`, `AUTHOR_EFFORT` | `sonnet`, none | the Claude model and effort of the coordinator |
 | `JUDGE_MODEL`, `JUDGE_EFFORT` | `opus`, `high` | the Claude model and effort of the judges; `JUDGE_EFFORT` also overrides the arbiter's `xhigh` |
+| `FINDING_CHECK_MODEL`, `FINDING_CHECK_EFFORT` | `sonnet`, `low` | the Claude model and effort of the finding check that re-runs a correctness or completeness judge's findings (see Judge outcomes) |
 | `PLANNER_MODEL`, `PLANNER_EFFORT` | `fable`, by round | the Claude model of the planner and contract writer (a failed call falls back to `opus`); effort is `medium` in round 1, `high` in rounds 2 and 3, `xhigh` after, unless set |
 | `AUTHOR_CODEX_MODEL`, `AUTHOR_CODEX_EFFORT`, `DELEGATE_CODEX_MODEL`, `DELEGATE_CODEX_EFFORT` | Codex's model, `medium` | the same for a Codex coordinator and Codex workers |
 | `JUDGE_CODEX_MODEL`, `JUDGE_CODEX_EFFORT`, `ARBITER_CODEX_MODEL`, `ARBITER_CODEX_EFFORT`, `CONTRACT_CODEX_MODEL`, `CONTRACT_CODEX_EFFORT`, `PLANNER_CODEX_MODEL`, `PLANNER_CODEX_EFFORT` | Codex's model, `high` | the same for the review-loop roles. Efforts are `minimal`, `low`, `medium`, `high` or `xhigh`; an invalid one warns and uses the default |
@@ -519,6 +556,8 @@ the session role definitions, the browser image files and the workspace template
 | Module | What it does |
 |---|---|
 | `_review.py` | the judge rounds, the arbiter and the verdicts |
+| `_findings.py` | pure: reading `FINDING` blocks, the mechanical verdict (`decide`), the finding-check prompt and the judges' finding-format prompt text |
+| `_check_findings.py` | the finding check call |
 | `_reviewer.py` | one reviewer call on its engine, in its own container |
 | `_contract.py` | the grading contract written before the first round |
 

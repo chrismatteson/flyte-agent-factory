@@ -15,9 +15,11 @@ import flyte.errors
 from flyte.io import Dir
 
 from flyte_agent_factory import (
+    _check_findings,
     _checkpoint,
     _contract,
     _dashboard,
+    _findings,
     _gates,
     _inbox,
     _issues,
@@ -33,15 +35,7 @@ from flyte_agent_factory import (
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
-# One verdict per line, last line wins. Tolerates the markdown a model wraps around the line
-# (`**VERDICT:** PASS`, `**VERDICT: PASS**`, backticks, a quote or heading prefix), a `-` or dash for the
-# colon, trailing punctuation and one short parenthetical. A line that merely mentions both words is not
-# a verdict: the word must follow the separator directly, and nothing else may trail it.
-_VERDICT = re.compile(
-    r"^[ \t>#*_`]*VERDICT[*_`]*[ \t]*[:\-\u2013\u2014][*_`]*[ \t]*[*_`]*(PASS|FAIL)[*_`]*[ \t]*[.!]?"
-    r"[ \t]*(?:\([^()\n]{0,80}\))?[ \t]*[.!]?[*_`]*[ \t\r]*$",
-    re.MULTILINE | re.IGNORECASE,
-)
+_VERDICT = _findings.VERDICT
 
 # What a judge round ended in. PASS, FAIL and ADVISORY (craft, not blocking) are decisions; the rest are not.
 PASS, FAIL, ADVISORY = "PASS", "FAIL", "ADVISORY"
@@ -209,13 +203,8 @@ def _qa_prompt(
             if judge == "craft"
             else "Standards exist in .claude-flyte/standards/; craft grades them. Do not grade style.\n\n"
         )
-        + "For each blocking finding use a separate block beginning `FINDING:` followed by "
-        "`Evidence: command: <command> | output: <observed failure>`, "
-        "`Evidence: test: <test> | output: <observed failure>`, "
-        "`Evidence: missing: <file/path>`, `Evidence: clause: <quoted brief/contract clause> | deliverable: "
-        "<missing deliverable>`, "
-        "or `Evidence: reproduction: <input> -> <wrong output>`. "
-        "Style/design opinions without failing checks are advisory.\n\n" + "## What was asked for\n\n"
+        + _findings.render_finding_instructions(judge)
+        + "## What was asked for\n\n"
         "This is the authority. It was given to the author as a task input and neither of you "
         "can change it.\n\n"
         f"{brief.strip()}\n\n"
@@ -763,21 +752,14 @@ def _review_report(text: str) -> str:
 
 
 def _evidenced_findings(text: str) -> tuple[list[str], list[str]]:
-    """Separate reproducible findings from opinions before interpreting a verdict."""
-    blocks = re.split(r"^FINDING:\s*", text, flags=re.MULTILINE)
-    evidence = re.compile(
-        r"^[ \t]*(?:[-*][ \t]+)?Evidence: (?:(?:command|test): \S[^\n]*\| output: \S[^\n]*|"
-        r"missing: \S+|clause: \S[^\n]*\| deliverable: \S[^\n]*|"
-        r"reproduction: \S[^\n]* -> \S[^\n]*)$",
-        re.MULTILINE,
-    )
-    findings = blocks[1:]
-    if not findings and any(m.group(1).upper() == "FAIL" for m in _VERDICT.finditer(text)):
-        findings = [text]
-    # A finding the reviewer itself labelled minor stays advisory however good its evidence is.
-    minor = re.compile(r"(?:minor|nit|advisory|non-?blocking):", re.IGNORECASE)
-    blocking = [b for b in findings if evidence.search(b) and not minor.match(b)]
-    return (blocking, [b for b in findings if b not in blocking])
+    """Separate reproducible findings from opinions: (blocking, the rest), each as the reply wrote it.
+
+    Kept as the compatibility seam: tests written against the original evidence rule pin it, and it applies
+    the same rule as `_findings.select_blocking`.
+    """
+    found = _findings.parse_findings(text)
+    blocking = _findings.select_blocking(found)
+    return [f.render() for f in blocking], [f.render() for f in found if f not in blocking]
 
 
 def _find_usable_result_gap(text: str, advisory_craft: bool) -> str:
@@ -944,64 +926,84 @@ async def _one_judge(
     if conflicts is not None and round_ > 1 and _reviewer._review_ledger:
         # Only where there were earlier requirements to conflict with; pass or fail alike.
         conflicts += [f"{judge}: {item}" for item in _design_conflicts(text)]
-    verdicts = list(_VERDICT.finditer(text or ""))
-    if judge in {"correctness", "completeness"} and verdicts and verdicts[-1].group(1).upper() == "PASS":
-        # The reviewer's own PASS stands: evidence on a finding it did not count as blocking
-        # makes that finding a note, never a failure.
+    verdict = ""
+    reply = text  # `text` becomes the kept findings on a FAIL; the sections after them are read from this
+    if judge in {"correctness", "completeness"}:
+        # The findings decide, not the VERDICT line (see `_findings.decide`); the finding check can only
+        # remove findings whose evidence does not reproduce.
+        check_text = await _check_findings.run(judge, brief, acceptance, text, round_, timeline, snapshot)
+        decision = _findings.decide(text, check_text)
+        verdict = decision.verdict
+        found = _findings.parse_findings(text)
+        kept_findings = decision.kept_findings
+        no_evidence = [f.render() for f in found if not _findings.has_runnable_evidence(f) and not f.advisory]
+        if no_evidence:
+            timeline.row("ℹ️", f"{display}: {len(no_evidence)} findings downgraded to advisory (no evidence)")
+        if decision.dropped:
+            timeline.row("ℹ️", f"{display}: {len(decision.dropped)} findings dropped (did not reproduce)")
+        if verdict == PASS and decision.reason:
+            timeline.row("ℹ️", f"{display}: {decision.reason}")
         if nonblocking is not None:
-            evidenced, downgraded = _evidenced_findings(text)
-            nonblocking.extend(f"{judge} advisory: {b.strip()}" for b in evidenced + downgraded)
-    elif judge in {"correctness", "completeness"} and verdicts:
-        evidenced, downgraded = _evidenced_findings(text)
-        if downgraded:
-            timeline.row(
-                "ℹ️",
-                f"{_roles.display_role(judge)}: {len(downgraded)} findings downgraded to advisory "
-                "(no evidence)",
+            nonblocking.extend(f"{judge} advisory (no evidence): {item}" for item in no_evidence)
+            nonblocking.extend(f"{judge} advisory (did not reproduce): {item}" for item in decision.dropped)
+            # A PASS also carries the NON-BLOCKING section's lines below; do not list a finding twice.
+            nonblocking.extend(
+                f"{judge} advisory: {f.render()}"
+                for f in found
+                if f.advisory and not (verdict == PASS and f.in_nonblocking_section)
             )
-            if nonblocking is not None:
-                nonblocking.extend(f"{judge} advisory (no evidence): {item}" for item in downgraded)
-        if not evidenced:
-            if nonblocking is not None:
-                nonblocking.extend(f"{judge}: {item}" for item in _heading_lines(text, _NONBLOCKING))
-            if unverified is not None:
-                unverified.extend(f"{judge}: {item}" for item in _unverified_lines(text))
-            if blocking is not None:
-                blocking.append(0)
-            # The supervisor's verdict, recorded like any other: a FAIL without evidence counts as a PASS.
-            timeline.row("✅", f"{display}: PASS")
-            record_outcome(PASS)
-            return judge, True, _review_report(text)
-        for finding in evidenced:
-            evidence = next((line for line in finding.splitlines() if "Evidence:" in line), "")
-            # Review evidence and gate output have no common diagnostic format; retain any cited paths.
-            paths = re.findall(r"([\w./-]+\.[\w]+)(?::(\d+))?", evidence)
-            for path, line in paths or [("", "")]:
+        if verdict == FAIL:
+            for finding in kept_findings:
+                # Review evidence and gate output have no common diagnostic format; retain any cited paths.
+                paths = re.findall(r"([\w./-]+\.[\w]+)(?::(\d+))?", finding.evidence)
+                for path, line in paths or [("", "")]:
+                    timeline.metric_label(
+                        kind="judge",
+                        round=round_,
+                        name=judge,
+                        verdict="FAIL",
+                        file=path,
+                        line=int(line) if line else None,
+                        title=finding.title,
+                        evidence_kind=_findings.classify_evidence_kind(finding),
+                    )
+            # The reproduced-claims path: no finding was written, each kept entry is a claim.
+            for claim in decision.kept_claims:
                 timeline.metric_label(
                     kind="judge",
                     round=round_,
                     name=judge,
                     verdict="FAIL",
-                    file=path,
-                    line=int(line) if line else None,
-                    title=finding.splitlines()[0],
-                    evidence_kind=evidence.partition("Evidence:")[2].strip().partition(":")[0],
+                    file="",
+                    line=None,
+                    title=claim,
+                    evidence_kind="claim",
                 )
-        text = "\n\n".join(evidenced) + f"\nBLOCKING: {len(evidenced)}\nVERDICT: FAIL"
-
+            text = "\n\n".join(k if k.startswith("FINDING:") else f"FINDING: {k}" for k in decision.kept)
+            text += f"\nBLOCKING: {len(decision.kept)}\nVERDICT: FAIL"
+        else:
+            if blocking is not None:
+                blocking.append(0)
+            if unverified is not None:
+                unverified.extend(f"{judge}: {item}" for item in _unverified_lines(text))
+            if nonblocking is not None:
+                nonblocking.extend(f"{judge}: {item}" for item in _heading_lines(text, _NONBLOCKING))
+            timeline.row("✅", f"{display}: PASS")
+            record_outcome(PASS)
+            return judge, True, _review_report(text)
     # The *last* verdict line: the prompt puts it last, and a reviewer quoting the
     # author (whose notes it now sees) must not have a quoted "VERDICT: PASS" win.
-    match = verdicts[-1]
-    passed = match.group(1).upper() == "PASS"
+    verdict = verdict or list(_VERDICT.finditer(text or ""))[-1].group(1).upper()
+    passed = verdict == PASS
     if blocking is not None:
         blocking.append(_blocking_count(text, passed))
     if new_reqs is not None and not passed:
-        new_reqs += _heading_lines(text, _NEW_REQUIREMENT)
+        new_reqs += _heading_lines(reply, _NEW_REQUIREMENT)
     if passed and unverified is not None:
         unverified += [f"{judge}: {item}" for item in _unverified_lines(text)]
     if passed and nonblocking is not None:
         nonblocking += [f"{judge}: {item}" for item in _heading_lines(text, _NONBLOCKING)]
-    timeline.row("✅" if passed else "❌", f"{display}: {match.group(1).upper()}")
+    timeline.row("✅" if passed else "❌", f"{display}: {verdict}")
     record_outcome(PASS if passed else FAIL)
     return judge, passed, _review_report(text)
 

@@ -47,6 +47,10 @@ DEFAULTS: dict[str, Setting] = {
     # Turns a failed round's findings into the author's next plan, and judges whether
     # the loop is converging. The highest-leverage call per round, so the strongest model.
     "planner": Setting("fable", "medium"),
+    # Re-runs a judge's findings in a fresh copy and drops the ones that do not reproduce. Mechanical work
+    # (run the command, read the output), so a cheap model; it only ever removes findings, never adds any.
+    # Override with FINDING_CHECK_MODEL / FINDING_CHECK_EFFORT.
+    "finding_check": Setting("sonnet", "low"),
 }
 
 # Resources rise with the round: a round that failed is evidence the problem is

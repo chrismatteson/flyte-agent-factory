@@ -463,7 +463,9 @@ def test_flyte_supports_the_gcp_bootstrap_input_type():
 #: +1 (restored-workspace hygiene): the pump's pre-review stage runs the session's own tools; whatever
 #: it raises (a `.venv` that lost its exec bits) bounces the DONE, because one that escapes ends the pump
 #: and leaves the run with nothing driving it.
-BROAD_HANDLER_SITES = 12
+#: +1 (finding check): a check that cannot run must keep the judge's findings, not sink the round, so the
+#: call's failure is caught here, reported on the timeline, and the verdict fails closed.
+BROAD_HANDLER_SITES = 13
 
 
 def test_the_broad_handlers_are_pinned_to_the_boundary_sites():

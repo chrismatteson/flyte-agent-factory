@@ -1,0 +1,15 @@
+{
+ "decisions": 45,
+ "reps": 90,
+ "judge_usd": 164.8,
+ "check_usd": 11.2,
+ "total_usd": 176.0,
+ "reserved_usd": 281.61,
+ "cap_usd": 150.0,
+ "decisions_fitting_under_cap_in_run_order": 28,
+ "decisions_expected_within_cap_in_run_order": 43,
+ "judge_estimate_margin": 1.15,
+ "check_estimate_usd_per_study_fail_rep": 0.4,
+ "reserve_margin": 1.6,
+ "method": "judge = mean of the study's two rep costs x margin; check = fixed amount per study rep whose raw verdict was FAIL; a decision 'fits' while the running total of reservations (estimate x reserve margin) stays under the cap; 'expected' counts decisions while the running total of estimates does (reservations are released as calls settle)"
+}

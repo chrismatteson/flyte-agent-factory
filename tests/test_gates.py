@@ -1103,6 +1103,11 @@ def test_evidence_may_be_a_bulleted_line(bullet):
     assert len(blocking) == 1 and advisory == []
 
 
+def test_evidence_still_needs_content_when_bulleted():
+    blocking, advisory = _review._evidenced_findings("FINDING: crash\n- Evidence:\nVERDICT: FAIL")
+    assert blocking == [] and len(advisory) == 1
+
+
 def test_evidence_still_needs_its_fields_when_bulleted():
     blocking, advisory = _review._evidenced_findings(
         "FINDING: crash\n- Evidence: it looked wrong\nVERDICT: FAIL"
