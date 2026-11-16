@@ -4,6 +4,7 @@
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.coverage
 .ruff_cache/
 # The run context `child.attach` reads (a link to it, too: no trailing slash, which would match only a directory).
 .flyte
