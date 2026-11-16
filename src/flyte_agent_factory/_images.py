@@ -36,6 +36,7 @@ import base64
 from pathlib import Path
 
 import flyte
+from flyte._image import _CREATE_FLYTE_USER_CMD
 
 from flyte_agent_factory import _scanners
 
@@ -60,6 +61,20 @@ CODEX_SHA256 = "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182
 TAILSCALE_VERSION = "1.82.5"
 # Official tailscale_1.82.5_amd64.tgz.sha256; these images target linux/amd64.
 TAILSCALE_SHA256 = "41a8931fa52055bd7ea4b51df9acff2ba2d4e9000c2380b667539b5b99991464"
+
+
+def run_as_flyte(image: flyte.Image) -> flyte.Image:
+    """Return `image` ending as the unprivileged `flyte` user; add it as the image's last layer.
+
+    The SDK's local builder starts the Dockerfile with `USER root` and only appends `USER flyte` when a
+    layer holds `_CREATE_FLYTE_USER_CMD`. A released SDK's `from_debian_base` returns a prebuilt base
+    without that layer, so without this every image would end as root and Claude Code would refuse
+    `bypassPermissions`. On the remote builder the command is an idempotent RUN. It is the factory image's
+    last layer so its chown of /home/flyte covers the layers before it; a derived image may add layers after
+    it (they still build as root, and the image still ends `USER flyte`), as long as they write outside
+    /home/flyte.
+    """
+    return image.with_commands([_CREATE_FLYTE_USER_CMD])
 
 
 def _with_tailscale(image: flyte.Image) -> flyte.Image:
@@ -288,8 +303,8 @@ def agent_image(
     if tailscale:
         image = _with_tailscale(image)
     if not browser:
-        return image
-    return (
+        return run_as_flyte(image)
+    return run_as_flyte(
         image
         # Xvfb because Chromium runs headed: the proven-working configuration,
         # and a headed browser is what records a watchable video.
@@ -369,4 +384,4 @@ def browser_image(
         .with_commands(["/opt/browser/install.sh"])
     )
 
-    return _with_tailscale(image) if tailscale else image
+    return run_as_flyte(_with_tailscale(image) if tailscale else image)

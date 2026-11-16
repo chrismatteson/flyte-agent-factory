@@ -28,7 +28,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Required, TypedDict, Unpack, cast
 
-from . import _codex_auth, _meter
+from . import _codex_auth, _meter, _unprivileged
 
 _CODEX_LIMIT = _meter._CODEX_LIMIT
 
@@ -147,7 +147,8 @@ class CodexProcess:
             self.last_message = ""
             self.turn_completed = False
             self.last_submission = (text, time.monotonic(), self.output_count)
-            self._proc = await asyncio.create_subprocess_exec(
+            self._proc = await _unprivileged.spawn(
+                "a Codex turn",
                 *self._argv(text),
                 cwd=str(self._cwd),
                 env=self._env,

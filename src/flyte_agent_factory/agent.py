@@ -88,6 +88,7 @@ from flyte_agent_factory import (
     _supervise_support,
     _timeline,
     _union_identity,
+    _unprivileged,
     _usage,
     _workspace_repair,
 )
@@ -409,6 +410,8 @@ async def project(
         pass back as `workspace_in` to continue it.
 
     """
+    # Before any work: as root every start fails alike, so fail once, with no checkpoint to restore.
+    _unprivileged.refuse_root("the project session")
     _usage._hard_pins = hard_pin
     # First, before any child exists: same-uid processes (the session's Bash calls) cannot then read
     # this process's credentials from /proc/<pid>/environ or /proc/<pid>/mem.
@@ -919,10 +922,8 @@ async def project(
                 tail = "\n".join(list(proc.tail)[-30:])
                 if author_engine == "codex" and getattr(proc, "auth_failure", False):
                     await _author._codex_login_dead(proc, timeline)
-                raise RuntimeError(
-                    f"{'Codex' if author_engine == 'codex' else 'Claude Code'} exited with status {status}; "
-                    f"retrying from the last checkpoint.\n{tail}"
-                )
+                # An exit before any prompt is not retried; the rest is "retrying from the last checkpoint".
+                raise _unprivileged.exit_error(author_engine, status, tail, proc)
         elif fatal:
             # `stop` was set by a fatal error, not by a human. Ending normally
             # here would publish and report success for a run that never did
@@ -1079,6 +1080,7 @@ async def subagent(
     """
     import flyte.report
 
+    _unprivileged.refuse_root("a sub-agent")
     _auth.set_non_dumpable()  # as in `project`: the sub-agent's children cannot read this process's secrets
     _union_identity.establish()
     route_blob = None
@@ -1221,7 +1223,8 @@ async def subagent(
                     child_env,
                     pass_fds,
                 ):
-                    proc = await asyncio.create_subprocess_exec(
+                    proc = await _unprivileged.spawn(
+                        "a Claude Code sub-agent",
                         *argv,
                         cwd=str(work),
                         env=child_env,
@@ -1270,6 +1273,8 @@ async def subagent(
             if proc.returncode != 0:
                 # A usage-limit refusal exits 1 with the result JSON on stdout: name it as such.
                 _subagent_run._raise_on_cli_error(raw.decode(errors="replace"), only_limit=True)
+                if not payload and 0 < (proc.returncode or 0) < 128:  # it never started; a signal is a crash
+                    raise _unprivileged.no_result_error(proc.returncode, raw.decode(errors="replace"), stderr)
                 # stdout too: `claude -p` puts its own errors there, not on stderr.
                 raise RuntimeError(
                     f"sub-agent exited {proc.returncode}.\n"
@@ -1293,6 +1298,8 @@ async def subagent(
                 unusable=unusable,
             ), await Dir.from_local(str(work))
 
+        except flyte.errors.NonRecoverableError:
+            raise  # a RuntimeError too, but never a usage limit to reroute
         except RuntimeError as exc:
             if _usage.USAGE_LIMIT_MARK not in (error := str(exc)):
                 raise

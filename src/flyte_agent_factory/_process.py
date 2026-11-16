@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import _unprivileged
 from ._auth import token_fd
 
 # Escape sequences, OSC strings, and the control characters a TUI emits by the
@@ -211,6 +212,8 @@ class ClaudeProcess:
     _delivering: asyncio.Lock | None = None
     _pending_enter: str | None = None
     _input_text: str | None = None
+    #: Whether the input box was ever drawn. A session that exits without it never started a conversation.
+    reached_prompt = False
 
     def __init__(
         self,
@@ -271,17 +274,23 @@ class ClaudeProcess:
         _size_pty(slave)
         self._master = master
 
-        with token_fd(self._env, self._token) as (env, pass_fds):
-            self._proc = await asyncio.create_subprocess_exec(
-                *self._argv,
-                cwd=str(self._cwd),
-                env=env,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                start_new_session=True,
-                pass_fds=pass_fds,
-            )
+        try:
+            with token_fd(self._env, self._token) as (env, pass_fds):
+                self._proc = await _unprivileged.spawn(
+                    "Claude Code",
+                    *self._argv,
+                    cwd=str(self._cwd),
+                    env=env,
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    start_new_session=True,
+                    pass_fds=pass_fds,
+                )
+        except BaseException:
+            os.close(slave)
+            self._close_reader()  # closes `master`
+            raise
         # The child owns the slave end now; holding it open here would keep the
         # master from ever reporting EOF.
         os.close(slave)
@@ -325,6 +334,7 @@ class ClaudeProcess:
             # Restored sessions skip onboarding; their unused rules must not answer
             # matching prose or permission requests later in the conversation.
             self._rules.clear()
+            self.reached_prompt = True
         if self.menu is None:
             for rule in self._rules:
                 if rule.match(self._window):

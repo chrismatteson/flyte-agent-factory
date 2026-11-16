@@ -38,6 +38,7 @@ from flyte_agent_factory import (
     _session_setup,
     _state,
     _timeline,
+    _unprivileged,
     _usage,
 )
 from flyte_agent_factory._author_session import AuthorSession
@@ -99,7 +100,9 @@ async def _check_headless_start(proc: ClaudeProcess) -> None:
     while proc.returncode is None and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
     if proc.returncode is not None:
-        raise RuntimeError("Claude Code exited at startup:\n" + "\n".join(list(proc.tail)[-40:]))
+        # Before any prompt this is not retried, unless the resume fallback below takes it.
+        tail = "Claude Code exited at startup:\n" + "\n".join(list(proc.tail)[-40:])
+        raise _unprivileged.exit_error("claude", proc.returncode, tail, proc)
 
 
 def _author_argv(project_name: str, mode: str, model: str, effort: str) -> list[str]:
