@@ -110,22 +110,25 @@ exit_node = "home-router"              # default exit node for every identity
 tailscale_tag = "tag:factory-browser"  # optional, default tag:k8s
 
 [browser.identities.github]
-profile_uri = "s3://YOUR-PROJECT-PREFIX/browser-github/profile.tar.gz"
 # exit_node = "other-node"   # optional override for this identity; "" means direct egress
+# profile_uri is omitted: it defaults to <bucket>/browser/github/profile.tar.gz (see "Location" below)
 ```
 
-The `profile_uri` archive is separate from the factory's state (which lives on a git branch, see `state-store.md`) and still uses the object-storage URI it is given: it holds sign-in cookies, which must not go into git.
+The `profile_uri` archive is separate from the factory's state (which lives on the configured backend, see `state-store.md`): it holds sign-in cookies, which must not go into git. It is encrypted and trimmed to session state; see [The profile archive](#the-profile-archive).
 
-An identity name matches `^[a-z][a-z0-9-]{0,19}$`, needs a `profile_uri`, and two identities may not share one.
+An identity name matches `^[a-z][a-z0-9-]{0,19}$`, needs a `profile_uri` unless `[state] bucket` or `volume` is set
+(then it defaults, see "Location"), and two identities may not share one.
 The earlier shape still works and is exactly one identity named `personal`:
-`[browser] personal = true` with `profile_uri` (and `exit_node`). Do not combine it with
+`[browser] personal = true` with `profile_uri` (optional under the same condition) and `exit_node`. Do not combine it with
 `[browser.identities.personal]`. `personal_env` is deprecated: it is accepted and ignored, because it no longer
 grants anything.
 
-Choose a URI inside this project's own storage prefix, distinct for each deployment
-profile. The app's workload identity needs read/write access there. S3 and GCS
-are supported through fsspec using the workload's credentials. No Volume is used.
-The archive excludes Chromium caches and host-specific locks; it is restored
+Omit `profile_uri` and let it default to `<bucket>/browser/<identity>/profile.tar.gz` (or the volume's path)
+under the factory's own bucket. A `profile_uri` in Flyte's own data bucket is refused: anyone who can read a run's
+data could read the sign-in cookies. If you set one, it must be distinct for each deployment profile, and the
+app's workload identity needs read/write access there. S3 and GCS are supported through fsspec using the
+workload's credentials, and `file://` (below).
+The archive holds only session state (below); it is restored
 before the browser starts, saved every ten minutes, and saved on SIGTERM.
 A forced kill can lose the last ten minutes. Periodic archives of an active
 Chromium profile are best-effort; a graceful shutdown is the reliable final copy.
@@ -145,7 +148,8 @@ an archive conditionally updates that pointer, so even a delayed write from an
 expired owner cannot overwrite the next owner's snapshot. Unreferenced older
 generations are removed after publication. Restore validates in a staging
 directory, tries the previous generation on corruption, then uses an empty
-profile if both are corrupt. Only a successful read of a bad archive counts as corruption.
+profile if both are corrupt. An archive that cannot be opened for want of the right key is not
+corruption: see below. Only a successful read of a bad archive counts as corruption.
 Storage errors (resets, timeouts, 5xx) are retried with backoff for two minutes; if storage is
 still unreachable the app exits without starting Chromium or saving anything, and the platform
 restarts it. After an all-corrupt start the unreadable generations stay referenced by the lease
@@ -286,9 +290,9 @@ examples say `github`; on a profile still in the legacy shape the identity is `p
    Test an abrupt restart separately; inspect snapshot age without exposing cookies.
 6. Confirm shutting down the app removes its ephemeral device from Tailscale.
 
-The archive contains cookies and can impersonate the human: anyone with access
-to that object can act as the logged-in user. Restrict bucket IAM and enable
-storage encryption. Do not download it into project workspaces or logs. To wipe,
+The archive contains cookies and can impersonate the human, once decrypted: anyone with access to
+the object and the archive key can act as the logged-in user. Restrict bucket IAM (above). Do not
+download it into project workspaces or logs. To wipe,
 stop the app, delete the archive objects referenced in the `.lease` sibling,
 the configured object and its `.prev`/`.lease` siblings, any orphan `.pending-*`
 uploads, and the app's local profile directory
@@ -303,6 +307,161 @@ before restarting. A dead local owner's Singleton locks are cleared safely.
 Implementation references: [Tailscale userspace networking](https://tailscale.com/docs/concepts/userspace-networking)
 and [OAuth clients](https://tailscale.com/docs/features/oauth-clients).
 
+## The profile archive
+
+Each snapshot is sealed before it leaves the pod, trimmed to what a signed-in session needs, and
+kept under `browser/<identity>/` of the factory bucket.
+
+### Location
+
+With the profile's `[state]` `bucket` or `volume` set, an identity's `profile_uri` defaults to
+`<bucket>/browser/<identity>/profile.tar.gz` (the volume: `file://<volume>/browser/<identity>/profile.tar.gz`); the
+`.prev`, `.lease` and `.pending-*` objects sit beside it. A `profile_uri` set explicitly still wins.
+
+- **S3-compatible endpoint.** `[state] endpoint` and `region` reach the app as `BROWSER_PROFILE_ENDPOINT`
+  and `BROWSER_PROFILE_REGION`, and are used for both fsspec (`s3fs` `client_kwargs`) and the obstore lease
+  (`endpoint`, `region`; `allow_http` only for an `http://` endpoint). Unset, the cloud's own endpoint is used.
+- **`file://` (a persistent volume).** `profile_uri = "file:///<mount>/browser/<identity>/profile.tar.gz"`
+  works for fsspec as it is. obstore's local store rejects the update-mode puts the lease needs, so for
+  `file://` the lease is the same JSON record kept by a compare-and-swap under an `flock` on a
+  `<lease>.flock` sidecar file (`LocalLeaseStore` in `browser_archive.py`). The `flock` is only
+  as good as the volume: a network filesystem without working locks admits two owners, so use a
+  volume that is single-attach (ReadWriteOnce) and local to the node.
+
+### Encryption
+
+Each archive gets a fresh random 256-bit data key and a random 96-bit nonce; the content is encrypted with
+AES-256-GCM (`cryptography`). The data key is wrapped with AES-KW by a key-encryption key (KEK) that
+is read from a Flyte secret. The stored object is a 66-byte header followed by the ciphertext and its
+16-byte tag:
+
+| bytes | content |
+| --- | --- |
+| 4 | magic `FBAR` |
+| 1 | version (1) |
+| 8 | key id: an HMAC of a fixed label under the KEK, so it names the key without being it |
+| 1 + 40 | length and AES-KW-wrapped data key |
+| 12 | GCM nonce |
+
+The whole header is the GCM associated data, so changing any byte of it fails authentication. A key
+rotation therefore does not need a rewrite of old archives to be detected: an archive under another
+key id says so.
+
+**The key secret** is `browser_archive_key` (the deployer mounts it in the personal browser apps only, as
+`BROWSER_ARCHIVE_KEY`; `start.sh` stages it in a private file like the bearer token, so it is never in
+`/proc/<pid>/environ`). `AGENT_FACTORY_BROWSER_ARCHIVE_KEY_SECRET` renames it at deploy time. It is one
+key for all identities. Create it once, without echoing it (32 random bytes, base64):
+
+```bash
+umask 077; key=$(mktemp)
+python3 -c 'import base64, os, sys; sys.stdout.write(base64.b64encode(os.urandom(32)).decode())' > "$key"
+flyte create secret browser_archive_key --from-file "$key"   # plus the usual project/domain options
+rm -f "$key"
+```
+
+Keep a copy of the value in the owner's password manager: without it the archives cannot be read
+and every identity must sign in again. Like the other secrets, a missing one stops the deployer
+from deploying the apps and names it in its report.
+
+**Failure rules.**
+
+- No (or malformed) key at start: the app exits before it restores or runs Chromium, naming only the error
+  class. It never writes an unencrypted archive, whether or not one exists yet.
+- An encrypted archive that the key cannot open (another key id, or none): an error that stops the app. It
+  does not fall back to `.prev` (which would roll the profile back without saying so), does not start on an
+  empty profile, and nothing is published, so the stored archive is untouched. Fix the secret and the
+  platform's restart recovers.
+- An archive under the right key that fails authentication (truncated or altered) is corruption, handled
+  as before: the previous generation, then an empty profile with the unreadable generations kept.
+- A plaintext `tar.gz` at the URI (written before this change) is restored once, as it is; the next snapshot
+  publishes a sealed, trimmed one and overwrites the plaintext object (and a plaintext `.prev`) with it, so no
+  unencrypted copy of the cookies stays in the bucket. Older noncurrent versions keep it until bucket versioning
+  expires them (30 days by default); delete those by hand if that is too long.
+
+### Trimming
+
+Only an allow-list is archived (`SESSION_STATE` in `browser_archive.py`, one comment per entry); everything
+else, including whatever a later Chromium adds, is left out, and restore works from that alone:
+`Default/Network/Cookies` (Chromium 96+; `Default/Cookies` for older builds) with their journals,
+`Default/Local Storage/`, `Default/Session Storage/`, `Default/Preferences` and `Local State`.
+
+Left out on purpose: caches, `History`, `Favicons`, `Service Worker/` (including `CacheStorage`),
+`Login Data` (saved passwords: the owner signs in by hand and nothing here uses them), and
+`Default/IndexedDB/`. IndexedDB is the one to revisit: it is large, and the sites this app is used with
+(GitHub, LinkedIn) keep their session in cookies and local storage, but that was **not tested against a real
+signed-in session**. If a site signs out after a restart, add `Default/IndexedDB` to `SESSION_STATE`.
+
+On Linux Chromium encrypts cookie values with a key from the keyring; Playwright launches Chromium with
+`--password-store=basic`, which uses a fixed key instead, so the cookie database is restorable on a new pod
+without a keyring. Verified with Chrome for Testing 155.0.8059.12 (the build Playwright ships in this
+image): a server-set cookie and a `localStorage` token, written in one profile, were both present when a
+fresh Chromium started on a directory holding only `Default/Cookies` and `Default/LocalStorage` copied from
+it. `Local State` is
+kept for setups that do keep the key there.
+
+### Measured sizes
+
+`ops/browser_archive_size.py PROFILE_DIR` (or `--synthetic` for a stand-in profile in a temp dir) builds the old archive (everything but caches), the trimmed one and
+the trimmed one sealed, and prints their sizes. Measured on a real profile: Chrome for Testing 155 headless
+(`--password-store=basic`), a fresh `--user-data-dir`, five public pages visited (example.com, a Wikipedia
+article, github.com/unionai-oss, python.org, news.ycombinator.com) plus a local page that set a cookie and a
+`localStorage` value.
+
+| archive | bytes |
+| --- | --- |
+| profile on disk | 7,492,889 |
+| old `tar.gz` (all but caches) | 335,229 |
+| trimmed `tar.gz` | 15,190 |
+| trimmed and encrypted | 15,272 |
+
+The trimmed archive is about 4.5% of the old one. A long-lived signed-in profile grows mostly in History,
+Favicons, Service Worker and IndexedDB, all left out, so the ratio should improve with age; `--synthetic`
+builds a stand-in profile for a quick check without a browser.
+
+Encryption adds 82 bytes (the header and the tag); sizes vary by a few bytes between runs because of gzip
+timestamps. Ciphertext does not compress, so the archive is gzipped before it is sealed.
+
+### IAM
+
+Only the browser app's workload identity should read or write `browser/`; the factory, the slots and
+people need no access. The apps' own identity is the one in the pod's service account.
+
+AWS, a bucket policy that denies everyone else (`APP_ROLE_ARN` is the app's role):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OnlyTheBrowserAppTouchesBrowserArchives",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::BUCKET/browser/*",
+      "Condition": {"StringNotEquals": {"aws:PrincipalArn": "APP_ROLE_ARN"}}
+    }
+  ]
+}
+```
+
+and on the app's role, only this: `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on
+`arn:aws:s3:::BUCKET/browser/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` with the condition
+`{"StringLike": {"s3:prefix": "browser/*"}}`. Other roles that hold bucket-wide access need the same
+prefix excluded.
+
+GCS: grant the app's service account `roles/storage.objectUser` on the bucket with an IAM condition on the
+object name, and grant no other principal a role that covers `browser/`:
+
+```
+resource.type == "storage.googleapis.com/Object" &&
+resource.name.startsWith("projects/_/buckets/BUCKET/objects/browser/")
+```
+
+The condition cannot limit `storage.objects.list`, which is evaluated against the bucket, not an object. Give the
+app's account a separate unconditional grant of a custom role holding only `storage.objects.list` on the bucket (the
+factory's account gets the same). Object names, not contents, are then visible to both accounts; reads and writes stay
+limited by the conditions. [terraform-factory-bucket.md](terraform-factory-bucket.md#gcp) has the HCL.
+
 ## Recovery, secrets and supervision
 
 - **Stuck profile lock.** The persistent profile admits one MCP client. nginx's gate sees each
@@ -313,7 +472,7 @@ and [OAuth clients](https://tailscale.com/docs/features/oauth-clients).
   idle for longer than the limit loses its browser tabs when another client initializes. A
   closed TCP connection is not observed; only silence is. Manual escape hatch:
   `curl -X POST -H "Authorization: Bearer $TOKEN" $ENDPOINT/admin/reset` (`$TOKEN` is the identity's token).
-- **Secrets.** `start.sh` writes the token and OAuth credentials to a private 0700 directory and
+- **Secrets.** `start.sh` writes the token, the archive key and OAuth credentials to a private 0700 directory and
   re-executes itself without them, so neither the entrypoint's nor its children's
   `/proc/<pid>/environ` holds them; personal.py reads and deletes the files. Flyte mounts
   secrets as files only at `/etc/flyte/secrets`, with a layout for apps that is not documented,

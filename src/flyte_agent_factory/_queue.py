@@ -348,7 +348,7 @@ def take_lease(queue: str, holder: str, now: float | None = None) -> str | None:
     now = time.time() if now is None else now
     key = _state_store.key_of(f"{queue}/{_LEASE}")
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], str | None]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], str | None]:
         lease = _parse_lease(snap.read(key))
         if lease and lease["holder"] != holder and lease["expires"] > now:
             return {}, lease["holder"]
@@ -360,12 +360,20 @@ def take_lease(queue: str, holder: str, now: float | None = None) -> str | None:
 
 def release_lease(queue: str, holder: str) -> None:
     key = _state_store.key_of(f"{queue}/{_LEASE}")
+    store = _state_store.current()
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], None]:
         # Not one that expired and was taken over meanwhile.
-        return ({key: None} if _parse_lease(snap.read(key)).get("holder") == holder else {}), None
+        if _parse_lease(snap.read(key)).get("holder") != holder:
+            return {}, None
+        if store.conditional_delete:
+            return {key: None}, None
+        # An object store cannot delete only if unchanged, and a delete could remove the lease another
+        # dispatcher took after this read. A conditional write of an already expired lease cannot, and
+        # `take_lease` treats it as free.
+        return {key: json.dumps({"holder": "", "expires": 0}).encode()}, None
 
-    _state_store.current().transact(decide, f"release lease {holder}")
+    store.transact(decide, f"release lease {holder}")
 
 
 def exists(path: str) -> bool:
@@ -474,7 +482,7 @@ def put_reserve(account: str, k: float) -> None:
         raise ValueError(f"k must be a number of percent per hour, 0 or more, not {k!r}")
     key = _state_store.key_of(_RESERVE)
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], None]:
         # The whole file is rewritten, so it is read here, on the tip the push is made against.
         stored = {a: v for a, v in _reserves_in(json_object(snap.read(key))).items() if a != account}
         body = json.dumps({**stored, **({account: k} if k else {})}, sort_keys=True).encode()

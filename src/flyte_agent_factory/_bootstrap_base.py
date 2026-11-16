@@ -253,6 +253,14 @@ class Settings:
     dry_run: bool = False
     redeploy: bool = False
     status_only: bool = False
+    # What `_bootstrap_state` found, written to `[state]` when the profile is made: the factory's own bucket
+    # (empty keeps the git store) and Flyte's data bucket(s), which the state must stay out of.
+    state_bucket: str = ""
+    state_region: str = ""
+    state_endpoint: str = ""
+    factory_service_account: str = ""
+    browser_service_account: str = ""
+    flyte_buckets: tuple[str, ...] = ()
 
     @property
     def read_only(self) -> bool:

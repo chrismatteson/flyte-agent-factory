@@ -83,6 +83,25 @@ def collect_wanted_keys(
     }
     if settings.backend == "union":  # a Union backend requires it; an OSS one has no such secrets
         keys["union"] = {"project_key": SECRET_UNION_PROJECT, "deployer_key": SECRET_UNION_DEPLOYER}
+    state: dict[str, object] = {}
+    if settings.state_bucket:
+        state["bucket"] = settings.state_bucket
+        state.update(
+            {
+                k: v
+                for k, v in (
+                    ("region", settings.state_region),
+                    ("endpoint", settings.state_endpoint),
+                    ("factory_service_account", settings.factory_service_account),
+                    ("browser_service_account", settings.browser_service_account),
+                )
+                if v
+            }
+        )
+    if settings.flyte_buckets:
+        state["flyte_bucket"] = list(settings.flyte_buckets)
+    if state:
+        keys["state"] = state
     if app_id:
         keys["github"] = {"app_id": app_id, "private_key_secret": SECRET_APP_KEY}
         keys["deploy"] = {"auto": True}
@@ -152,6 +171,10 @@ def _fill_missing_text(path: Path, settings: Settings, app_id: str | None) -> tu
             continue
         have = present.get(table)
         missing = {k: v for k, v in values.items() if not isinstance(have, dict) or k not in have}
+        if table == "state" and isinstance(have, dict) and {"backend", "bucket", "volume"} & have.keys():
+            # The person has chosen a backend: a bucket beside it could contradict it. Only what the
+            # engine must know about Flyte is added.
+            missing = {k: v for k, v in missing.items() if k == "flyte_bucket"}
         if missing:
             text = _add_keys(text, path, table, have, missing)
             added.extend(f"{table}.{k}" for k in missing)

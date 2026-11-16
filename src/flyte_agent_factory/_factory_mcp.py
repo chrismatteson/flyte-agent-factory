@@ -32,7 +32,7 @@ from mcp.server.fastmcp import (
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
 
-from . import _factory, _grant_page, _profile, _profile_oss, _resources, _union_identity
+from . import _factory, _grant_page, _profile, _profile_oss, _resources, _state_pod, _union_identity
 from ._bridge import _ENDED_PHASES, _ended_on_server
 from ._bridge_common import parse_approval
 from ._errors import REMOTE_ERRORS
@@ -231,6 +231,7 @@ app = FlyteMCPAppEnvironment(
     instructions=INSTRUCTIONS,
     allowed_hosts=[urlparse(_public_url).netloc] if _public_url else None,
     allowed_origins=[_public_url] if _public_url else None,
+    **_state_pod.environment_kwargs(PROFILE, "factory", app=True),
     secrets=[*_QUEUE_SECRETS],
     env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     # Spelled out: the app defaults to 1 CPU / 512Mi when it gets None, and `mcp` asks for nothing.

@@ -91,6 +91,11 @@ The setup it performs, in the order a person thinks of it:
    d=~/flyte-agent-factory; u=https://github.com/unionai-oss/flyte-agent-factory; { [ -d "$d/.git" ] || git clone -q "$u" "$d"; } && case "$(git -C "$d" config --get remote.origin.url)" in "$u"|"$u.git") ;; *) echo "$d is not a clone of $u" >&2; false ;; esac && git -C "$d" checkout -q main && git -C "$d" pull -q --ff-only origin main && cd "$d" && uv sync -q --python 3.12 && uv run python ops/bootstrap.py --endpoint flyte.example.com --project my-agents --workspace you/agent-workspace --redeploy
    ```
 
+To keep the factory's state in a bucket of its own (recommended for production) instead of a git branch, add
+`--state-bucket s3://BUCKET/PREFIX` (or `gs://`) to the command, or set `AGENT_FACTORY_STATE_BUCKET`, or give
+`--terraform-dir DIR` to read the `factory_bucket` output of the Terraform module; the bootstrap writes
+`[state] bucket` into the profile, and refuses Flyte's own data bucket ([setup.md](setup.md#where-the-state-lives)).
+
 Around those seven, the bootstrap also checks tools and signs you in to Flyte, makes sure the project exists,
 stores your engine token, and, after the deploy, reads the factory MCP's URL into the profile and redeploys. The
 full table has one line per step, and a line stays `todo` until its live check passes. The command runs the steps in this table's
@@ -347,15 +352,16 @@ export FLYTE_PROJECT="$(PYTHONPATH=src uv run python -m flyte_agent_factory._pro
 export FLYTE_DOMAIN="$(PYTHONPATH=src uv run python -m flyte_agent_factory._profile domain)"
 ```
 
-### Factory state needs no storage
+### Factory state: a git branch, or a bucket
 
 The factory keeps its own state (the launch queue, usage reserves, admission wait reasons) on an orphan git
-branch of your workspace repository, `factory-state/<project>-<domain>`, so there is no bucket, prefix or IAM
-policy to set up and no `[state]` table to write. It is reached with `[secrets] deploy_key`, which the
-bootstrap creates as a write key; from your machine, with your own git credentials. See
+branch of your workspace repository, `factory-state/<project>-<domain>`, by default: git is the zero-setup
+option, with no bucket, prefix or IAM policy to set up and no `[state]` table to write. It is reached with
+`[secrets] deploy_key`, which the bootstrap creates as a write key; from your machine, with your own git
+credentials. A bucket of its own is the production default (see `--state-bucket` below). See
 [state-store.md](state-store.md). A profile left over from an older install may still carry `[state] uri`; it
 is ignored with a deprecation warning, and so is `--state-uri` on an old bootstrap command. To move a factory
-that has state in a bucket, see "Cutover from the bucket" in [state-store.md](state-store.md).
+that has state in a bucket, see "Cutover from the old Flyte-bucket layout" in [state-store.md](state-store.md).
 
 List secret names/metadata in the selected project/domain:
 

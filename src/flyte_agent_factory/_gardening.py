@@ -206,7 +206,7 @@ def record_counts(scans: Mapping[str, Mapping[str, int]]) -> None:
     """
     key = _state_store.key_of(_COUNTS)
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], None]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], None]:
         # The baseline is rewritten whole, so it is read here, on the tip the push is made against.
         clean = _counts_in(_queue.json_object(snap.read(key)))["clean"]
         for target, rules in scans.items():

@@ -410,7 +410,7 @@ A launch carries a `priority`: `normal` (the default), `low` (starts only when a
 or `expedite` (goes first). An account (`claude`, `codex`) can hold back `k` percent of each usage window per hour left
 until that window resets: a launch waits when its account has less than `k` times the hours to reset left, and it
 reopens as the reset nears. Set it from chat with `factory.set_reserve` and read it with `factory.get_reserve`; it
-is kept on the factory's state branch ([state-store.md](state-store.md)).
+is kept in the factory's state store ([state-store.md](state-store.md)).
 
 ## Why it works this way
 
@@ -542,7 +542,7 @@ the session role definitions, the browser image files and the workspace template
 | `_factory_recreate.py` | recreating runs the deployer aborted, and the workspace a new run starts from |
 | `_factory_status.py` | reading an older project report's HTML for the timeline and activity |
 | `_tick_guard.py` | a scheduled tick skips itself while an earlier run of its task is live |
-| `_queue.py` | the launch queue's storage and the reserve file on the factory's state branch |
+| `_queue.py` | the launch queue's storage and the reserve file in the factory's state store (the branch, on the git backend) |
 | `_factory_mcp.py` | the factory MCP server: every stock tool, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
 
 **Planning, the loop and the board**

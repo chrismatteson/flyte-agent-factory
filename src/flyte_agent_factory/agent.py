@@ -82,6 +82,7 @@ from flyte_agent_factory import (
     _session_setup,
     _standards,
     _state,
+    _state_pod,
     _subagent_run,
     _supervise,
     _supervise_support,
@@ -225,6 +226,7 @@ _session_secrets, _session_env_vars = _union_identity.pod_for(_session_config._P
 
 env = flyte.TaskEnvironment(
     name=_ENV_NAME,
+    **_state_pod.environment_kwargs(_session_config._PROFILE, "factory"),
     # Modules reached lazily (`_factory` and its deps; the `credential-grant` command) must ship explicitly.
     include=(
         "_factory.py",

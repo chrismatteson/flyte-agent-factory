@@ -147,7 +147,7 @@ do nothing. Issue content is fenced as untrusted project data, and session guida
 cannot change factory or security settings. Refused authors receive no GitHub reply.
 
 Queue requests retain `issue = "owner/repo#number"`; runs carry a `factory-issue` label derived
-from that reference. The intake lease is a compare-and-swap commit on the factory's state branch
+from that reference. The intake lease is a compare-and-swap commit in the factory's state store (the branch, on the git backend)
 ([state-store.md](state-store.md)). A crash between signalling a condition and recording
 delivery can repeat a direction on retry.
 

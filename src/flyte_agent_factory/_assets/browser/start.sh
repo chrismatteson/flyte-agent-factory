@@ -16,10 +16,10 @@ set -euo pipefail
 # /etc/flyte/secrets, whose layout for apps is not documented, so this does not depend on it.
 if [ "${BROWSER_PERSONAL:-0}" = "1" ] && [ -z "${BROWSER_SECRETS_DIR:-}" ]; then
     secrets_dir=$(mktemp -d)
-    for name in BROWSER_PERSONAL_TOKEN TAILSCALE_OAUTH_CLIENT_ID TAILSCALE_OAUTH_CLIENT_SECRET; do
+    for name in BROWSER_PERSONAL_TOKEN BROWSER_ARCHIVE_KEY TAILSCALE_OAUTH_CLIENT_ID TAILSCALE_OAUTH_CLIENT_SECRET; do
         [ -n "${!name:-}" ] && (umask 077 && printf %s "${!name}" > "$secrets_dir/$name")
     done
-    exec env -u BROWSER_PERSONAL_TOKEN -u TAILSCALE_OAUTH_CLIENT_ID -u TAILSCALE_OAUTH_CLIENT_SECRET \
+    exec env -u BROWSER_PERSONAL_TOKEN -u BROWSER_ARCHIVE_KEY -u TAILSCALE_OAUTH_CLIENT_ID -u TAILSCALE_OAUTH_CLIENT_SECRET \
         BROWSER_SECRETS_DIR="$secrets_dir" /bin/bash "$0" "$@"
 fi
 
@@ -67,7 +67,7 @@ if [ "${BROWSER_PERSONAL:-0}" = "1" ]; then
     rm -f /tmp/personal-ready /tmp/personal-mcp.pid
     python3 /opt/browser/personal.py &
     PERSONAL_PID=$!
-    unset TAILSCALE_OAUTH_CLIENT_ID TAILSCALE_OAUTH_CLIENT_SECRET BROWSER_PERSONAL_TOKEN BROWSER_SECRETS_DIR
+    unset TAILSCALE_OAUTH_CLIENT_ID TAILSCALE_OAUTH_CLIENT_SECRET BROWSER_PERSONAL_TOKEN BROWSER_ARCHIVE_KEY BROWSER_SECRETS_DIR
     for _ in $(seq 1 240); do
         [ -e /tmp/personal-ready ] && break
         kill -0 "$PERSONAL_PID" 2>/dev/null || exit 1

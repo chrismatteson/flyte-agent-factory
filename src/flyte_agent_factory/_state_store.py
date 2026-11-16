@@ -23,6 +23,7 @@ import json
 import os
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -31,9 +32,12 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, overload
 
 from flyte_agent_factory import _git
+
+if TYPE_CHECKING:
+    from flyte_agent_factory import _profile_state
 
 T = TypeVar("T")
 
@@ -123,6 +127,42 @@ def _redact(text: str) -> str:
     return re.sub(r"(//)[^/@\s]+@", r"\1***@", text)
 
 
+class SnapshotView(Protocol):
+    """What a `decide` function reads: the files as of one moment, never changed by later writes."""
+
+    tip: str  # names the state read: a commit sha for git, a digest of the listing for objects
+
+    def read(self, key: str) -> bytes | None: ...
+    def read_many(self, keys: builtins.list[str]) -> dict[str, bytes]: ...
+    def exists(self, key: str) -> bool: ...
+    def list(self, prefix: str = "") -> builtins.list[str]: ...
+
+
+class Store(Protocol):
+    """What callers use of the state: files by key, snapshots, and compare-and-swap transactions.
+
+    Implemented by `StateStore` (git), `_state_bucket.BucketStore` (an object store) and the volume backend.
+    `fresh` asks for a read no older than the call; a backend that always reads current state ignores it.
+    """
+
+    #: Whether `transact` can delete a key conditionally. Object stores cannot, so a caller that deletes a key
+    #: contended between writers (`_queue.release_lease`) writes a tombstone there instead.
+    conditional_delete: bool
+
+    def read(self, key: str, *, fresh: bool = False) -> bytes | None: ...
+    def exists(self, key: str, *, fresh: bool = False) -> bool: ...
+    def list(self, prefix: str = "", *, fresh: bool = False) -> builtins.list[str]: ...
+    def snapshot(self, *, fresh: bool = False) -> SnapshotView: ...
+    def write(self, changes: Mapping[str, bytes | None], message: str) -> bool: ...
+    def transact(
+        self, decide: Callable[[SnapshotView], tuple[Mapping[str, bytes | None], T]], message: str
+    ) -> T: ...
+    def fs(self) -> StateFS: ...
+    def recent_changes(self, limit: int) -> builtins.list[dict[str, object]]:
+        """Return the newest changes, newest first: dicts with `at` (epoch seconds), `message` and `keys`."""
+        ...
+
+
 class Snapshot:
     """The files of one commit. Immutable: later writes do not change what it returns."""
 
@@ -155,6 +195,8 @@ class Snapshot:
 class StateStore:
     """One branch of one remote, cached in the bare repository `cache_dir`."""
 
+    conditional_delete = True  # a delete is a commit on the tip, like any write
+
     def __init__(
         self,
         remote: str,
@@ -171,12 +213,19 @@ class StateStore:
         self.ttl = ttl
         self.retries = retries
         self._author = author
+        # A commit is named by its parent, tree, message, identity and second. Two stores that make the same
+        # change on the same tip in the same second would otherwise make the *same commit*, both pushes
+        # would "succeed" (the second is an up-to-date no-op), and one of two increments would be lost.
+        self._writer = secrets.token_hex(4)
         self._ref = f"refs/remotes/origin/{branch}"
         self._lock = threading.RLock()
         self._depth = 0  # how many times this thread holds the lock; only the outermost takes the file lock
         self._fetched = float("-inf")  # time.monotonic() of the last fetch
         self._snap: Snapshot | None = None
         self._ready = False
+        # Read by the benchmark (`ops/state_bench.py`); they change nothing about how a write behaves.
+        self.pushes = 0  # commits this store pushed
+        self.lost_races = 0  # pushes rejected because another writer moved the branch first
 
     # -- reads ---------------------------------------------------------------------------------------
 
@@ -209,7 +258,9 @@ class StateStore:
         # Its first look at the tip may be up to `ttl` old: if that shows nothing to do, `_cas` looks again.
         return self._cas(lambda _snap: (changes, True), message, fresh=False)[1]
 
-    def transact(self, decide: Callable[[Snapshot], tuple[Mapping[str, bytes | None], T]], message: str) -> T:
+    def transact(
+        self, decide: Callable[[SnapshotView], tuple[Mapping[str, bytes | None], T]], message: str
+    ) -> T:
         """Commit what `decide` returns against a fresh tip; if the push loses, call `decide` again.
 
         `decide` must be pure apart from what it returns: it can run several times.
@@ -219,9 +270,27 @@ class StateStore:
     def fs(self) -> StateFS:
         return StateFS(self)
 
+    def recent_changes(self, limit: int) -> builtins.list[dict[str, object]]:
+        """Return the newest `limit` commits of the branch, newest first, from `git log`."""
+        with self._locked():
+            self.snapshot(fresh=True)  # fetch; the log is of the cached branch
+            tip = self._tip()
+            if not tip or limit < 1:
+                return []
+            # \x01 starts a commit, \x02 splits time from subject; --name-only follows, one key a line.
+            out = self._git("log", f"--max-count={limit}", "--name-only", "--format=%x01%ct%x02%s", tip)
+        changes = []
+        for chunk in out.decode(errors="replace").split("\x01")[1:]:
+            head, _, names = chunk.partition("\n")
+            at, _, message = head.partition("\x02")
+            changes.append(
+                {"at": float(at), "message": message, "keys": sorted(n for n in names.split("\n") if n)}
+            )
+        return changes
+
     def _cas(
         self,
-        decide: Callable[[Snapshot], tuple[Mapping[str, bytes | None], T]],
+        decide: Callable[[SnapshotView], tuple[Mapping[str, bytes | None], T]],
         message: str,
         *,
         fresh: bool,
@@ -242,8 +311,10 @@ class StateStore:
                     fresh = True  # decided on a tip up to `ttl` old: make sure before saying "nothing to do"
                     continue
                 if self._push(commit):
+                    self.pushes += 1
                     self._git("update-ref", self._ref, commit)
                     return result, True
+                self.lost_races += 1
                 self._fetch()  # lost the race: the next attempt decides on the winner's tip
         raise StateError(f"{self.branch}: push rejected {self.retries} times; giving up")
 
@@ -270,9 +341,9 @@ class StateStore:
             return None
         identity = {
             "GIT_AUTHOR_NAME": self._author,
-            "GIT_AUTHOR_EMAIL": f"{self._author}@users.noreply.invalid",
+            "GIT_AUTHOR_EMAIL": f"{self._author}+{self._writer}@users.noreply.invalid",
             "GIT_COMMITTER_NAME": self._author,
-            "GIT_COMMITTER_EMAIL": f"{self._author}@users.noreply.invalid",
+            "GIT_COMMITTER_EMAIL": f"{self._author}+{self._writer}@users.noreply.invalid",
         }
         parent = ["-p", tip] if tip else []  # no parent: the first commit makes the branch an orphan
         return self._git("commit-tree", tree, *parent, "-m", message, env=identity).decode().strip()
@@ -424,9 +495,9 @@ class StateStore:
 
 
 class StateFS:
-    """The filesystem calls the queue makes, over a StateStore, for full paths that start with ROOT."""
+    """The filesystem calls the queue makes, over a Store, for full paths that start with ROOT."""
 
-    def __init__(self, store: StateStore) -> None:
+    def __init__(self, store: Store) -> None:
         self._store = store
 
     def makedirs(self, path: str, *, exist_ok: bool) -> None:
@@ -457,7 +528,7 @@ class StateFS:
     def rm(self, path: str) -> None:
         key = key_of(path)
 
-        def decide(snap: Snapshot) -> tuple[Mapping[str, bytes | None], None]:
+        def decide(snap: SnapshotView) -> tuple[Mapping[str, bytes | None], None]:
             if not snap.exists(key):
                 raise FileNotFoundError(path)
             return {key: None}, None
@@ -477,12 +548,12 @@ def _at(body: bytes) -> float:
     return float(at) if isinstance(at, int | float) and not isinstance(at, bool) else 0.0
 
 
-_configured: StateStore | None = None
-_built: dict[tuple[str, str, str], StateStore] = {}
+_configured: Store | None = None
+_built: dict[tuple[str, ...], Store] = {}
 _built_lock = threading.Lock()
 
 
-def configure(store: StateStore | None) -> None:
+def configure(store: Store | None) -> None:
     """Set the process-wide store, or clear it (and the ones `current` built) with None."""
     global _configured
     with _built_lock:
@@ -490,10 +561,13 @@ def configure(store: StateStore | None) -> None:
         _built.clear()
 
 
-def current(*, branch: str = "") -> StateStore:
+def current(*, branch: str = "") -> Store:
     """Return the configured store, else one built from the environment and the profile.
 
-    The environment wins over `branch`, which wins over the profile's `[state] branch`.
+    The git backend: the environment wins over `branch`, which wins over the profile's `[state] branch`.
+    A profile with `[state] bucket` or `volume` selects that backend instead, unless
+    `AGENT_FACTORY_STATE_REMOTE` is set: that override is for git (operator tools, tests) and is never
+    forwarded to a pod.
     """
     if _configured is not None:
         return _configured
@@ -505,12 +579,20 @@ def current(*, branch: str = "") -> StateStore:
     if from_env and not valid_branch(from_env):
         raise StateError(f"AGENT_FACTORY_STATE_BRANCH is not a valid git branch name: {from_env!r}")
     name = from_env or branch
+    profile = None
     if not remote or not name:
         profile = _profile.current()
         if profile is None:
             raise StateError("no state remote: set AGENT_FACTORY_STATE_REMOTE or select a profile")
+        if profile.state.backend != "git" and not remote:
+            return _object_store(profile.state)
         remote = remote or profile.repo
         name = name or profile.state.branch or default_branch(profile.backend.project, profile.backend.domain)
+    return git_store(remote, name)
+
+
+def git_store(remote: str, name: str) -> Store:
+    """Return the git store of branch `name` on `remote`, one per process (and cache directory)."""
     base = os.environ.get("AGENT_FACTORY_BASE") or os.environ.get("HOME") or "/tmp"
     with _built_lock:
         if (remote, name, base) not in _built:
@@ -518,3 +600,27 @@ def current(*, branch: str = "") -> StateStore:
             cache = Path(base) / ".cache" / "flyte-agent-factory" / "state" / f"{digest}.git"
             _built[remote, name, base] = StateStore(remote, name, cache)
         return _built[remote, name, base]
+
+
+def _object_store(state: _profile_state.State) -> Store:
+    """Return the bucket or volume store `[state]` names (one per process and setting)."""
+    from flyte_agent_factory import _profile_state, _state_bucket, _state_volume
+
+    key = (state.backend, state.bucket, state.endpoint, state.region, state.volume)
+    with _built_lock:
+        if key not in _built:
+            if state.backend == "bucket":
+                # The bucket's own check, again at the point of use: the Flyte task this runs in knows its
+                # raw-data prefix even when the profile does not say which that is.
+                _profile_state.refuse_flyte_bucket(
+                    state.bucket, (*state.flyte_bucket, *_profile_state.runtime_flyte_prefixes())
+                )
+                _built[key] = _state_bucket.open_store(
+                    state.bucket,
+                    endpoint=state.endpoint,
+                    region=state.region,
+                    retention_days=state.retention_days,
+                )
+            else:
+                _built[key] = _state_volume.open_store(state.volume, retention_days=state.retention_days)
+        return _built[key]

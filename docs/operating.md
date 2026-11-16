@@ -22,13 +22,13 @@ come back: the coordinator starts a fresh session over that workspace.
 
 Projects started through the factory (`factory.launch` from chat, or `ops/operate.py launch`) never fail for
 capacity. A launch is validated (name slug, brief size, repo allowlist, model), written to
-`queue/<name>/` on the factory's state branch ([state-store.md](state-store.md)), and started at once if a slot is free; otherwise it waits and the
+`queue/<name>/` in the factory's state ([state-store.md](state-store.md): a dedicated bucket is the recommended production default, git the zero-setup trial, a volume for open-source single-node use; measurements and when to outgrow the bucket in [state-escalation.md](state-escalation.md)), and started at once if a slot is free; otherwise it waits and the
 `factory.sweep` task (every 5 minutes, [webhook setup](deploy-webhook.md)) starts it when
 a slot frees. The queue is first in, first out. Launching a
 name that is already waiting replaces its brief and keeps its place; launching the name of a finished project
 resumes it from its last published workspace with the new brief appended as direction. `factory.queue_list` and
 `factory.queue_cancel` (and `ops/operate.py queue` / `cancel NAME`) show and edit the queue; `operate.py overview`
-shows it too. Every identity that launches needs write access to the workspace repository, since the state branch lives there.
+shows it too. Every identity that launches needs write access to the workspace repository, since, on the git backend, the state store (the state branch) lives there.
 A project that has passed review releases 30 minutes after its session goes quiet (no direction, open question,
 child action or delegation, and not on a usage limit), typically about 60 minutes after the pass because the
 post-pass ask runs 30 minutes first. It snapshots, ends and frees its slot; launching the same name resumes it. Every
@@ -163,7 +163,7 @@ What you can send to the `direct-` condition while it waits:
 | --- | --- |
 | `/stop` | ends the project at once, as when it is running; it does not wait for the reset |
 | `/engine claude`, `/resume [on] claude`, `resume [now] on claude`, `switch to claude` (or `codex`) | the project switches to that engine now, through the handoff, if it can run; otherwise the timeline says when that engine resets and the project waits for it. The engine becomes a hard pin for the rest of the run |
-| `/clear-limit`, `/clear-limit codex` | forgets the remembered usage limit of that engine (Claude by default) in this project and, through the state branch, for every other project's pod (only this pod when the branch cannot be written), then the waiting review, the paused session and a waiting delegation try again at once ([remembered limits](#remembered-usage-limits)) |
+| `/clear-limit`, `/clear-limit codex` | forgets the remembered usage limit of that engine (Claude by default) in this project and, through the state store, for every other project's pod (only this pod when the branch cannot be written), then the waiting review, the paused session and a waiting delegation try again at once ([remembered limits](#remembered-usage-limits)) |
 | anything else | kept, and delivered once to the session when it resumes |
 
 An engine direction counts only as the whole message, in any case and with an optional final `.` or `!`:
@@ -193,7 +193,7 @@ outliving the limit:
 - **Clear on success.** Any call that is answered on an account (a judge, a delegate, the session itself once
   it runs again after a limit) drops a limit noted before the call began, whatever reset time was remembered;
   a refusal noted after it stands. A reading older than the clear does not bring it back.
-- **Shared.** A pod writes the limit it noted for an account to `limits/` on the state branch (`docs/state-store.md`)
+- **Shared.** A pod writes the limit it noted for an account to `limits/` in the state store (`docs/state-store.md`)
   (a hash of the account, the engine and times; never a token or a secret name; a Codex limit is kept per
   login, so one slot's success never clears another's), and writes `cleared_at` there when a call on that
   account succeeds while a limit is on record (no write per call). A pod that still remembers a limit reads
@@ -202,7 +202,7 @@ outliving the limit:
   nobody could read, and with either engine configured) and a delegation waiting for an engine resume at the
   next tick after a limit is cleared. A read or write the store refuses, or a record whose times are not
   numbers (read as absent; a `null` is absent without a log line), is logged at most once a minute (a record
-  not written yet is no failure) and never fails or defers a call; a pod that cannot push to the state branch (no deploy key, no
+  not written yet is no failure) and never fails or defers a call; a pod that cannot write to the state store (no deploy key, no
   network) keeps its limits to itself, and without a selected profile limits stay in their pod.
 
 To clear by hand, for example after resetting the weekly limit yourself, send `/clear-limit [engine]` to one

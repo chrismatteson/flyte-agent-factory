@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import fsspec  # type: ignore[import-untyped]
 import pytest
 from flyte.io import Dir
 
@@ -31,6 +33,7 @@ spec = importlib.util.spec_from_file_location("personal_runtime", ASSETS / "pers
 assert spec is not None and spec.loader is not None
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
+KEK = bytes(range(32))
 
 
 def test_snapshot_restore(tmp_path):
@@ -40,9 +43,9 @@ def test_snapshot_restore(tmp_path):
     (profile / "Default/Cache/data").write_text("cache")
     (profile / "SingletonLock").symlink_to("oldhost-123")
     uri = "memory://personal-test/profile.tar.gz"
-    runtime.snapshot(profile, uri)
+    runtime.snapshot(profile, uri, kek=KEK)
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri)
+    runtime.restore(restored, uri, kek=KEK)
     assert (restored / "Default/Cookies").read_bytes() == b"private cookies"
     assert not (restored / "Default/Cache").exists()
     assert not (restored / "SingletonLock").is_symlink()
@@ -309,19 +312,19 @@ def test_credentials_not_in_children(monkeypatch):
 @pytest.mark.parametrize("previous", [True, False])
 def test_corrupt_restore_falls_back(tmp_path, data, previous, capsys):
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"private cookies")
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"private cookies")
     uri = (tmp_path / "snapshot.tar.gz").as_uri()
-    runtime.snapshot(profile, uri)
+    runtime.snapshot(profile, uri, kek=KEK)
     if previous:
-        (profile / "Cookies").write_bytes(b"new cookies")
-        runtime.snapshot(profile, uri)
+        (profile / "Default/Cookies").write_bytes(b"new cookies")
+        runtime.snapshot(profile, uri, kek=KEK)
     (tmp_path / "snapshot.tar.gz").write_bytes(data)
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri)
+    runtime.restore(restored, uri, kek=KEK)
     assert restored.is_dir()
     if previous:
-        assert (restored / "Cookies").read_bytes() == b"private cookies"
+        assert (restored / "Default/Cookies").read_bytes() == b"private cookies"
     else:
         assert not list(restored.iterdir())
     assert "private cookies" not in capsys.readouterr().out
@@ -369,25 +372,27 @@ def test_permission_denied_lock_not_removed(tmp_path, monkeypatch):
 
 def test_snapshot_skips_disappeared_files_and_caches(tmp_path, monkeypatch):
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"cookies")
-    (profile / "vanishes").write_bytes(b"temporary")
-    for name in runtime.EXCLUDED:
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"cookies")
+    (profile / "Default/Preferences").write_bytes(b"temporary")
+    for name in ("Cache", "Code Cache", "GPUCache", "ShaderCache", "CacheStorage"):
         (profile / "Default" / name).mkdir(parents=True, exist_ok=True)
         (profile / "Default" / name / "data").write_bytes(b"cache")
     add = runtime.tarfile.TarFile.add
 
     def race(self, path, *args, **kwargs):
-        if Path(path).name == "vanishes":
+        if Path(path).name == "Preferences":
             raise FileNotFoundError
         return add(self, path, *args, **kwargs)
 
     monkeypatch.setattr(runtime.tarfile.TarFile, "add", race)
     uri = (tmp_path / "profile.tar.gz").as_uri()
-    runtime.snapshot(profile, uri)
+    runtime.snapshot(profile, uri, kek=KEK)
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri)
-    assert [p.name for p in restored.iterdir()] == ["Cookies"]
+    runtime.restore(restored, uri, kek=KEK)
+    assert sorted(p.relative_to(restored).as_posix() for p in restored.rglob("*") if p.is_file()) == [
+        "Default/Cookies"
+    ]
 
 
 def test_personal_bearer_auth():
@@ -447,8 +452,8 @@ def test_exit_node_discovery_is_bounded(monkeypatch):
 
 def test_snapshot_cannot_publish_without_lease(tmp_path):
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"cookies")
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"cookies")
     uri = (tmp_path / "profile.tar.gz").as_uri()
 
     class Lost:
@@ -456,7 +461,7 @@ def test_snapshot_cannot_publish_without_lease(tmp_path):
             raise RuntimeError("Personal profile lease lost before snapshot publish")
 
     with pytest.raises(RuntimeError, match="lease lost"):
-        runtime.snapshot(profile, uri, Lost())
+        runtime.snapshot(profile, uri, Lost(), kek=KEK)
     assert not (tmp_path / "profile.tar.gz").exists()
     assert not list(tmp_path.glob("*.pending-*"))
 
@@ -596,14 +601,14 @@ def test_leased_snapshots_keep_two_generations_and_recover(tmp_path):
     lease = runtime.Lease(uri, store)
     assert lease.renew()
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"one")
-    runtime.snapshot(profile, uri, lease)
-    (profile / "Cookies").write_bytes(b"two")
-    runtime.snapshot(profile, uri, lease)
-    (profile / "Cookies").write_bytes(b"three")
-    runtime.snapshot(profile, uri, lease)
-    fs, key = runtime.fsspec.core.url_to_fs(uri)
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"one")
+    runtime.snapshot(profile, uri, lease, kek=KEK)
+    (profile / "Default/Cookies").write_bytes(b"two")
+    runtime.snapshot(profile, uri, lease, kek=KEK)
+    (profile / "Default/Cookies").write_bytes(b"three")
+    runtime.snapshot(profile, uri, lease, kek=KEK)
+    fs, key = fsspec.core.url_to_fs(uri)
     assert len(fs.glob(key + ".pending-*")) == 2
     with fs.open(lease.archives[0], "wb") as target:
         target.write(b"truncated")
@@ -611,9 +616,9 @@ def test_leased_snapshots_keep_two_generations_and_recover(tmp_path):
     replacement = runtime.Lease(uri, store)
     assert replacement.renew()
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri, replacement)
-    assert (restored / "Cookies").read_bytes() == b"two"
-    runtime.snapshot(restored, uri, replacement)
+    runtime.restore(restored, uri, replacement, kek=KEK)
+    assert (restored / "Default/Cookies").read_bytes() == b"two"
+    runtime.snapshot(restored, uri, replacement, kek=KEK)
     assert replacement.archives[1] == lease.archives[1]
     assert len(fs.glob(key + ".pending-*")) == 2
 
@@ -626,11 +631,11 @@ def test_delayed_old_owner_cannot_publish_after_takeover(tmp_path, monkeypatch):
     new = runtime.Lease("memory://test/profile", store)
     assert old.renew(now=100)
     assert new.renew(now=221)
-    original_put = runtime.obstore.put
+    original_put = runtime.browser_archive.obstore.put
     monkeypatch.setattr(runtime.time, "time", lambda: 222)
     with pytest.raises(RuntimeError, match="lease lost"):
         old.publish("old-archive", None)
-    record = json.loads(bytes(runtime.obstore.get(store, new.key).bytes()))
+    record = json.loads(bytes(runtime.browser_archive.obstore.get(store, new.key).bytes()))
     assert record["owner"] == new.owner
     assert record["archives"] == []
 
@@ -641,10 +646,10 @@ def test_delayed_old_owner_cannot_publish_after_takeover(tmp_path, monkeypatch):
             original_put(target, path, json.dumps(successor).encode())
         return original_put(target, path, data, **kwargs)
 
-    monkeypatch.setattr(runtime.obstore, "put", raced_put)
+    monkeypatch.setattr(runtime.browser_archive.obstore, "put", raced_put)
     with pytest.raises(RuntimeError, match="lease lost"):
         new.publish("new-archive", None)
-    record = json.loads(bytes(runtime.obstore.get(store, new.key).bytes()))
+    record = json.loads(bytes(runtime.browser_archive.obstore.get(store, new.key).bytes()))
     assert record["archives"] == ["successor-archive"]
 
 
@@ -654,9 +659,10 @@ def test_live_lease_blocks_startup_until_bounded_timeout(tmp_path, monkeypatch):
     monkeypatch.setenv("BROWSER_PROFILE_DIR", str(profile))
     monkeypatch.setenv("BROWSER_PROFILE_URI", "memory://test/profile")
     monkeypatch.setenv("BROWSER_PERSONAL_TOKEN", "test-token")
+    monkeypatch.setenv("BROWSER_ARCHIVE_KEY", base64.b64encode(KEK).decode())
     restored = []
     launched = []
-    monkeypatch.setattr(runtime, "restore", lambda *args: restored.append(True))
+    monkeypatch.setattr(runtime, "restore", lambda *args, **kwargs: restored.append(True))
     monkeypatch.setattr(runtime.subprocess, "Popen", lambda *args, **kw: launched.append(True))
     monkeypatch.setattr(runtime.signal, "signal", lambda *args: None)
     clock = iter([0, 181])
@@ -1011,11 +1017,11 @@ def test_personal_env_defined_only_when_profile_enables_it(section):
 
 def test_transient_storage_errors_are_retried_not_treated_as_corruption(tmp_path, monkeypatch):
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"private cookies")
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"private cookies")
     uri = (tmp_path / "snapshot.tar.gz").as_uri()
-    runtime.snapshot(profile, uri)
-    fs, _ = runtime.fsspec.core.url_to_fs(uri)
+    runtime.snapshot(profile, uri, kek=KEK)
+    fs, _ = fsspec.core.url_to_fs(uri)
     real_open = fs.open
     failures = [ConnectionResetError(), TimeoutError(), OSError("503 Service Unavailable")]
 
@@ -1027,17 +1033,17 @@ def test_transient_storage_errors_are_retried_not_treated_as_corruption(tmp_path
     monkeypatch.setattr(type(fs), "open", lambda self, *a, **k: flaky(*a, **k))
     monkeypatch.setattr(runtime.time, "sleep", lambda s: None)
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri)
+    runtime.restore(restored, uri, kek=KEK)
     assert not failures
-    assert (restored / "Cookies").read_bytes() == b"private cookies"
+    assert (restored / "Default/Cookies").read_bytes() == b"private cookies"
 
 
 def test_unreachable_storage_is_not_an_empty_profile(tmp_path, monkeypatch):
     profile = tmp_path / "profile"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"local cookies")
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default/Cookies").write_bytes(b"local cookies")
     uri = (tmp_path / "snapshot.tar.gz").as_uri()
-    fs, _ = runtime.fsspec.core.url_to_fs(uri)
+    fs, _ = fsspec.core.url_to_fs(uri)
 
     def unreachable(*args, **kwargs):
         raise ConnectionResetError
@@ -1047,8 +1053,8 @@ def test_unreachable_storage_is_not_an_empty_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(runtime.time, "sleep", lambda s: None)
     with pytest.raises(runtime.StorageUnavailable):
-        runtime.restore(profile, uri, retry_s=120)
-    assert (profile / "Cookies").read_bytes() == b"local cookies"
+        runtime.restore(profile, uri, retry_s=120, kek=KEK)
+    assert (profile / "Default/Cookies").read_bytes() == b"local cookies"
 
 
 def test_unreachable_storage_neither_starts_chromium_nor_snapshots(tmp_path, monkeypatch):
@@ -1057,6 +1063,7 @@ def test_unreachable_storage_neither_starts_chromium_nor_snapshots(tmp_path, mon
     monkeypatch.setenv("BROWSER_PROFILE_DIR", str(profile))
     monkeypatch.setenv("BROWSER_PROFILE_URI", "memory://test/profile")
     monkeypatch.setenv("BROWSER_PERSONAL_TOKEN", "test-token")
+    monkeypatch.setenv("BROWSER_ARCHIVE_KEY", base64.b64encode(KEK).decode())
     snapshots, released, launched = [], [], []
 
     class Held:
@@ -1068,7 +1075,7 @@ def test_unreachable_storage_neither_starts_chromium_nor_snapshots(tmp_path, mon
         def release(self):
             released.append(True)
 
-    def unreachable(*args):
+    def unreachable(*args, **kwargs):
         raise runtime.StorageUnavailable("ConnectionResetError")
 
     monkeypatch.setattr(runtime, "Lease", lambda uri: Held())
@@ -1089,14 +1096,14 @@ def test_retention_keeps_unreadable_generations_until_a_restored_profile_replace
 
     store = MemoryStore()
     uri = f"memory://retention-{tmp_path.name}/profile.tar.gz"
-    fs, _ = runtime.fsspec.core.url_to_fs(uri)
+    fs, _ = fsspec.core.url_to_fs(uri)
     lease = runtime.Lease(uri, store)
     assert lease.renew()
     profile = tmp_path / "profile"
-    profile.mkdir()
+    (profile / "Default").mkdir(parents=True)
     for content in (b"one", b"two"):
-        (profile / "Cookies").write_bytes(content)
-        runtime.snapshot(profile, uri, lease)
+        (profile / "Default/Cookies").write_bytes(content)
+        runtime.snapshot(profile, uri, lease, kek=KEK)
     older, newest = lease.archives[1], lease.archives[0]
     lease.release()
     for name in (older, newest):
@@ -1106,22 +1113,23 @@ def test_retention_keeps_unreadable_generations_until_a_restored_profile_replace
     second = runtime.Lease(uri, store)
     assert second.renew()
     restored = tmp_path / "restored"
-    runtime.restore(restored, uri, second)
+    runtime.restore(restored, uri, second, kek=KEK)
     assert not list(restored.iterdir())
     assert not second.trusted
     for _ in range(3):
-        (restored / "Cookies").write_bytes(b"signed in again")
-        runtime.snapshot(restored, uri, second)
+        (restored / "Default").mkdir(exist_ok=True)
+        (restored / "Default/Cookies").write_bytes(b"signed in again")
+        runtime.snapshot(restored, uri, second, kek=KEK)
     assert second.archives[1:] == [newest, older]
     assert fs.exists(older) and fs.exists(newest)
     second.release()
     # A later start restores the new profile, which makes it the lineage: retention is normal again.
     third = runtime.Lease(uri, store)
     assert third.renew()
-    runtime.restore(tmp_path / "again", uri, third)
+    runtime.restore(tmp_path / "again", uri, third, kek=KEK)
     assert third.trusted
-    runtime.snapshot(tmp_path / "again", uri, third)
-    runtime.snapshot(tmp_path / "again", uri, third)
+    runtime.snapshot(tmp_path / "again", uri, third, kek=KEK)
+    runtime.snapshot(tmp_path / "again", uri, third, kek=KEK)
     assert newest not in third.archives and not fs.exists(newest)
 
 
@@ -1137,12 +1145,12 @@ def test_lease_release_survives_storage_errors():
     def reset(*args, **kwargs):
         raise ConnectionResetError
 
-    original = runtime.obstore.put
-    runtime.obstore.put = reset
+    original = runtime.browser_archive.obstore.put
+    runtime.browser_archive.obstore.put = reset
     try:
         lease.release()
     finally:
-        runtime.obstore.put = original
+        runtime.browser_archive.obstore.put = original
 
 
 class FakeMcp:
