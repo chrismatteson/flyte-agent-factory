@@ -32,12 +32,14 @@ from . import (
     _profile_oss,
     _profile_policy,
     _profile_resources,
+    _profile_state,
     _profile_union,
     _standards,
     _state_store,
 )
 from ._profile_policy import Gardening as Gardening
 from ._profile_policy import JudgementPolicy as JudgementPolicy
+from ._profile_state import State as State
 
 PROFILE_ENV = "AGENT_FACTORY_PROFILE"
 #: The profile's text, set on deployed environments. Not a `AGENT_FACTORY_<ROLE>_*` policy key.
@@ -179,12 +181,6 @@ class Planner:
     """Admission policy; cutover requires single-writer deployment ownership."""
 
     admission: str = "legacy"
-
-
-@dataclass(frozen=True)
-class State:
-    branch: str = ""  # the state branch; "" is `_state_store.default_branch`
-    uri: str = ""  # retired: read only so that a profile that still sets it loads; nothing uses it
 
 
 @dataclass(frozen=True)
@@ -549,7 +545,7 @@ def _fields(
     return out
 
 
-def _browser(data: Mapping[str, Any], where: str) -> Browser:
+def _browser(data: Mapping[str, Any], where: str, state: State) -> Browser:
     """Parse `[browser]`, including the legacy `personal = true` shape (one identity named `personal`)."""
     table = dict(_table(data, "browser", where, required=False))
     legacy = table.pop("personal", False)
@@ -573,23 +569,26 @@ def _browser(data: Mapping[str, Any], where: str) -> Browser:
 
     identities = []
     for name, identity_table in identity_tables.items():
+        section = f"browser.identities.{name}"
         if not _IDENTITY_NAME.fullmatch(name):
-            raise ProfileError(
-                f"{where}: [browser.identities.{name}] name must match {_IDENTITY_NAME.pattern}"
-            )
-        values = _fields(
-            identity_table, f"browser.identities.{name}", where, ("profile_uri",), ("exit_node",)
-        )
-        identities.append(BrowserIdentity(name, values["profile_uri"], values.get("exit_node")))
+            raise ProfileError(f"{where}: [{section}] name must match {_IDENTITY_NAME.pattern}")
+        values = _fields(identity_table, section, where, (), ("profile_uri", "exit_node"))
+        if "profile_uri" in values and not values["profile_uri"]:
+            raise ProfileError(f"{where}: [{section}] profile_uri must be a non-empty string")
+        uri = values.get("profile_uri") or _profile_state.default_profile_uri(state, name)
+        if not uri:
+            raise ProfileError(f"{where}: missing key 'profile_uri' in [browser.identities.{name}]")
+        identities.append(BrowserIdentity(name, uri, values.get("exit_node")))
     if legacy:
         if LEGACY_IDENTITY in identity_tables:
             raise ProfileError(
                 f"{where}: [browser] personal = true and [browser.identities.{LEGACY_IDENTITY}] both define "
                 f"the {LEGACY_IDENTITY!r} identity; keep one"
             )
-        if not fields.get("profile_uri"):
+        uri = fields.get("profile_uri") or _profile_state.default_profile_uri(state, LEGACY_IDENTITY)
+        if not uri:
             raise ProfileError(f"{where}: personal browser requires profile_uri")
-        identities.append(BrowserIdentity(LEGACY_IDENTITY, fields["profile_uri"]))
+        identities.append(BrowserIdentity(LEGACY_IDENTITY, uri))
     uris = [i.profile_uri for i in identities]
     if len(set(uris)) != len(uris):
         raise ProfileError(f"{where}: [browser.identities] two identities share one profile_uri")
@@ -937,7 +936,12 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             **cast(_GcpLists, lists),
         )
 
-    browser = _browser(data, where)
+    try:  # also refuses a bucket or archive inside Flyte's own data bucket, when the profile names it
+        state = _profile_state.parse(_table(data, "state", where, required=False))
+        browser = _browser(data, where, state)
+        _profile_state.check_not_flyte_bucket(state, [i.profile_uri for i in browser.identities])
+    except _profile_state.StateConfigError as exc:
+        raise ProfileError(f"{where}: {exc}") from exc
 
     deploy_table = dict(_table(data, "deploy", where, required=False))
     auto = deploy_table.pop("auto", False)
@@ -956,13 +960,11 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         raise ProfileError(f"{where}: [deploy] webhook must be true or false")
     if deploy_table:
         raise ProfileError(f"{where}: unknown key(s) in [deploy]: {', '.join(sorted(deploy_table))}")
-    state = State(
-        **_fields(_table(data, "state", where, required=False), "state", where, (), ("branch", "uri"))
-    )
     if state.uri:
         _warn_once(
             f"{where}: [state] uri is no longer read and is ignored: the factory's state lives on a git "
-            "branch of [repo] project (docs/state-store.md)"
+            "branch of [repo] project; `ops/migrate_state.py --from <that uri>` moves what it holds "
+            "(docs/state-store.md)"
         )
     if state.branch and not _state_store.valid_branch(state.branch):
         raise ProfileError(

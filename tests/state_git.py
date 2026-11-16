@@ -37,7 +37,7 @@ def take_lease(remote: str, cache: str, holder: str) -> str:
     """Take the lease if it is absent; return who holds it afterwards. Run in a separate process."""
     store = _state_store.StateStore(remote, BRANCH, Path(cache), ttl=0.0, retries=50)
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], str]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], str]:
         held = snap.read("queue/.dispatch-lease.json")
         if held is not None:
             return {}, json.loads(held)["holder"]

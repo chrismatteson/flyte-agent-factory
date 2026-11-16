@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         _profile,
         _pull_requests,
         _resources,
+        _state_pod,
         _union_identity,
     )
     from ._errors import REMOTE_ERRORS
@@ -65,6 +66,7 @@ else:
         _profile,
         _pull_requests,
         _resources,
+        _state_pod,
         _union_identity,
     )
     from flyte_agent_factory._errors import REMOTE_ERRORS
@@ -263,6 +265,7 @@ _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 #: Issue intake and the closed-PR milestone. It holds the App key; the public app never does.
 issues_env = flyte.TaskEnvironment(
     name="factory-issues",
+    **_state_pod.environment_kwargs(PROFILE, "factory"),
     image=_image,
     resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     secrets=[
@@ -281,6 +284,12 @@ issues_env = flyte.TaskEnvironment(
 app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 env = flyte.app.AppEnvironment(
     name="factory-webhook",
+    # The planner runs in this app and reads the queue; without it the app touches no state.
+    **(
+        _state_pod.environment_kwargs(PROFILE, "factory", app=True)
+        if PROFILE.planner.admission == "planner"
+        else {}
+    ),
     image=_image,
     requires_auth=False,
     resources=_resources.for_component(PROFILE, "webhook").to_flyte(),

@@ -198,13 +198,18 @@ def test_each_identity_is_its_own_app_with_its_own_token_and_archive(monkeypatch
     )
     assert [s.key for s in _secrets(apps["github"])] == [
         "browser_github_token",
+        "browser_archive_key",
         "tailscale_oauth_client_id",
         "tailscale_oauth_client_secret",
         "factory-project-key",  # the queue tier's Union key, mounted last
     ]
     # linkedin overrides the default exit node with "" (direct egress): no exit node, no tailscale pair.
     assert _env_vars(apps["linkedin"])["BROWSER_EXIT_NODE"] == ""
-    assert [s.key for s in _secrets(apps["linkedin"])] == ["browser_linkedin_token", "factory-project-key"]
+    assert [s.key for s in _secrets(apps["linkedin"])] == [
+        "browser_linkedin_token",
+        "browser_archive_key",
+        "factory-project-key",
+    ]
 
 
 def test_the_deploy_override_of_the_exit_node_applies_to_inheriting_identities_only(monkeypatch):
@@ -227,6 +232,7 @@ def test_the_legacy_profile_yields_exactly_the_old_app(monkeypatch):
     assert _env_vars(app)["BROWSER_TAILSCALE_TAG"] == "tag:k8s"
     assert [(s.key, s.as_env_var) for s in _secrets(app)] == [
         ("browser_personal_token", "BROWSER_PERSONAL_TOKEN"),
+        ("browser_archive_key", "BROWSER_ARCHIVE_KEY"),
         ("tailscale_oauth_client_id", "TAILSCALE_OAUTH_CLIENT_ID"),
         ("tailscale_oauth_client_secret", "TAILSCALE_OAUTH_CLIENT_SECRET"),
         ("factory-project-key", "AGENT_FACTORY_UNION_KEY"),
@@ -291,6 +297,24 @@ def test_the_personal_app_serializes_with_its_grace_period():
     assert pod["terminationGracePeriodSeconds"] == 90
     assert [c["name"] for c in pod["containers"]] == ["app"]
     assert pod["containers"][0]["command"] == ["/bin/bash", "/opt/browser/start.sh"]
+
+
+def test_the_personal_app_mounts_the_state_volume_and_runs_as_the_browser_account():
+    from flyte.app._runtime.app_serde import _get_k8s_pod
+    from flyte.models import SerializationContext
+    from google.protobuf.json_format import MessageToDict
+
+    from flyte_agent_factory import browser
+
+    state = '[state]\nvolume="/state"\nvolume_claim="factory-state"\nbrowser_service_account="flyte-browser"'
+    profile = _profile.parse(WORK + PERSONAL + state)
+    app = browser.personal_app(profile, profile.browser.identities[0], "home-router")
+    assert isinstance(app.pod_template, flyte.PodTemplate)
+    pod = MessageToDict(_get_k8s_pod(app, app.pod_template, SerializationContext(version="v1")).pod_spec)
+    assert pod["volumes"][0]["persistentVolumeClaim"]["claimName"] == "factory-state"
+    assert pod["containers"][0]["volumeMounts"][0]["mountPath"] == "/state"
+    assert app.service_account == "flyte-browser"
+    assert pod["terminationGracePeriodSeconds"] == 90
 
 
 def test_view_link_for_initialises_flyte_in_a_fresh_process(monkeypatch):
@@ -543,8 +567,13 @@ def test_the_check_defines_every_identity_app(key):
 
     profile = _profile.parse(WORK + TWO)
     needed = _deploy_child.collect_planned_secrets(profile, SRC, _env())
-    assert needed["claude-browser-github"][0] == "browser_github_token"
-    assert needed["claude-browser-linkedin"] == ["browser_linkedin_token", "factory-project-key"]
+    # Sorted: the archive key sorts before each identity's token.
+    assert needed["claude-browser-github"][:2] == ["browser_archive_key", "browser_github_token"]
+    assert needed["claude-browser-linkedin"] == [
+        "browser_archive_key",
+        "browser_linkedin_token",
+        "factory-project-key",
+    ]
 
 
 def test_the_check_passes_when_every_secret_exists(monkeypatch, tmp_path, capsys, key):

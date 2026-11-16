@@ -24,6 +24,11 @@ dependencies = [
     # `flyte deploy` from a Mac would fail on the import.
     "flyteplugins-union>=0.15.5,<0.16.0 ; sys_platform == 'linux'",
     "pyjwt[crypto]>=2.8,<3",
+    # The state store's bucket backend. Pinned to the minor: its conditional-put and error classes are what
+    # `_state_bucket` relies on (the contract suite's CAS tests).
+    "obstore>=0.11,<0.12",
+    # The browser archive's envelope encryption (`browser_archive.seal`); it also arrives through the Flyte SDK.
+    "cryptography>=42",
     # Read by `_target_ci` to find the commands a target repo's workflows run.
     "pyyaml>=6,<7",
     # `_target_ci` reads a target repo's coverage data for the patch-coverage gate, in the pod.
@@ -32,6 +37,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "moto[server]>=5.2.5",
     "mypy>=2.4.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -114,7 +120,7 @@ python_version = "3.12"
 strict = true
 explicit_package_bases = true
 warn_unreachable = true
-mypy_path = "src"
+mypy_path = "src:src/flyte_agent_factory/_assets/browser"  # the second: personal.py imports its sibling
 exclude = ['^(?!(.*/)?tests/)(.*/)?(test_[^/]*|[^/]*_test)\.py$', '^tests/fixtures/']
 
 [[tool.mypy.overrides]]

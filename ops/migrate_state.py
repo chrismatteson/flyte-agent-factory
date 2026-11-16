@@ -88,7 +88,7 @@ def _digest(body: bytes) -> str:
     return hashlib.sha1(body).hexdigest()
 
 
-def _record(snap: _state_store.Snapshot) -> dict[str, dict[str, Any]]:
+def _record(snap: _state_store.SnapshotView) -> dict[str, dict[str, Any]]:
     try:
         raw = json.loads(snap.read(RECORD) or b"{}")
     except ValueError:
@@ -156,7 +156,7 @@ def _targets(
 
 def migrate(
     source: Mapping[str, bytes],
-    store: _state_store.StateStore,
+    store: _state_store.Store,
     *,
     dry_run: bool = False,
     overwrite: bool = False,
@@ -185,7 +185,7 @@ def migrate(
             invalid.append(key)
     wanted = [key for key in wanted if key not in invalid]
 
-    def decide(snap: _state_store.Snapshot) -> tuple[dict[str, bytes | None], dict[str, Any]]:
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], dict[str, Any]]:
         # Decided on the tip the push is made against: a write the new code makes meanwhile makes the
         # push lose, and this runs again on top of it rather than over it.
         return _plan(source, wanted, skipped + invalid, snap, overwrite=overwrite)
@@ -199,7 +199,7 @@ def _plan(
     source: Mapping[str, bytes],
     wanted: list[str],
     skipped: list[str],
-    snap: _state_store.Snapshot,
+    snap: _state_store.SnapshotView,
     *,
     overwrite: bool,
 ) -> tuple[dict[str, bytes | None], dict[str, Any]]:

@@ -10,7 +10,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -99,10 +99,10 @@ def test_a_state_branch_in_the_profile_selects_the_branch(monkeypatch, tmp_path)
     profile = dataclasses.replace(_factory_base.PROFILE, state=_profile.State(branch="x/y"))
     monkeypatch.setattr(_profile, "current", lambda: profile)
     _state_store.configure(None)  # the suite's own store would answer otherwise
-    assert _state_store.current().branch == "x/y"
+    assert cast(_state_store.StateStore, _state_store.current()).branch == "x/y"
     _state_store.configure(None)
     monkeypatch.setattr(_profile, "current", lambda: dataclasses.replace(profile, state=_profile.State()))
-    assert _state_store.current().branch == _state_store.default_branch(
+    assert cast(_state_store.StateStore, _state_store.current()).branch == _state_store.default_branch(
         profile.backend.project, profile.backend.domain
     )
 
@@ -261,7 +261,7 @@ def test_queue_list_and_status_show_state_written_by_another_pod(flyte_world, tm
 
 def flyte_world_remote(_world: Any) -> str:
     """The bare repository behind the suite's store."""
-    return str(_state_store.current().remote)
+    return str(cast(_state_store.StateStore, _state_store.current()).remote)
 
 
 # --- a project pod's deploy key is chosen by the project's clone, never by the state store ------------------

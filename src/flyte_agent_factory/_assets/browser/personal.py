@@ -8,6 +8,7 @@ import gzip
 import hmac
 import html
 import http.cookies
+import io
 import ipaddress
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -31,11 +33,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, ContextManager, Protocol, TypedDict, TypeVar, cast
 
-import fsspec  # type: ignore[import-untyped]  # fsspec does not ship type information.
-import obstore
 from obstore.exceptions import AlreadyExistsError, NotFoundError, PreconditionError
 from obstore.exceptions import BaseError as ObstoreError
-from obstore.store import from_url
+
+# personal.py runs as a script from /opt/browser, which is already on sys.path; a test or a tool that loads it
+# by path is not, and browser_archive.py sits beside it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import browser_archive
+from browser_archive import ArchiveCorrupt, ArchiveKeyError
 
 if TYPE_CHECKING:
     from obstore import PutMode, UpdateVersion
@@ -56,6 +61,8 @@ TAILSCALE_ERRORS = (subprocess.SubprocessError, OSError, ValueError, KeyError, A
 class _FileSystem(Protocol):
     # fsspec has no stubs; this is the binary file surface used by download.
     def open(self, path: str, mode: str) -> ContextManager[BinaryIO]: ...
+
+    def exists(self, path: str) -> bool: ...
 
 
 class _LeaseRecord(TypedDict, total=False):
@@ -87,17 +94,6 @@ class _Request(Protocol):
     def __call__(self, request: urllib.request.Request, /, *, timeout: int) -> ContextManager[BinaryIO]: ...
 
 
-EXCLUDED = {
-    "Cache",
-    "Code Cache",
-    "GPUCache",
-    "ShaderCache",
-    "GrShaderCache",
-    "DawnCache",
-    "DawnGraphiteCache",
-    "DawnWebGPUCache",
-    "CacheStorage",
-}
 OAUTH_ENV = ("TAILSCALE_OAUTH_CLIENT_ID", "TAILSCALE_OAUTH_CLIENT_SECRET")
 TS_SOCKET = str(Path.home() / ".browser-tailscale" / "tailscaled.sock")
 SECRETS_DIR_ENV = "BROWSER_SECRETS_DIR"
@@ -137,7 +133,8 @@ def take_secrets(names: Iterable[str]) -> list[str]:
 
 def child_env() -> dict[str, str]:
     """Return the environment for child processes, without the Tailscale OAuth credentials or bearer token."""
-    return {k: v for k, v in os.environ.items() if k not in (*OAUTH_ENV, "BROWSER_PERSONAL_TOKEN")}
+    hidden = (*OAUTH_ENV, "BROWSER_PERSONAL_TOKEN", browser_archive.KEY_ENV)
+    return {k: v for k, v in os.environ.items() if k not in hidden}
 
 
 def clear_stale_lock(profile: Path) -> None:
@@ -197,13 +194,21 @@ def download(fs: _FileSystem, path: str, target: BinaryIO) -> None:
         shutil.copyfileobj(source, target)
 
 
-def restore(profile: Path, uri: str, lease: Lease | None = None, retry_s: float = RESTORE_RETRY_S) -> None:
+def restore(
+    profile: Path,
+    uri: str,
+    lease: Lease | None = None,
+    retry_s: float = RESTORE_RETRY_S,
+    kek: bytes | None = None,
+) -> None:
     """Restore the newest readable archive; only an archive we read and could not unpack is corrupt.
 
-    Raises StorageUnavailable when storage stays unreachable for `retry_s`: the caller must not
-    start Chromium on an empty profile in that case, or snapshot over what is stored.
+    An encrypted archive that `kek` cannot open is not corrupt: it raises ArchiveKeyError, and so does
+    StorageUnavailable when storage stays unreachable for `retry_s`. In both the caller must not start
+    Chromium on an empty profile, or snapshot over what is stored. A plaintext archive (from before
+    encryption) is restored as it is; the next snapshot writes it encrypted.
     """
-    fs, key = fsspec.core.url_to_fs(uri)
+    fs, key = browser_archive.open_fs(uri)
     deadline = time.monotonic() + retry_s
     candidates = lease.archives if lease and lease.archives else (key, key + ".prev")
     corrupt = False
@@ -214,14 +219,17 @@ def restore(profile: Path, uri: str, lease: Lease | None = None, retry_s: float 
                 continue
             storage(partial(download, fs, candidate, archive), deadline)
             archive.seek(0)
+            blob = archive.read()
             try:
+                if browser_archive.is_sealed(blob):
+                    blob = browser_archive.unseal(blob, kek)
                 # Extract off to the side: a truncated archive must not leave a half profile.
                 with tempfile.TemporaryDirectory(dir=profile.parent) as staging:
-                    with tarfile.open(fileobj=archive, mode="r:gz") as tar:
+                    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
                         tar.extractall(staging, filter="data")
                     shutil.rmtree(profile, ignore_errors=True)
                     shutil.move(staging, profile)
-            except (EOFError, tarfile.TarError, zlib.error, gzip.BadGzipFile) as error:
+            except (EOFError, tarfile.TarError, zlib.error, gzip.BadGzipFile, ArchiveCorrupt) as error:
                 print(f"[personal] restore failed: {type(error).__name__}", flush=True)
                 corrupt = True
                 continue
@@ -242,44 +250,58 @@ def restore(profile: Path, uri: str, lease: Lease | None = None, retry_s: float 
         lease.inherited = list(lease.archives)
 
 
-def snapshot(profile: Path, uri: str, lease: Lease | None = None) -> None:
-    """Archive the profile (minus caches and singleton files) and publish it at `uri`.
+def snapshot(profile: Path, uri: str, lease: Lease | None = None, kek: bytes | None = None) -> None:
+    """Archive the session state of the profile, encrypted under `kek`, and publish it at `uri`.
 
-    With a `lease` the archive is published through the lease's conditional write; without one the
-    previous archive is kept as `.prev`.
+    Never publishes plaintext: without a `kek` it raises ArchiveKeyError. With a `lease` the archive is
+    published through the lease's conditional write; without one the previous archive is kept as `.prev`.
     """
-    fs, key = fsspec.core.url_to_fs(uri)
+    if kek is None:
+        raise ArchiveKeyError("refusing to archive the profile without an archive key")
+    fs, key = browser_archive.open_fs(uri)
     pending: str | None = key + ".pending-" + uuid.uuid4().hex
     try:
         with tempfile.TemporaryFile() as archive:
             with tarfile.open(fileobj=archive, mode="w:gz") as tar:
-                for directory, dirs, files in os.walk(profile):
-                    dirs[:] = [d for d in dirs if d not in EXCLUDED and not d.startswith("Singleton")]
-                    for name in files:
-                        if name in EXCLUDED or name.startswith("Singleton"):
-                            continue
-                        path = Path(directory) / name
-                        try:
-                            tar.add(path, arcname=str(path.relative_to(profile)), recursive=False)
-                        except FileNotFoundError:
-                            # Chromium evicts cache and temporary files while it is running.
-                            continue
+                browser_archive.add_session_state(tar, profile)
             archive.seek(0)
+            sealed = browser_archive.seal(archive.read(), kek)
             with fs.open(pending, "wb") as target:
-                shutil.copyfileobj(archive, target)
+                target.write(sealed)
         if lease is not None:
             # Publish the immutable archive through the lease's conditional write.
             # A delayed old writer cannot overwrite its successor's snapshot pointer.
             # pending is still the generated key; None is assigned only after publishing.
             lease.publish(cast(str, pending), key if fs.exists(key) else None)
             pending = None
+            if lease.trusted:
+                reseal_legacy(fs, key, sealed)
             return
         if fs.exists(key):
             fs.copy(key, key + ".prev")
         fs.copy(pending, key)
+        reseal_legacy(fs, key, sealed)
     finally:
         if pending and fs.exists(pending):
             fs.rm(pending)
+
+
+def reseal_legacy(fs: _FileSystem, key: str, sealed: bytes) -> None:
+    """Overwrite any plaintext archive left at `key` or its `.prev` with the sealed one just published.
+
+    A legacy archive holds cookies in the clear; once a sealed successor exists it must not stay at rest.
+    """
+    for legacy in (key, key + ".prev"):
+        try:
+            if not fs.exists(legacy):
+                continue
+            with fs.open(legacy, "rb") as source:
+                if browser_archive.is_sealed(source.read(len(browser_archive.MAGIC))):
+                    continue
+            with fs.open(legacy, "wb") as target:
+                target.write(sealed)
+        except OSError as error:
+            print(f"[personal] legacy archive reseal failed: {type(error).__name__}", flush=True)
 
 
 class Lease:
@@ -289,7 +311,7 @@ class Lease:
         """Use the lease object at `uri`; `store` is an obstore store, built from `uri` when not given."""
         self.uri = uri
         parsed = urllib.parse.urlsplit(uri)
-        self.store = store if store is not None else from_url(f"{parsed.scheme}://{parsed.netloc}")
+        self.store = store if store is not None else browser_archive.lease_store(uri)
         self.key = parsed.path.lstrip("/") + ".lease"
         self.owner = uuid.uuid4().hex
         self.version: UpdateVersion | None = None
@@ -309,7 +331,7 @@ class Lease:
     def _renew(self, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         try:
-            current = obstore.get(self.store, self.key)
+            current = browser_archive.lease_get(self.store, self.key)
             record: _LeaseRecord = json.loads(bytes(current.bytes()))
             if self.version and (record["owner"] != self.owner or now >= self.expires):
                 return False
@@ -333,7 +355,7 @@ class Lease:
                 "UpdateVersion",
                 {
                     k: v
-                    for k, v in obstore.put(self.store, self.key, payload, mode=mode).items()
+                    for k, v in browser_archive.lease_put(self.store, self.key, payload, mode).items()
                     if v is not None
                 },
             )
@@ -360,7 +382,7 @@ class Lease:
                 archives = [key] + self.inherited
             record = json.dumps({"owner": self.owner, "expires": self.expires, "archives": archives}).encode()
             try:
-                version = obstore.put(self.store, self.key, record, mode=self.version)
+                version = browser_archive.lease_put(self.store, self.key, record, self.version)
             except PreconditionError as error:
                 raise RuntimeError("Personal profile lease lost before snapshot publish") from error
             old = self.archives
@@ -372,7 +394,7 @@ class Lease:
         for obsolete in old:
             if obsolete not in archives and ".pending-" in obsolete:
                 try:
-                    fs, _ = fsspec.core.url_to_fs(self.uri)
+                    fs, _ = browser_archive.open_fs(self.uri)
                     fs.rm(obsolete)
                 except OSError as error:
                     print(f"[personal] archive cleanup failed: {type(error).__name__}", flush=True)
@@ -387,11 +409,11 @@ class Lease:
             # Expire our version rather than deleting a successor's lease. Any storage failure
             # is survivable here: the lease expires on its own, and shutdown must proceed.
             try:
-                obstore.put(
+                browser_archive.lease_put(
                     self.store,
                     self.key,
                     json.dumps({"owner": self.owner, "expires": 0, "archives": self.archives}).encode(),
-                    mode=self.version,
+                    self.version,
                 )
             except (ObstoreError, OSError, ValueError) as error:  # a lease we cannot release simply expires
                 print(f"[personal] lease release failed: {type(error).__name__}", flush=True)
@@ -870,7 +892,13 @@ def write_vnc_password() -> str:
 
 
 def shutdown(
-    profile: Path, uri: str, lease: Lease, network: Tailscale | None, held: bool, ready: bool = True
+    profile: Path,
+    uri: str,
+    lease: Lease,
+    network: Tailscale | None,
+    held: bool,
+    ready: bool = True,
+    kek: bytes | None = None,
 ) -> None:
     """Stop the browser and, if this process holds the lease and restored the profile, save it.
 
@@ -880,7 +908,7 @@ def shutdown(
     try:
         # An unrestored profile is not the user's profile: publishing it would bury their archives.
         if held and ready and lease.renew():
-            snapshot(profile, uri, lease)
+            snapshot(profile, uri, lease, kek)
     finally:
         if network:
             network.close()
@@ -1081,9 +1109,14 @@ def main() -> None:
     """Restore the profile, start the browser and its network gate, and serve until stopped."""
     profile = Path(os.environ["BROWSER_PROFILE_DIR"])
     uri = os.environ["BROWSER_PROFILE_URI"]
-    token, *credentials = take_secrets(("BROWSER_PERSONAL_TOKEN", *OAUTH_ENV))
+    token, encoded_kek, *credentials = take_secrets(
+        ("BROWSER_PERSONAL_TOKEN", browser_archive.KEY_ENV, *OAUTH_ENV)
+    )
     if not uri or not token:
         raise RuntimeError("Personal browser requires profile storage and a bearer token")
+    # Fail at start, not at the first snapshot ten minutes in: without the key nothing can be saved,
+    # and the profile is never archived in plaintext.
+    kek = browser_archive.load_key(encoded_kek)
     owner = (profile.parent / "personal-browser.lock").open("w")
     fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
     stop = threading.Event()
@@ -1137,14 +1170,14 @@ def main() -> None:
 
     def save() -> None:
         if held and restored and lease.renew():
-            snapshot(profile, uri, lease)
+            snapshot(profile, uri, lease, kek)
 
     heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
     heartbeat_thread.start()
     threading.Thread(target=watchdog, daemon=True).start()
     try:
         clear_stale_lock(profile)
-        restore(profile, uri, lease)
+        restore(profile, uri, lease, kek=kek)
         restored = True
         clear_stale_lock(profile)
         proxy = None
@@ -1173,14 +1206,14 @@ def main() -> None:
         while not stop.wait(30):
             if time.monotonic() - last_snapshot >= 600:
                 try:
-                    snapshot(profile, uri, lease)
+                    snapshot(profile, uri, lease, kek)
                 except SNAPSHOT_ERRORS as error:  # report class only
                     print(f"[personal] snapshot failed: {type(error).__name__}", flush=True)
                 last_snapshot = time.monotonic()
     finally:
         Path("/tmp/personal-ready").unlink(missing_ok=True)
         try:
-            shutdown(profile, uri, lease, network, held, restored)
+            shutdown(profile, uri, lease, network, held, restored, kek)
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=10)

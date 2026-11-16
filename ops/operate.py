@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from flyte import remote
+from obstore.exceptions import BaseError as ObstoreError
 
 # Run under `uv run`, which does not install this project (`package = false`): without this the import
 # below fails with ModuleNotFoundError (as in ops/bootstrap.py).
@@ -50,6 +51,7 @@ from flyte_agent_factory import (  # noqa: E402 -- must follow select_from_argv(
     _factory_policy,
     _meter,
     _queue,
+    _state_store,
     _union_identity,
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS  # noqa: E402 -- must follow select_from_argv() so the profile is chosen first
@@ -62,6 +64,11 @@ CAP = _factory_base.cap()
 REPO = _factory.REPO
 LIVE = _factory_base.LIVE
 
+
+#: How many of the state store's latest writes the overview lists.
+STATE_CHANGES = 20
+#: What reading the state store's history can raise on any backend (git, bucket, volume).
+_STATE_ERRORS = (_state_store.StateError, _profile.ProfileError, ObstoreError, OSError, ValueError)
 
 LAUNCH_HINT = "PYTHONPATH=src uv run python ops/operate.py launch <brief> --name <name>"
 
@@ -332,6 +339,34 @@ def build_overview(
     }
 
 
+def _read_state_changes(limit: int) -> tuple[list[dict[str, Any]] | None, str]:
+    """Return the changes, or None and the class name of what stopped the read."""
+    try:
+        return _state_store.current().recent_changes(limit), ""
+    except _STATE_ERRORS as exc:
+        return None, type(exc).__name__
+
+
+def recent_state_changes(limit: int = STATE_CHANGES) -> list[dict[str, Any]] | None:
+    """Return the newest `limit` writes to the factory's state (time, message, keys), or None if unreadable.
+
+    Best effort: the status must show whatever else it has when the state store cannot be reached.
+    """
+    return _read_state_changes(limit)[0]
+
+
+def _state_change_lines(changes: list[dict[str, Any]] | None, error: str = "") -> list[str]:
+    if changes is None:
+        return [
+            f"recent state changes: unavailable ({error})" if error else "recent state changes: unavailable"
+        ]
+    lines = ["RECENT STATE CHANGES"] if changes else ["recent state changes: none"]
+    for change in changes:
+        at = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(change.get("at") or 0)))
+        lines.append(f"{at} UTC  {change.get('message', '')}  ({len(change.get('keys') or [])} keys)")
+    return lines
+
+
 def _meter_lines(readings: list[_meter.MeterData]) -> list[str]:
     return [_meter.format_line(_meter.Meter.from_dict(m)) for m in readings]
 
@@ -359,6 +394,9 @@ def overview_text(view: dict[str, Any]) -> str:
     if view.get("gardening"):
         out.append(view["gardening"])
     out.extend(view.get("reserve", []))
+    if "state_changes" in view:
+        out.append("")
+        out.extend(_state_change_lines(view["state_changes"], view.get("state_changes_error", "")))
     out.append("")
     for slot, readings in view["slots"].items():
         out.append(f"{slot}: " + ("; ".join(_meter_lines(readings)) if readings else "no meter reading"))
@@ -427,6 +465,9 @@ def overview_html(view: dict[str, Any]) -> str:
     )
     if view.get("gardening"):
         queue_table += f"<p>{html.escape(view['gardening'])}</p>"
+    if "state_changes" in view:
+        lines = _state_change_lines(view["state_changes"], view.get("state_changes_error", ""))
+        queue_table += f"<h4>State</h4><ul>{''.join(f'<li>{html.escape(line)}</li>' for line in lines)}</ul>"
     return (
         "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Factory overview</title><style>body{font:14px system-ui,sans-serif;margin:12px}"
@@ -453,6 +494,7 @@ def overview(args: argparse.Namespace) -> None:
     except REMOTE_ERRORS as e:  # the projects are still worth showing without the queue
         print(f"(queue unavailable: {type(e).__name__}: {e})")
     view = build_overview(_factory.recent_runs(), queued=queued, gardening=gardening, reserve=reserve)
+    view["state_changes"], view["state_changes_error"] = _read_state_changes(STATE_CHANGES)
     print(overview_text(view))
     if args.html:
         Path(args.html).write_text(overview_html(view))

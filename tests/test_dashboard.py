@@ -1730,3 +1730,51 @@ def test_report_usage_keeps_a_nonzero_codex_coordinator_measured(monkeypatch):
     timeline = timeline_for()
     _usage._report_usage(1, timeline)
     assert timeline.coordinator_measured is True
+
+
+def test_overview_lists_the_recent_state_changes(monkeypatch, capsys):
+    operate = _operate()
+    changes = [
+        {"at": 1_700_000_100.0, "message": "dispatch lease", "keys": ["queue/.dispatch-lease.json"]},
+        {"at": 1_700_000_000.0, "message": "launch alpha", "keys": ["queue/alpha/0001.json", "reserve.json"]},
+    ]
+
+    class Store:
+        def recent_changes(self, limit):
+            assert limit == 20
+            return changes
+
+    monkeypatch.setattr(operate._state_store, "current", lambda: Store())
+    monkeypatch.setattr(operate._factory, "recent_runs", list)
+    view = operate.build_overview([])
+    view["state_changes"] = operate.recent_state_changes()
+    text = operate.overview_text(view)
+    assert "RECENT STATE CHANGES" in text
+    assert "2023-11-14 22:15:00 UTC  dispatch lease  (1 keys)" in text
+    assert "launch alpha  (2 keys)" in text
+    assert "launch alpha" in operate.overview_html(view)
+
+
+def test_overview_says_unavailable_when_the_state_store_cannot_be_read(monkeypatch, capsys):
+    operate = _operate()
+
+    def broken():
+        raise operate._state_store.StateError("git fetch failed")
+
+    monkeypatch.setattr(operate._state_store, "current", broken)
+    monkeypatch.setattr(operate._factory, "recent_runs", list)
+    operate.overview(SimpleNamespace(html=""))
+    out = capsys.readouterr().out
+    assert "recent state changes: unavailable" in out
+    assert "no live or recent projects" in out  # the rest of the status is still there
+
+
+def test_overview_survives_a_state_store_that_raises_an_unexpected_error_class(monkeypatch):
+    operate = _operate()
+
+    class Store:
+        def recent_changes(self, limit):
+            raise OSError("volume gone")
+
+    monkeypatch.setattr(operate._state_store, "current", lambda: Store())
+    assert operate.recent_state_changes() is None

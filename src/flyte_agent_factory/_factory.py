@@ -45,6 +45,7 @@ from flyte_agent_factory import (
     _profile,
     _queue,
     _resources,
+    _state_pod,
     _state_store,
     _tick_guard,
     _union_identity,
@@ -1082,6 +1083,7 @@ def cycle_projects() -> dict[str, Any]:
 # pod, which is why each repository is a separate action.
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_factory_base.PROFILE, "queue")
 scan_env = flyte.TaskEnvironment(
+    **_state_pod.environment_kwargs(_factory_base.PROFILE, "factory"),
     name="gardening-scan",
     image=agent_image(),  # the image the factory runs in, i.e. $FLYTE_INTERNAL_IMAGE there
     resources=_resources.for_component(_factory_base.PROFILE, "scan").to_flyte(),
@@ -1100,6 +1102,7 @@ scan_env = flyte.TaskEnvironment(
 env = flyte.TaskEnvironment(
     name="factory",
     image=agent_image(),
+    **_state_pod.environment_kwargs(_factory_base.PROFILE, "factory"),
     resources=_resources.for_component(_factory_base.PROFILE, "ticks").to_flyte(),
     secrets=[*_factory_envs.env_secrets(_factory_base.PROFILE), *_QUEUE_SECRETS],
     depends_on=[scan_env],

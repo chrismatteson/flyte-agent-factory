@@ -17,6 +17,9 @@ Every page, grouped by the reader it is written for. The project overview is the
 |---|---|
 | [quickstart.md](quickstart.md) | Start here: install the skills, run `/agent-factory`, and what it walks you through; prerequisites, and the same steps by hand, on a personal Claude Pro/Max or ChatGPT Plus/Pro plan |
 | [github-app.md](github-app.md) | Registering your own GitHub App (the bootstrap's manifest flow, or by hand): permissions, what it enables and what works without it |
+| [state-store.md](state-store.md) | The factory's state: git (zero-setup trial), a dedicated bucket (recommended production default) or a volume (OSS single node), and the contract all three keep |
+| [READBACK.md](READBACK.md) | Plain-language readback of the dedicated factory bucket work (#11): what changed for state and the browser archive, and how to use it |
+| [terraform-factory-bucket.md](terraform-factory-bucket.md) | What `terraform-flyte` and `terraform-union-dataplane` must add for the factory's bucket: versioning, lifecycle, encryption, least-privilege IAM per prefix, outputs |
 | [secrets.md](secrets.md) | Every Flyte secret a profile can name: what it unlocks, how to get it, how to store it, where it is mounted, how to rotate it |
 | [install-audit.md](install-audit.md) | The gaps found walking the README as a stranger, what fixed each, and what is still to prove on a personal cluster |
 | [setup.md](setup.md) | From nothing to a first project: workspace, profile, setup-token, deploy key, deploying |
@@ -40,6 +43,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [judgement.md](judgement.md) | Who decides a question: the owner or the factory, the no-waiver rule, overruling a decision |
 | [judge-inputs.md](judge-inputs.md) | What each review judge was shown, as recorded in the round row, and recreating the diff from it |
 | [deploy-webhook.md](deploy-webhook.md) | Push wake-ups, issue intake and the deploy safety net |
+| [state-escalation.md](state-escalation.md) | State backend benchmark results (git vs bucket vs volume under 12 writers) and the measurements and thresholds that would justify a Postgres backend |
 | [triggers.md](triggers.md) | Every timer, its cadence and what it costs |
 | [personal-browser.md](personal-browser.md) | The single-seat logged-in browser |
 | [browser-exit-node.md](browser-exit-node.md) | Routing the in-pod browser through a Tailscale exit node |

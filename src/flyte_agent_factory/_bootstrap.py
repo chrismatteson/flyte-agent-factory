@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
 import re
 import subprocess
 import sys
@@ -23,7 +24,18 @@ from pathlib import Path
 from typing import TypeVar
 
 from . import _bootstrap_base as base
-from ._bootstrap_base import BLOCKED, DEFAULT_DOMAIN, DONE, TODO, Check, Context, Settings, Step
+from . import _bootstrap_state as state_choice
+from ._bootstrap_base import (
+    BLOCKED,
+    DEFAULT_DOMAIN,
+    DONE,
+    TODO,
+    BootstrapError,
+    Check,
+    Context,
+    Settings,
+    Step,
+)
 from ._bootstrap_finish import ConnectStep, DeployStep, GithubAppStep, McpUrlStep, ProfileStep
 from ._bootstrap_flyte import DeployScripts, FlyteSdk
 from ._bootstrap_github import GhCli
@@ -202,7 +214,41 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--workspace", required=True, help="<owner>/<repo>, the workspace repository")
     ap.add_argument(
         "--state-uri",
-        help="deprecated and ignored: the factory keeps its state on a git branch, not in a bucket",
+        help="deprecated and ignored: the old Flyte-bucket location of the state (ops/migrate_state.py moves "
+        "it); to keep the state in a bucket of the factory's own, use --state-bucket",
+    )
+    ap.add_argument(
+        "--state-bucket",
+        metavar="URI",
+        help="keep the factory's state in this bucket (s3://bucket/prefix or gs://bucket/prefix), never "
+        "Flyte's own; without it AGENT_FACTORY_STATE_BUCKET, then --terraform-dir, else a git branch",
+    )
+    ap.add_argument("--state-region", default="", help="region of --state-bucket (S3)")
+    ap.add_argument("--state-endpoint", default="", help="S3-compatible endpoint of --state-bucket (MinIO)")
+    ap.add_argument(
+        "--factory-service-account",
+        default="",
+        help="Kubernetes service account every pod that touches state runs as; else the "
+        "`factory_service_accounts` Terraform output (with a state bucket)",
+    )
+    ap.add_argument(
+        "--browser-service-account",
+        default="",
+        help="Kubernetes service account of the personal browser apps; else the Terraform output "
+        "(with a state bucket)",
+    )
+    ap.add_argument(
+        "--terraform-dir",
+        type=Path,
+        help="read `terraform output -json` here for factory_bucket (and _region, _endpoint); never applies",
+    )
+    ap.add_argument(
+        "--flyte-bucket",
+        action="append",
+        default=[],
+        metavar="URI",
+        help="Flyte's own data bucket or prefix, which the state must stay out of (recorded as "
+        "[state] flyte_bucket); repeat for more than one",
     )
     ap.add_argument("--backend", choices=("union", "oss"), default="union")
     ap.add_argument("--engine", choices=("claude", "codex"), default="claude")
@@ -245,6 +291,37 @@ def _build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _choose_state(args: argparse.Namespace, ctx: Context) -> None:
+    """Set where the profile keeps the state: the factory's bucket if one is found, else the git branch."""
+    settings = ctx.settings
+    settings.flyte_buckets = state_choice.find_flyte_buckets(ctx.flyte.config_path, args.flyte_bucket)
+    found, why = state_choice.find_state_bucket(
+        explicit=args.state_bucket or "",
+        region=args.state_region,
+        endpoint=args.state_endpoint,
+        factory_service_account=args.factory_service_account,
+        browser_service_account=args.browser_service_account,
+        environ=os.environ,
+        terraform_dir=args.terraform_dir,
+    )
+    if found is None:
+        ctx.say(f"state: {why + '; ' if why else ''}{state_choice.KEEP_GIT}")
+        return
+    state_choice.check_state_bucket(found, settings.flyte_buckets)
+    settings.state_bucket, settings.state_region, settings.state_endpoint = (
+        found.uri,
+        found.region,
+        found.endpoint,
+    )
+    settings.factory_service_account = found.factory_service_account
+    settings.browser_service_account = found.browser_service_account
+    # The bucket's own URI is not printed: a mistyped one could carry a credential, which
+    # `check_state_bucket` would have refused.
+    ctx.say(f"state: bucket from {found.source} goes into [state] of the profile (never Flyte's own bucket)")
+    if found.uri.partition("://")[0] in ("s3", "gs"):
+        ctx.say(f"state: {state_choice.VERSIONING}")
+
+
 def main(
     argv: Sequence[str] | None = None, *, make_context: Callable[[Settings], Context] | None = None
 ) -> int:
@@ -265,7 +342,8 @@ def main(
     if args.state_uri is not None:
         # Old copy-paste commands carry it; they must keep running.
         print(
-            "note: --state-uri is ignored; the factory keeps its state on a git branch (docs/state-store.md)"
+            "note: --state-uri is ignored; the old Flyte-bucket state moves with ops/migrate_state.py "
+            "(docs/state-store.md)"
         )
     if not args.project.strip():
         ap.error("--project must not be empty")
@@ -292,6 +370,11 @@ def main(
         context = Context(settings, GhCli(), FlyteSdk(settings), DeployScripts())
     else:
         context = make_context(settings)
+    if not (args.chat_key or args.union_keys or args.grant):
+        try:
+            _choose_state(args, context)
+        except BootstrapError as exc:
+            ap.error(str(exc))
     if args.grant:
         return run_key_mode(context, "grant", functools.partial(grant_key, context, *args.grant))
     if args.chat_key:

@@ -35,6 +35,7 @@ from . import (
     _pull_requests,
     _queue,
     _resources,
+    _state_pod,
     _tick_guard,
     _union_identity,
 )
@@ -64,6 +65,7 @@ if PROFILE.github.configured:
 _secrets.extend(_QUEUE_SECRETS)
 env = flyte.TaskEnvironment(
     name="factory-reconcile",
+    **_state_pod.environment_kwargs(PROFILE, "factory"),
     image=agent_image(),
     resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     interruptible=True,

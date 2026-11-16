@@ -61,12 +61,18 @@ import flyte.app
 
 # Keep runtime imports usable when deployment tools load this file by path.
 if TYPE_CHECKING:
-    from kubernetes.client import V1PodSpec
-
-    from . import _names, _profile, _profile_oss, _resources, _union_identity
+    from . import _names, _profile, _profile_oss, _profile_state, _resources, _state_pod, _union_identity
     from ._images import browser_image
 else:
-    from flyte_agent_factory import _names, _profile, _profile_oss, _resources, _union_identity
+    from flyte_agent_factory import (
+        _names,
+        _profile,
+        _profile_oss,
+        _profile_state,
+        _resources,
+        _state_pod,
+        _union_identity,
+    )
     from flyte_agent_factory._images import browser_image
 
 APP_NAME = "claude-browser"
@@ -108,41 +114,12 @@ browser_env = flyte.app.AppEnvironment(
 
 #: The deploy-time override of `[browser] exit_node`; an identity's own `exit_node` still wins over it.
 _EXIT_NODE = _names.getenv("AGENT_FACTORY_BROWSER_EXIT_NODE", _PROFILE.browser.exit_node if _PROFILE else "")
+#: The Flyte secret holding the base64 256-bit key that wraps each profile archive's data key. One key for
+#: every identity's archive; `AGENT_FACTORY_BROWSER_ARCHIVE_KEY_SECRET` renames it at deploy time (the
+#: profile has no field for it). Mounted in the personal browser apps only, never in a slot or the factory.
+ARCHIVE_KEY_SECRET = _names.getenv("AGENT_FACTORY_BROWSER_ARCHIVE_KEY_SECRET", "browser_archive_key")
 #: Seconds from SIGTERM to SIGKILL: shutdown stops Chromium, saves the profile, logs out of Tailscale.
 _PERSONAL_GRACE_S = 90
-
-
-class _PersonalPodTemplate(flyte.PodTemplate):
-    """The personal app's pod template, whose Kubernetes objects are built only when Flyte serializes it.
-
-    This module is imported where `kubernetes` is not installed: by the deployer and by every slot pod
-    (agent image). Flyte reads `pod_spec` only in its app serializer, which imports `kubernetes` itself
-    first, so building the `V1PodSpec` on first read keeps that package a need of deploying the app alone.
-    Flyte's app serializer requires the primary container to be named `app`.
-    """
-
-    def __init__(self) -> None:
-        self._spec: V1PodSpec | None = None
-        super().__init__(primary_container_name="app")
-
-    @property
-    def pod_spec(self) -> V1PodSpec:
-        if self._spec is None:
-            from kubernetes.client import V1Container, V1PodSpec
-
-            self._spec = V1PodSpec(
-                containers=[V1Container(name=self.primary_container_name)],
-                termination_grace_period_seconds=_PERSONAL_GRACE_S,
-            )
-        return self._spec
-
-    @pod_spec.setter
-    def pod_spec(self, value: V1PodSpec | None) -> None:
-        self._spec = value
-
-    def __repr__(self) -> str:
-        # The dataclass repr would read `pod_spec`, and so import `kubernetes`.
-        return f"{type(self).__name__}(termination_grace_period_seconds={_PERSONAL_GRACE_S})"
 
 
 def identity_exit_node(identity: _profile.BrowserIdentity) -> str:
@@ -153,11 +130,24 @@ def identity_exit_node(identity: _profile.BrowserIdentity) -> str:
 def personal_app(
     profile: _profile.Profile, identity: _profile.BrowserIdentity, exit_node: str
 ) -> flyte.app.AppEnvironment:
-    """Return the personal browser app of `identity`. Needs no `kubernetes`: see `_PersonalPodTemplate`."""
+    """Return the personal browser app of `identity`. Needs `kubernetes` only on the volume backend."""
     queue_secrets, queue_env = _union_identity.pod_spec(profile, "queue")
+    # An archive of its own `profile_uri` is reached with that URI's own defaults, not the `[state]` bucket's.
+    state_env = (
+        {
+            name: value
+            for name, value in (
+                ("BROWSER_PROFILE_ENDPOINT", profile.state.endpoint),
+                ("BROWSER_PROFILE_REGION", profile.state.region),
+            )
+            if value
+        }
+        if identity.profile_uri == _profile_state.default_profile_uri(profile.state, identity.name)
+        else {}
+    )
     return flyte.app.AppEnvironment(
         name=identity.app,
-        pod_template=_PersonalPodTemplate(),
+        **_state_pod.environment_kwargs(profile, "browser", grace_seconds=_PERSONAL_GRACE_S),
         image=browser_image(tailscale=bool(exit_node)),
         command=["/bin/bash", "/opt/browser/start.sh"],
         port=APP_PORT,
@@ -171,6 +161,7 @@ def personal_app(
             "BROWSER_PERSONAL": "1",
             "BROWSER_IDENTITY": identity.name,
             "BROWSER_PROFILE_URI": identity.profile_uri,
+            **state_env,
             "BROWSER_EXIT_NODE": exit_node,
             "BROWSER_TAILSCALE_TAG": profile.browser.tailscale_tag,
             _profile.TOML_ENV: profile.deployment_text(),
@@ -178,6 +169,8 @@ def personal_app(
         # Whatever the identity, the app reads its token as BROWSER_PERSONAL_TOKEN (start.sh, personal.py).
         secrets=[
             flyte.Secret(key=identity.token_secret, as_env_var="BROWSER_PERSONAL_TOKEN"),
+            # start.sh stages it in a file and personal.py reads it from there, as it does the token.
+            flyte.Secret(key=ARCHIVE_KEY_SECRET, as_env_var="BROWSER_ARCHIVE_KEY"),
             *(
                 flyte.Secret(key=key, as_env_var=key.upper())
                 for key in (

@@ -363,7 +363,7 @@ def browser_image(
                 "PLAYWRIGHT_MCP_VERSION": mcp_version,
             }
         )
-        .with_pip_packages("fsspec", "s3fs", "gcsfs", "obstore>=0.5")
+        .with_pip_packages("fsspec", "s3fs", "gcsfs", "obstore>=0.5", "cryptography>=42")
         .with_source_folder(_ASSETS / "browser", dst="/opt/browser")
         .with_commands(["chmod +x /opt/browser/install.sh /opt/browser/start.sh"])
         .with_commands(["/opt/browser/install.sh"])

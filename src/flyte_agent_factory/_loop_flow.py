@@ -39,6 +39,7 @@ from . import (
     _queue,
     _resources,
     _router,
+    _state_pod,
     _state_store,
     _tick_guard,
     _union_identity,
@@ -49,6 +50,7 @@ PROFILE = _profile.require()
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(PROFILE, "queue")
 env = flyte.TaskEnvironment(
     name="factory-loop",
+    **_state_pod.environment_kwargs(PROFILE, "factory"),
     image=agent_image(),
     resources=_resources.for_component(PROFILE, "ticks").to_flyte(),
     # TaskEnvironment accepts mixed secret lists; this list contains only Secret instances.

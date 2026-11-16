@@ -97,6 +97,22 @@ export FLYTE_DOMAIN="$(PYTHONPATH=src uv run python -m flyte_agent_factory._prof
 export AGENT_FACTORY_SECRETS="$(PYTHONPATH=src uv run python -m flyte_agent_factory._profile agent_secrets)"
 ```
 
+### Where the state lives
+
+The bootstrap keeps the factory's state on a git branch unless it finds a bucket of the factory's own.
+It looks, in order, at `--state-bucket s3://bucket/prefix` (or `gs://`; `--state-region` and
+`--state-endpoint` go with it), the `AGENT_FACTORY_STATE_BUCKET` environment variable, and, only when
+`--terraform-dir DIR` is given, `terraform output -json` in that directory: its `factory_bucket` output
+(and `factory_bucket_region`, `factory_bucket_endpoint`, and the names in `factory_service_accounts`, which
+go to `[state] factory_service_account` and `browser_service_account`; `--factory-service-account` and
+`--browser-service-account` override them). Every pod that touches state then runs as the factory account and the
+personal browser app as the browser account. It never runs `terraform apply`. A bucket found
+is written to `[state]` in the profile and the bootstrap says so; one that is Flyte's own data bucket is
+refused (`--flyte-bucket URI` names it when the Flyte config does not; it is recorded as `[state]
+flyte_bucket`). Without one, it prints a line saying a bucket is recommended for production and how to add
+it. Turn object versioning on for the bucket. An existing state moves with `ops/move_state.py`
+([state-store.md](state-store.md#moving-the-state-between-backends)).
+
 For a project that needs GCP, `PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" run --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/flyte_agent_factory/agent.py gcp_bootstrap --project_id <id>` signs in to
 Google through a Flyte condition and leaves only a service-account key behind; see
 [docs/gcp-bootstrap.md](gcp-bootstrap.md).
@@ -174,6 +190,19 @@ secrets are opted into at deploy time:
 AGENT_FACTORY_SECRETS=github_token,npm_token=NPM_TOKEN PYTHONPATH=src uv run flyte --config "$FLYTE_CONFIG" \
   deploy --all --root-dir src -p "$FLYTE_PROJECT" -d "$FLYTE_DOMAIN" src/flyte_agent_factory/agent.py
 ```
+
+### 6. Where the factory keeps its state (optional)
+
+The factory's own state (the launch queue, leases, reserves) needs no setup to start: by default it is a branch of
+the workspace repository. Choose before the first run, because the backends do not share state
+([state-store.md](state-store.md)):
+
+- **A dedicated bucket is the recommended production default.** Provision it with the Terraform additions in
+  [terraform-factory-bucket.md](terraform-factory-bucket.md) and set `[state] bucket`.
+- **git** is the zero-setup trial: nothing to provision, slower and more contended under many slots.
+- **volume** is for open-source, single-node use.
+
+[state-escalation.md](state-escalation.md) has the measurements behind the choice.
 
 ## Deploying
 

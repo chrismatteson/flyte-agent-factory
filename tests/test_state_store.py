@@ -5,11 +5,19 @@ import multiprocessing
 import shutil
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from flyte_agent_factory import _state_store as ss
-from tests.state_git import BRANCH, make_remote, make_store, take_production_lease, write_in_process
+from tests.state_git import (
+    BRANCH,
+    make_remote,
+    make_store,
+    rival_wins_first_push,
+    take_production_lease,
+    write_in_process,
+)
 
 
 def bare(remote: Path, *args: str) -> str:
@@ -28,6 +36,15 @@ def test_roundtrip_and_delete(tmp_path):
     assert not store.exists("a/b.json")
     assert store.list() == ["a/c.json"]
     assert store.write({"a/b.json": None}, "rm again") is False
+
+
+def test_counts_pushes_and_rejected_pushes(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    store.write({"a": b"1"}, "first")
+    assert (store.pushes, store.lost_races) == (1, 0)
+    rival_wins_first_push(monkeypatch, store, tmp_path, {"b": b"2"})
+    store.write({"c": b"3"}, "second")
+    assert (store.pushes, store.lost_races) == (2, 1)  # the rival's push is counted on the rival
 
 
 def test_list_prefix_is_directory_prefix(tmp_path):
@@ -256,12 +273,12 @@ def test_current_builds_from_env_and_configure_resets(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_FACTORY_STATE_BRANCH", "factory-state/x")
     ss.configure(None)
     try:
-        store = ss.current()
+        store = cast(ss.StateStore, ss.current())  # the env names a git remote: the git store
         assert (store.remote, store.branch) == ("git@example.com:o/r.git", "factory-state/x")
         assert store.cache_dir.parent == tmp_path / ".cache" / "flyte-agent-factory" / "state"
         assert ss.current() is store
         monkeypatch.setenv("AGENT_FACTORY_STATE_BRANCH", "factory-state/y")
-        assert ss.current().branch == "factory-state/y"
+        assert cast(ss.StateStore, ss.current()).branch == "factory-state/y"
         mine = make_store(tmp_path)
         ss.configure(mine)
         assert ss.current() is mine
@@ -277,9 +294,10 @@ def test_current_branch_hook_and_env_precedence(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_FACTORY_STATE_BRANCH", raising=False)
     ss.configure(None)
     try:
-        assert ss.current(branch="factory-state/profile").branch == "factory-state/profile"
+        branch = "factory-state/profile"
+        assert cast(ss.StateStore, ss.current(branch=branch)).branch == branch
         monkeypatch.setenv("AGENT_FACTORY_STATE_BRANCH", "factory-state/env")
-        assert ss.current(branch="factory-state/profile").branch == "factory-state/env"
+        assert cast(ss.StateStore, ss.current(branch=branch)).branch == "factory-state/env"
     finally:
         ss.configure(None)
 
