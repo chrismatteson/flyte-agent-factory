@@ -154,6 +154,14 @@ def _not_inside_the_run_that_runs_the_tests(monkeypatch):
     monkeypatch.delenv("FLYTE_INTERNAL_EXECUTION_ID", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _tests_run_as_the_unprivileged_user_the_factory_expects(monkeypatch):
+    """Sessions refuse to start as root (`_unprivileged`); a CI container running the suite as root must still
+    exercise them. A test of the refusal sets `os.geteuid` itself, after this."""
+    if os.geteuid() == 0:
+        monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 

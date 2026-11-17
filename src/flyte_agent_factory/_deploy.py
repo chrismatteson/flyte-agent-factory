@@ -208,10 +208,12 @@ revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=False)
 os.environ["AGENT_FACTORY_ENGINE_SHA"] = revision.stdout.strip() if revision.returncode == 0 else ""
 from flyte_agent_factory import agent
+from flyte_agent_factory._image_user import check_unprivileged
 from_root(agent)
 envs = (agent.env, agent.subagent_env, agent.setup_env)
 if {e.name for e in envs} != set(sys.argv[5].split(",")):
     raise SystemExit(f"the slot recipe gave {[e.name for e in envs]}, not {sys.argv[5]}")
+check_unprivileged(*envs)
 deployments = flyte.deploy(*envs, dry_run=dry)
 for d in deployments:
     print(d.summary_repr() if hasattr(d, "summary_repr") else d)
@@ -226,6 +228,7 @@ FACTORY_CHILD = (
     + _INIT
     + """
 from flyte_agent_factory._deploy import check_environments
+from flyte_agent_factory._image_user import check_unprivileged
 from flyte_agent_factory import _deployer, _factory, _factory_mcp
 for module in (_factory, _factory_mcp, _deployer):
     from_root(module)
@@ -252,6 +255,7 @@ check_environments(*envs)
 from flyte._deploy import plan_deploy
 for plan in plan_deploy(*envs):
     check_environments(*plan.envs.values())
+check_unprivileged(*envs)
 deployments = flyte.deploy(*envs, dry_run=dry)
 for deployment in deployments:
     print(deployment.summary_repr())
@@ -288,6 +292,7 @@ APPS_CHILD = (
     + """
 from flyte_agent_factory import _profile
 from flyte_agent_factory._deploy import APPS, app_envs, check_environments
+from flyte_agent_factory._image_user import check_unprivileged
 profile = _profile.require()
 enabled = app_envs(profile)
 if enabled:
@@ -316,6 +321,7 @@ if profile.browser.personal:
         raise SystemExit(f"the profile has browser identities {missing}, but browser.py does not define them")
     envs += tuple(browser.identity_apps[i.name] for i in profile.browser.identities)
 check_environments(*envs, allowed=enabled)
+check_unprivileged(*envs)
 for env in envs:
     # Recorded only once the app is active (or unchanged): a deploy that did not start it is not a release.
     record(_deploy_apps.deploy_app(env, dry_run=dry))

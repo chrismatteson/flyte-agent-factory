@@ -32,6 +32,7 @@ from flyte_agent_factory import (
     _session_config,
     _session_setup,
     _timeline,
+    _unprivileged,
     _usage,
 )
 from flyte_agent_factory._bridge import (
@@ -202,7 +203,8 @@ async def _ask_remaining_work(
         return ""
     # The same credential path as the worker's own call: in token deployments `env` alone has no login.
     with _auth.token_fd(env, os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()) as (child_env, pass_fds):
-        proc = await asyncio.create_subprocess_exec(
+        proc = await _unprivileged.spawn(
+            "a Claude Code sub-agent",
             claude,
             "-p",
             _PLAN_PROMPT,
@@ -482,7 +484,8 @@ async def _run_codex(
     # After `--`: a prompt starting with "-" (a role file's `---` header did) was read as an option.
     argv += ["--", prompt]
     env = {**_session_setup._session_env({**os.environ, **(extra_env or {})}), "CODEX_HOME": str(home)}
-    proc = await asyncio.create_subprocess_exec(
+    proc = await _unprivileged.spawn(
+        "a Codex sub-agent",
         *argv,
         cwd=str(work),
         env=env,
