@@ -1,7 +1,7 @@
 # Readback: four-cpu-node (#15) re-applied on #12's sharded slow lane
 
 This project is upstream main ee14bf2 (which has #12) with #15's whole change re-applied. It is meant to become
-the new content of PR #15 (`four-cpu-node` on chrismatteson/flyte-agent-factory, squashed at 1af2181 on 83d2150).
+the new content of PR #15 (`four-cpu-node` on the owner's fork, squashed at 1af2181 on 83d2150).
 
 ## What was carried over unchanged
 
