@@ -294,4 +294,4 @@ def describe(profile: Profile) -> list[dict[str, str]]:
 # Flyte's code bundle carries only the modules that are loaded when an environment is deployed. Without this
 # import no pod has the module: the token command fails with "No module named ..._union_token" and every
 # tier is refused at `establish`. At the end of the file because `_union_token` imports this module.
-from . import _union_token as _union_token  # noqa: E402
+from . import _union_token as _union_token  # noqa: E402 -- last: _union_token imports this module

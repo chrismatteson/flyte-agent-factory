@@ -593,7 +593,9 @@ def _run_in_tree(
         try:
             out, err = proc.communicate(text, timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            # The group can end between the timeout and the kill; it is then already gone, which is the goal.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate()
             raise DeployError(
                 f"{args[0]} in the engine tree did not finish in {timeout} s; killed it"
