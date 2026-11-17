@@ -382,3 +382,25 @@ def test_token_command_as_a_subprocess_fails_cleanly_without_a_key():
     )
     assert (result.returncode, result.stdout) == (2, "")
     assert "tier project (secret factory-project-key)" in result.stderr
+
+
+def test_the_token_command_ships_in_every_bundle_that_carries_the_identity_module():
+    """Flyte bundles only modules loaded at deploy time, and the SDK runs `_union_token` by name.
+
+    A deploy from before this test left every pod without the module: each tier failed at `establish` with
+    "No module named flyte_agent_factory._union_token". Importing the identity module must load it.
+    """
+    code = (
+        "import sys\n"
+        "import flyte_agent_factory._union_identity\n"
+        "assert 'flyte_agent_factory._union_token' in sys.modules\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_token_command_imports_first_without_a_cycle_error():
+    """`python -m flyte_agent_factory._union_token` imports the token module before the identity module."""
+    code = "import flyte_agent_factory._union_token as t; assert callable(t.main)\n"
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
