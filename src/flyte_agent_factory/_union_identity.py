@@ -288,3 +288,10 @@ def describe(profile: Profile) -> list[dict[str, str]]:
     if _profile_oss.keyless(profile):
         return []
     return [{"tier": tier, "secret": profile.union.key_for(tier)} for tier in _profile_union.TIERS]
+
+
+# The SDK runs `_union_token` by name (`TOKEN_COMMAND`) in a process of its own, so nothing else imports it.
+# Flyte's code bundle carries only the modules that are loaded when an environment is deployed. Without this
+# import no pod has the module: the token command fails with "No module named ..._union_token" and every
+# tier is refused at `establish`. At the end of the file because `_union_token` imports this module.
+from . import _union_token as _union_token  # noqa: E402 -- last: _union_token imports this module
