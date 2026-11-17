@@ -48,7 +48,7 @@ async def _fetch(run_names: list[str]) -> None:
             ):
                 continue
             details = await remote.ActionDetails.get.aio(run_name=name, name=action.name)
-            outputs = await details.outputs()
+            outputs = await details.outputs.aio()
             record = json.loads(outputs[0])
             rows.append({key: record.get(key) for key in KEEP})
         rows.sort(key=lambda r: (r["task"], r["arm"], r["repeat"]))

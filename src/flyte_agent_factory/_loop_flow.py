@@ -156,7 +156,7 @@ async def _benchmark(head: str, baseline: str) -> str:
 async def _initialize_spend() -> dict[str, object]:
     # An attempt can fail after paying for cases. Preserve its ledger when a retry reuses its decision.
     run = await remote.Run.get.aio(name=flyte.ctx().action.run_name)
-    details = await run.action.details()
+    details = await run.action.details.aio()
     for attempt in range(details.attempts, -1, -1):
         try:
             snapshot = _dashboard.from_report(await run.get_report.aio(attempt=attempt))
@@ -174,7 +174,7 @@ async def _initialize_spend() -> dict[str, object]:
 
 
 def _pending_cases(run: remote.Run) -> list[_PaidCase]:
-    # Action.details() and outputs() exist only as coroutines; the listing has a sync form.
+    # Action.details and outputs are awaited through `.aio` (`syncify_compat`); the listing has a sync form.
     actions = [
         a for a in remote.Action.listall(for_run_name=run.name) if a.task_name == "factory-bench.benchmark"
     ]
@@ -192,9 +192,9 @@ class _PaidCase(TypedDict):
 async def _action_cases(actions: Iterable[remote.Action]) -> list[_PaidCase]:
     cases: list[_PaidCase] = []
     for action in actions:
-        details = await action.details()
+        details = await action.details.aio()
         try:
-            _, output = await details.outputs()
+            _, output = await details.outputs.aio()
         except (ValueError, RuntimeError, TypeError) as exc:
             raise ValueError("loop benchmark spend is not yet available") from exc
         cases.extend(json.loads(line) for line in output.splitlines())

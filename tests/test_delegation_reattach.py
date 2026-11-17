@@ -383,15 +383,16 @@ class FakeAction:
         """Hold the phase, outputs and error message the hook reads."""
         self.phase, self._outputs, self.error_message = phase, outputs, error
         self.waited = False
-        # `get` is syncified in the SDK, so it has `.aio`; `Action.wait` is a plain coroutine method.
+        # `get`, `wait` and `outputs` are `syncify`/`syncify_compat` in the SDK, so each has `.aio`.
         self.get = SimpleNamespace(aio=self._get)
+        self.wait = SimpleNamespace(aio=self._wait)
+        self.outputs = SimpleNamespace(aio=self._outputs_aio)
 
     async def _get(self, run_name, name):
         assert (run_name, name) == ("r1", "a7")
         return self
 
-    async def wait(self, quiet=False):
-        """Record that the hook waited for the action."""
+    async def _wait(self, quiet=False):
         self.waited = True
 
     def done(self):
@@ -403,8 +404,7 @@ class FakeAction:
             ActionPhase.TIMED_OUT,
         )
 
-    async def outputs(self):
-        """Return the outputs the action was built with."""
+    async def _outputs_aio(self):
         return self._outputs
 
 
@@ -451,14 +451,11 @@ async def test_the_production_hook_raises_the_actions_error_when_it_did_not_succ
 
 def test_the_fake_has_the_shape_of_the_real_sdk_class():
     """The fake action has the shape of the real SDK class."""
-    import inspect
-
     import flyte.remote
 
-    assert inspect.iscoroutinefunction(flyte.remote.Action.wait)
-    assert not hasattr(flyte.remote.Action.wait, "aio")
+    # 2.13.x made `Action.wait` and `ActionDetails.outputs` `syncify_compat`: an awaitable with `.aio`.
+    assert hasattr(flyte.remote.Action.wait, "aio") and hasattr(flyte.remote.ActionDetails.outputs, "aio")
     assert hasattr(flyte.remote.Action.get, "aio") and hasattr(flyte.remote.ActionDetails.get, "aio")
-    assert inspect.iscoroutinefunction(flyte.remote.ActionDetails.outputs)
     assert callable(flyte.remote.ActionDetails.done)
 
 
@@ -467,7 +464,7 @@ async def test_cancelling_a_reattach_leaves_the_job_running_and_reattachable(rep
     job = interrupted_job(bridge_root, repo)
 
     class StillRunning(FakeAction):
-        async def wait(self, quiet=False):
+        async def _wait(self, quiet=False):
             # What the SDK does: `Action.wait` swallows the cancellation and returns.
             self.waited = True
 

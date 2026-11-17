@@ -90,8 +90,9 @@ in the same way; a waiver is always the owner's decision ([contributing.md](cont
 ## The controls on the MCP
 
 The factory MCP is Flyte's stock `FlyteMCPAppEnvironment` behind Union sign-in, so every call runs as the caller and
-Union RBAC applies ([factory-mcp-setup.md](factory-mcp-setup.md)). The server exposes every tool the stock app has
-(`TOOLS` in `_factory_mcp.py`, all 32). Their scope is the factory's project and domain, enforced by the server's own
+Union RBAC applies ([factory-mcp-setup.md](factory-mcp-setup.md)); the wrappers around the stock server are
+listed in [mcp-stock-move.md](mcp-stock-move.md). The server exposes every stock tool
+(`TOOLS` in `_factory_mcp.py` is `ALL_MCP_TOOLS`). Their scope is the factory's project and domain, enforced by the server's own
 project/domain check: a call naming another project or domain is refused before any request to Union, and
 `list_projects` shows only the factory project. What the caller may do inside that scope is bounded by the caller's
 Union auth (the RBAC of the bearer token or API key).
@@ -108,19 +109,22 @@ Union auth (the RBAC of the bearer token or API key).
 | `list_actions` | lists the actions of a run |
 | `get_action` | reads one action, including its error info |
 | `get_logs` | reads an action's logs |
-| `list_conditions` | lists a run's open conditions (`ask-` questions and `direct-` inboxes) |
+| `list_conditions`, `get_condition` | list a run's open conditions (`ask-` questions and `direct-` inboxes), or read one |
 | `signal_condition` | answers a condition: an answer to a question (plain yes/no or a sentence for any ask; one to an ask that already closed is rerouted to the project's `direct-` inbox as a late answer), or direction to a project |
 | `abort_run` | aborts a run; unsaved work is lost, so prefer `/stop` through `direct-NNN` |
 | `rerun_run` | starts a run again with the same inputs |
 | `abort_action` | aborts one action of a run |
 | `list_apps`, `get_app` | list and read the factory's apps |
 | `activate_app`, `deactivate_app` | turn an app on or off |
+| `delete_app` | deletes an app; it comes back only by a redeploy, so prefer `deactivate_app` |
 | `list_triggers`, `get_trigger` | list and read the factory's triggers (the queue sweep, for one) |
 | `activate_trigger`, `deactivate_trigger` | turn a trigger on or off |
+| `create_trigger`, `delete_trigger` | add or remove a schedule on a task; the factory's own schedules (the queue sweep) come from its deployed environments |
 | `list_projects`, `get_project` | show the factory project only; `get_project` refuses any other name |
-| `list_secrets` | lists secret names and types; no tool returns a secret value |
-| `create_secret`, `delete_secret` | write or remove a secret; the value is never echoed back. Engine credentials are not set this way: they are stored with local commands ([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat |
+| `list_secrets`, `get_secret` | list secret names and types, or whether one exists and is ready; no tool returns a secret value |
+| `create_secret`, `update_secret`, `delete_secret` | write, replace or remove a secret: create and update return a one-time link the owner opens to type the value, which never goes through chat. Engine credentials are not set this way: they are stored with local commands ([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat |
 | `search_flyte_sdk_examples`, `search_flyte_docs_examples`, `search_full_docs` | search the Flyte SDK examples, the Union examples and the Union docs, which the app image carries in `/opt/flyte-mcp-docs` |
+| `generate_secret` | makes an SSH key pair and stores the private key as a secret; only the public key comes back |
 | `whoami` | shows which identity the calls run as |
 
 `run_task` can start any task in the factory project and domain. The instructions steer chat to these (`CHAT_TASKS`,
@@ -582,7 +586,7 @@ the session role definitions, the browser image files and the workspace template
 | `_factory_status.py` | reading an older project report's HTML for the timeline and activity |
 | `_tick_guard.py` | a scheduled tick skips itself while an earlier run of its task is live |
 | `_queue.py` | the launch queue's storage and the reserve file in the factory's state store (the branch, on the git backend) |
-| `_factory_mcp.py` | the factory MCP server: every stock tool, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
+| `_factory_mcp.py` | the factory MCP server: the stock tools in `TOOLS`, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
 
 **Planning, the loop and the board**
 

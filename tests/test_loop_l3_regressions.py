@@ -267,11 +267,11 @@ def test_pending_legacy_ledger_recovers_child_outputs(monkeypatch):
         return "{}", json.dumps({"ended_at": NOW, "usd_total": 12})
 
     async def details():
-        return SimpleNamespace(outputs=outputs)
+        return SimpleNamespace(outputs=SimpleNamespace(aio=outputs))
 
     def actions(**kwargs):
         assert kwargs == {"for_run_name": "loop"}
-        return [SimpleNamespace(task_name="factory-bench.benchmark", details=details)]
+        return [SimpleNamespace(task_name="factory-bench.benchmark", details=SimpleNamespace(aio=details))]
 
     run = SimpleNamespace(
         name="loop",

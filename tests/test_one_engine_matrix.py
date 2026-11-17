@@ -615,7 +615,7 @@ async def test_factory_mcp_launch_status_direction(single_engine, queue_state, m
     import dataclasses
 
     from flyte._initialize import _InitConfig, init_config_context
-    from flyte.ai.mcp._tools import build_tool_functions
+    from mcp.server.fastmcp.exceptions import ToolError
 
     from flyte_agent_factory import _factory_mcp, _profile
     from tests.fake_flyte import FakeFlyte
@@ -629,7 +629,10 @@ async def test_factory_mcp_launch_status_direction(single_engine, queue_state, m
     monkeypatch.setattr(_factory_base, "PROFILE", profile)
     monkeypatch.setattr(_factory_base, "SLOTS", profile.tasks)
     world = FakeFlyte(monkeypatch, _factory, fake_headroom=False)
-    tools = build_tool_functions(_factory_mcp.app)
+    # The functions the factory app serves: the stock tools behind its scope check and reroute.
+    assert _factory_mcp.app.mcp is not None
+    served = _factory_mcp._registered_tool_functions(_factory_mcp.app.mcp)
+    tools = {name: tool.fn for name, tool in served.items()}
     outputs = {}
     author_script(tmp_path, monkeypatch, ["echo launched > edited"])
     loop = asyncio.get_running_loop()
@@ -674,6 +677,14 @@ async def test_factory_mcp_launch_status_direction(single_engine, queue_state, m
     config = _InitConfig(root_dir=tmp_path, project=_factory.PROJECT, domain=_factory.DOMAIN)
     try:
         with init_config_context(config):
+            with pytest.raises(ToolError, match="not allowed"):
+                await tools["run_task"](
+                    "other-domain",
+                    _factory.PROJECT,
+                    "factory.launch",
+                    {"brief": "build", "name": "matrix-project"},
+                )
+            assert not world.created
             launched = await tools["run_task"](
                 _factory.DOMAIN,
                 _factory.PROJECT,

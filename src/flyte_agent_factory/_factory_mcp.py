@@ -4,7 +4,7 @@ With `[mcp] auth = "union"` (the default on a Union backend) Union authenticates
 ingress (`requires_auth=True`) and Flyte runs each call as the caller, so a Union user's sign-in token or a
 Union API key both work as the bearer. What the caller may do inside the factory's project and domain is
 bounded by their Union auth (RBAC); this module only keeps every tool from reaching outside it
-(`_scope_tools_to_the_factory`).
+(`_scoped_to_the_factory`).
 
 With `auth = "proxy"` (the default on OSS) the app does no authentication of its own (`requires_auth=False`):
 it trusts whoever reaches it. It must sit behind an authenticating proxy (an OAuth proxy) and never be exposed
@@ -24,16 +24,27 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 import flyte
-from flyte.ai.mcp import FlyteMCPAppEnvironment
-from flyte.ai.mcp._flyte_mcp_app import ALL_MCP_TOOLS, TOOL_REGISTRY
-from flyte.ai.mcp._tools import build_tool_functions
+from flyte.ai.mcp import ALL_MCP_TOOLS, FlyteMCPAppEnvironment
 from mcp.server.fastmcp import (
     Context as MCPContext,
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
+from starlette.middleware import Middleware
+from starlette.routing import Match, Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import _factory, _git, _grant_page, _profile, _profile_oss, _resources, _state_pod, _union_identity
-from ._bridge import _ENDED_PHASES, _ended_on_server
+from . import (
+    _factory,
+    _git,
+    _grant_page,
+    _grant_seal,
+    _profile,
+    _profile_oss,
+    _resources,
+    _state_pod,
+    _union_identity,
+)
+from ._bridge import _ended_on_server
 from ._bridge_common import parse_approval
 from ._errors import REMOTE_ERRORS
 from ._factory import DOMAIN, PROJECT
@@ -42,9 +53,9 @@ from ._images import agent_image
 from ._policy import LAUNCH_MODEL
 from ._reserved import list_owner_reserved
 
-#: Every tool the installed flyte ships (the same 32 through 2.13.0); `_scope_tools_to_the_factory` is what
-#: limits them, not leaving some out.
-TOOLS: list[str] = list(ALL_MCP_TOOLS)
+#: The tools the factory serves: every stock tool, as it always has. `_scoped_to_the_factory` is what limits
+#: them to the factory's project and domain, and it covers a tool a newer SDK adds without a change here.
+TOOLS: tuple[str, ...] = tuple(ALL_MCP_TOOLS)
 
 _mcp = PROFILE.mcp
 if _mcp is None:
@@ -176,7 +187,8 @@ the others too.
 A project whose run has ended is resumed by launching the same name again with
 the new work as the brief: it continues from the last published workspace.
 Use factory.status for progress and review state (rounds, blocking findings, each judge's latest
-verdict); get_logs reads diagnostic logs from the beginning.
+verdict); get_logs returns the newest max_lines lines of a log, oldest first: page back with
+before_line=next_before_line, or pass before_line=max_lines to read from the start.
 list_conditions finds ask- questions and direct- inboxes (send direction; /stop saves and ends the
 project). Decide an engineering-judgement ask- yourself (design, structure, how to satisfy a check, tests,
 tooling): do what is the right thing to do, never a waiver, lowered threshold, removed rule or skipped test.
@@ -218,8 +230,10 @@ only this project. What you may do here is bounded by the caller's Union permiss
 Running a slot task directly is unsupported (it skips validation and the queue), though it is not blocked.
 After a failed deploy, start run_task(name="factory-deployer.deploy_if_changed") (no inputs) instead of
 waiting for the next tick; read its result with get_run_io.
-list_secrets shows names only and no tool returns a secret value; create_secret and delete_secret exist for
-the token secrets the owner would otherwise set. list_apps, get_app, activate_app and deactivate_app, and
+list_secrets shows names only and no tool returns a secret value. create_secret returns a one-time link on
+this server that the owner opens to type the value into a password field: give the owner the link, and never
+ask for the value in chat; once they have used it, list_secrets shows the name. delete_secret removes one.
+list_apps, get_app, activate_app and deactivate_app, and
 list_triggers, get_trigger, activate_trigger and deactivate_trigger, manage this project's apps and triggers.
 """
 
@@ -228,7 +242,9 @@ _public_url = os.environ.get("FACTORY_MCP_PUBLIC_URL", _mcp.public_url).rstrip("
 #: The docs the search tools read. The stock defaults are under /root, which the factory's `agent_image()`
 #: does not have and its unprivileged user could not read; the image build puts them here instead.
 DOCS_DIR = "/opt/flyte-mcp-docs"
-FLYTE_SDK_TAG = "v2.10.7"  # the installed flyte; its examples match the SDK the tools run on
+#: The flyte the image installs, as `pyproject.toml` pins it for the engine (a test keeps the two equal).
+FLYTE_PIN = "flyte[mcp]>=2.13.5,<2.14.0"
+FLYTE_SDK_TAG = "v2.13.5"  # the installed flyte; its examples match the SDK the tools run on (a test checks)
 _FETCH_DOCS = (
     # Shallow clones keep only the directory the search reads; the rest of each repo is dropped.
     f"mkdir -p {DOCS_DIR} "
@@ -240,16 +256,49 @@ _FETCH_DOCS = (
     f"&& rm -rf /tmp/flyte-sdk /tmp/unionai-examples && chmod -R a+rX {DOCS_DIR}"
 )
 
+
+class _GrantPage:
+    """ASGI middleware that serves the grant page at `PAGE_PATH`, ahead of the app's router.
+
+    The page is the factory's one route of its own. The stock app mounts FastMCP's ASGI app at
+    `/flyte-mcp`, and Starlette gives a request under a mount to the mount alone, so a route added beside it
+    at `/flyte-mcp/grant` is never reached; and a FastMCP `custom_route` has to exist before the app is built,
+    which the stock environment offers no public hook for. A middleware installed through the documented
+    `_starlette_middleware` hook is inside the stock auth middleware, as the page was when it was a
+    `custom_route`: Union mode asks for the caller's sign-in, proxy mode asks for nothing.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap `app`, which gets every request but the page's."""
+        self.app = app
+        self.route = Route(_grant_seal.PAGE_PATH, _grant_page.serve_grant_page, methods=["GET"])
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Serve the page for a request to its path, pass any other request on."""
+        if scope["type"] == "http":
+            match, child_scope = self.route.matches(scope)
+            if match is Match.FULL:
+                scope.update(child_scope)
+                await self.route.handle(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+class FactoryMCPAppEnvironment(FlyteMCPAppEnvironment):
+    """The stock Flyte MCP app, plus the factory's grant page."""
+
+    def _starlette_middleware(self) -> list[Middleware]:
+        return [*super()._starlette_middleware(), Middleware(_GrantPage)]
+
+
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_for(PROFILE, "queue")  # none on OSS
 _PROXY_AUTH = _profile_oss.mcp_auth(PROFILE) == "proxy"
-app = FlyteMCPAppEnvironment(
+app = FactoryMCPAppEnvironment(
     name="factory-mcp",
-    image=agent_image()
-    .with_pip_packages("flyte[mcp]>=2.10.7,<2.11.0", "mcp>=1.30.0,<2")
-    .with_commands([_FETCH_DOCS]),
+    image=agent_image().with_pip_packages(FLYTE_PIN, "mcp>=1.30.0,<2").with_commands([_FETCH_DOCS]),
     requires_auth=not _PROXY_AUTH,
-    tools=TOOLS,
-    task_allowlist=None,  # any task in the factory project; `_scope_tools_to_the_factory` bounds it
+    tools=list(TOOLS),
+    task_allowlist=None,  # any task in the factory project; `_scoped_to_the_factory` bounds it
     instructions=INSTRUCTIONS,
     allowed_hosts=[urlparse(_public_url).netloc] if _public_url else None,
     allowed_origins=[_public_url] if _public_url else None,
@@ -258,6 +307,7 @@ app = FlyteMCPAppEnvironment(
     env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
     # Spelled out: the app defaults to 1 CPU / 512Mi when it gets None, and `mcp` asks for nothing.
     resources=_resources.for_component(_profile.current(), "mcp").to_flyte(),
+    # One replica: the secret-input links `create_secret` mints live in the process's memory.
     scaling=flyte.app.Scaling(replicas=1),
     sdk_examples_path=f"{DOCS_DIR}/flyte-sdk/examples",
     docs_examples_path=f"{DOCS_DIR}/unionai-examples/v2",
@@ -268,7 +318,7 @@ app = FlyteMCPAppEnvironment(
 ToolFn = Callable[..., Awaitable[dict[str, Any]]]
 
 
-def _wrap_tools_to_wait_for_outputs(stock: dict[str, Any]) -> dict[str, ToolFn]:
+def _wrap_tools_to_wait_for_outputs(stock: dict[str, ToolFn]) -> dict[str, ToolFn]:
     """Return `wait_for_run` and `get_run_io` that wait out the read model's lag after SUCCEEDED.
 
     Wrappers over the stock tools rather than a replacement: the SDK owns how outputs are decoded, and
@@ -280,20 +330,18 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, Any]) -> dict[str, ToolFn]:
     stock_wait: ToolFn = stock["wait_for_run"]
     stock_io: ToolFn = stock["get_run_io"]
 
-    async def outputs_when_readable(
+    async def poll_outputs(
         name: str,
         project: str | None,
         domain: str | None,
-        # Unparametrised on purpose: FastMCP finds its Context argument by `issubclass`, which a
-        # `Context[...]` alias fails. The tools' `-> dict` is bare for the same reason: `dict[str, Any]`
-        # makes FastMCP add structured output, a second content block that clients do not expect.
-        ctx: MCPContext | None,  # type: ignore[type-arg]  # bare on purpose, see above
+        ctx: MCPContext | None,  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
     ) -> dict[str, Any]:
-        """Poll `get_run_io` until the outputs are there, `outputs_error` is set or the wait is spent."""
+        """Poll for the run's outputs until they are there, `outputs_error` is set or the wait is spent."""
         deadline = time.monotonic() + _OUTPUTS_WAIT_S
         delay = _POLL_FIRST_S
         while True:
-            io = await stock_io(name, project, domain, ctx)
+            # outputs_only: the inputs are already in hand, and each poll would fetch them again.
+            io = await stock_io(name=name, outputs_only=True, project=project, domain=domain, ctx=ctx)
             if io.get("outputs") is not None or io.get("outputs_error"):
                 return io
             if time.monotonic() + delay > deadline:
@@ -311,8 +359,8 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, Any]) -> dict[str, ToolFn]:
         timeout_s: float | None = None,
         project: str | None = None,
         domain: str | None = None,
-        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # see above
-    ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see above
+        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # see `get_run_io`
+    ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
         """Block until a run reaches a terminal phase, then report it.
 
         Prefer this over polling `get_run` in a loop. Always pass `timeout_s` for runs that
@@ -321,17 +369,23 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, Any]) -> dict[str, ToolFn]:
         its outputs are readable by `get_run_io` (`outputs_ready: true`), up to a bounded wait;
         if they are not, `outputs_ready` is false and `get_run_io` should be retried.
         """
-        result = await stock_wait(name, timeout_s, project, domain, ctx)
+        result = await stock_wait(name=name, timeout_s=timeout_s, project=project, domain=domain, ctx=ctx)
         if _phase_name(result.get("phase")) in _SUCCESS_PHASES:
-            io = await outputs_when_readable(name, project, domain, ctx)
+            io = await poll_outputs(name, project, domain, ctx)
             result["outputs_ready"] = io.get("outputs") is not None
         return result
 
     async def get_run_io(
         name: str,
+        action_name: str | None = None,
+        inputs_only: bool = False,
+        outputs_only: bool = False,
         project: str | None = None,
         domain: str | None = None,
-        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # see above
+        # Unparametrised on purpose: FastMCP finds its Context argument by `issubclass`, which a
+        # `Context[...]` alias fails. The tools' `-> dict` is bare for the same reason: `dict[str, Any]`
+        # makes FastMCP add structured output, a second content block that clients do not expect.
+        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # bare on purpose, see above
     ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see above
         """Get a run's inputs, and its outputs once it has finished.
 
@@ -339,54 +393,68 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, Any]) -> dict[str, ToolFn]:
         readable, since a run that has just SUCCEEDED can still look as if it is going; if they are
         not, `outputs_error` says so and the call can be repeated. If the outputs exist but cannot be
         decoded, `outputs_error` explains why instead of the outputs silently coming back null.
+
+        Pass `action_name` (from `list_actions`) for a nested action's data instead of the root's, and
+        `inputs_only` or `outputs_only` (not both) to leave the other out of the response when it is large.
+        Those return at once: only the run's own outputs are waited for.
         """
-        io = await stock_io(name, project, domain, ctx)
-        if io.get("outputs") is not None or io.get("outputs_error"):
+        io = await stock_io(
+            name=name,
+            action_name=action_name,
+            inputs_only=inputs_only,
+            outputs_only=outputs_only,
+            project=project,
+            domain=domain,
+            ctx=ctx,
+        )
+        if action_name is not None or inputs_only or io.get("outputs") is not None or io.get("outputs_error"):
             return io
         # Null outputs are right for a run that failed. Any other phase may be stale: the read model that
         # `get_run` reads lags the one that SUCCEEDED, so only the failure phases are trusted as they are.
-        if _phase_name((await stock_get_run(name, project, domain, ctx)).get("phase")) in _FAILURE_PHASES:
+        run = await stock_get_run(name=name, project=project, domain=domain, ctx=ctx)
+        if _phase_name(run.get("phase")) in _FAILURE_PHASES:
             return io
-        return await outputs_when_readable(name, project, domain, ctx)
+        polled = await poll_outputs(name, project, domain, ctx)
+        return {**io, **{k: v for k, v in polled.items() if k in ("outputs", "outputs_error")}}
 
     return {"wait_for_run": wait_for_run, "get_run_io": get_run_io}
 
 
-def _use_patient_tools(environment: FlyteMCPAppEnvironment) -> None:
-    """Swap the stock `wait_for_run` and `get_run_io` in `environment.mcp` for patient ones.
+def _scoped_arguments(fn: ToolFn) -> dict[str, str]:
+    """Return the factory's value for each parameter of `fn` that picks a project or a domain.
 
-    The replacements come from `_wrap_tools_to_wait_for_outputs`.
+    By name, so an SDK release's new `run_project`-like parameter is covered the day it arrives; a test
+    reads every parameter of every tool the live server lists to hold this to account.
     """
-    server = environment.mcp
-    assert server is not None  # built in the environment's __post_init__
-    for tool_name, fn in _wrap_tools_to_wait_for_outputs(build_tool_functions(environment)).items():
-        server.remove_tool(tool_name)
-        info = TOOL_REGISTRY[tool_name]  # type: ignore[index]  # keys are the registered tool names
-        server.add_tool(fn, name=tool_name, annotations=info.annotations())
-
-
-_use_patient_tools(app)
+    factory_value = {"project": PROJECT, "domain": DOMAIN}
+    return {
+        parameter: factory_value[parameter.rsplit("_", 1)[-1]]
+        for parameter in inspect.signature(fn).parameters
+        if parameter.rsplit("_", 1)[-1] in factory_value
+    }
 
 
 def _scoped_to_the_factory(name: str, fn: ToolFn) -> ToolFn:
     """Wrap `fn` so it refuses a project or domain other than the factory's, else calls through.
 
-    The stock tools take any `project` and `domain` and run the call there as the caller, so without this
-    chat could reach every project the caller's Union RBAC allows. Empty means "the server default", which
-    is the factory's (`FLYTE_MCP_PROJECT`/`FLYTE_MCP_DOMAIN`).
+    The stock tools take any `project` and `domain` (and `run_task`, a `run_project` and `run_domain` to
+    create the run elsewhere) and run the call there as the caller, so without this chat could reach every
+    project the caller's Union RBAC allows. Empty means "the server default", which is the factory's
+    (`FLYTE_MCP_PROJECT`/`FLYTE_MCP_DOMAIN`).
     """
     signature = inspect.signature(fn)
+    scoped_arguments = _scoped_arguments(fn)
 
     # functools.wraps copies the signature, annotations and docstring, so FastMCP builds the same schema.
     @functools.wraps(fn)
     async def scoped(*args: Any, **kwargs: Any) -> Any:
         given = signature.bind(*args, **kwargs).arguments
-        for argument, factory_value in (("project", PROJECT), ("domain", DOMAIN)):
+        for argument, factory_value in scoped_arguments.items():
             value = given.get(argument)
             if value and value != factory_value:
                 raise ToolError(
                     f"{name}: {argument} {value!r} is not allowed; this server is limited to "
-                    f"{argument} {factory_value!r}."
+                    f"{argument.rsplit('_', 1)[-1]} {factory_value!r}."
                 )
         return await fn(*args, **kwargs)
 
@@ -399,8 +467,9 @@ def _list_only_the_factory_project(stock: ToolFn) -> ToolFn:
     @functools.wraps(stock)
     async def list_projects(limit: int = 100, ctx: MCPContext | None = None) -> Any:  # type: ignore[type-arg]
         # Ask for everything: the stock limit counts projects before this filter drops all but one.
-        everything = cast(list[dict[str, Any]], await stock(10**6, ctx))
-        return [p for p in everything if p["id"] == PROJECT][:limit]
+        everything = cast(list[dict[str, Any]], await stock(limit=10**6, ctx=ctx))
+        # Stock returns at least one project for any limit (it checks the count after appending).
+        return [p for p in everything if p["id"] == PROJECT][: max(limit, 1)]
 
     return list_projects
 
@@ -414,18 +483,22 @@ def _get_only_the_factory_project(stock: ToolFn) -> ToolFn:
             raise ToolError(
                 f"get_project: project {name!r} is not allowed; this server is limited to {PROJECT!r}."
             )
-        return await stock(name, ctx)
+        return await stock(name=name, ctx=ctx)
 
     return get_project
 
 
-def _signal_condition_that_reaches_the_project(environment: FlyteMCPAppEnvironment, stock: ToolFn) -> ToolFn:
+def _signal_condition_that_reaches_the_project(stock: ToolFn, list_conditions: ToolFn) -> ToolFn:
     """`signal_condition` that takes any answer to an ask, and sends a late one to the project's inbox.
 
     A chat relays the owner's words as they are. The stock tool fails on a sentence for a bool condition
     and on a condition that has ended, and either way the owner's answer was lost to the project. Here an
     ask's answer that cannot be signalled to it goes to the run's open `direct-` condition instead, as
     `/late-answer <condition> <value>`, which the session's inbox hands to its bridge (`Bridge.late_answer`).
+
+    Everything goes through the stock `signal_condition` and `list_conditions`, which take the scope: the
+    `flyte.remote.Condition` calls under them read the project and domain off the init config, and only the
+    stock tools can set that for one call.
     """
 
     @functools.wraps(stock)
@@ -435,101 +508,116 @@ def _signal_condition_that_reaches_the_project(environment: FlyteMCPAppEnvironme
         value: bool | int | float | str,
         project: str | None = None,
         domain: str | None = None,
-        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # bare on purpose, see above
-    ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see above
-        from flyte.remote._condition import coerce_condition_payload, resolve_condition_expected_type
+        ctx: MCPContext | None = None,  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
+    ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
+        async def signal(condition: str, payload: bool | int | float | str) -> dict[str, Any]:
+            return await stock(
+                name=condition, run_name=run_name, value=payload, project=project, domain=domain, ctx=ctx
+            )
 
-        with environment._scoped(project, domain):
-            condition = await cast(Any, flyte.remote.Condition.get).aio(name, run_name=run_name)
-            if condition is None:
-                raise ToolError(f"Condition '{name}' was not found in run '{run_name}'.")
-            is_ask = name.startswith("ask-")
-            phase = str(getattr(condition, "phase", "") or "").removeprefix("ACTION_PHASE_")
-            late = f"{name} had already ended ({phase})" if is_ask and phase in _ENDED_PHASES else ""
-            payload: Any = value
-            if not late:
-                expected = resolve_condition_expected_type(condition.pb2)
-                try:
-                    if expected is bool:
-                        # An approve ask from before they took text: coerce "yes" or a sentence.
-                        payload = parse_approval(value)
-                        if payload is None:
-                            raise ValueError(f"{value!r} is neither yes nor no")
-                    elif expected is not None:
-                        payload = coerce_condition_payload(value, expected)
-                except (ValueError, TypeError) as e:
-                    if not is_ask:
-                        raise ToolError(f"{name}: {e}") from e
-                    late = f"{name} takes {expected.__name__ if expected else 'another type'}: {e}"
-            if not late:
-                try:
-                    await condition.signal.aio(payload)
-                except REMOTE_ERRORS as e:
-                    if not (is_ask and _ended_on_server(e)):
-                        raise
-                    late = f"{name} had already ended"
-                else:
-                    return {"name": condition.name, "run_name": run_name, "signaled": True, "value": payload}
+        if not name.startswith("ask-"):
+            return await signal(name, value)
 
-            if not str(value).strip():
-                raise ToolError(
-                    f"The answer to {name} was NOT delivered: {late}, and an empty answer says nothing."
-                )
-            inbox = None
-            async for candidate in cast(Any, flyte.remote.Condition.listall).aio(
-                run_name=run_name, limit=500
-            ):
-                if candidate.name.startswith("direct-") and "PAUSED" in str(candidate.phase):
-                    inbox = candidate
-                    break
-            if inbox is None:
-                raise ToolError(
-                    f"The answer to {name} was NOT delivered: {late}, and run '{run_name}' has no open "
-                    "direct- inbox right now. Tell the user it did not arrive and try again shortly."
-                )
-            await inbox.signal.aio(f"/late-answer {name} {value}")
-            return {
-                "name": name,
-                "run_name": run_name,
-                "signaled": True,
-                "rerouted": True,
-                "delivered_to": inbox.name,
-                "reason": f"{late}; sent to the project's inbox as a late answer",
-            }
+        async def try_signal(payload: bool | int | float | str) -> tuple[dict[str, Any] | None, str]:
+            """Return the stock call's result, or why an ask's answer could not be signalled to it."""
+            try:
+                return await signal(name, payload), ""
+            except (ValueError, TypeError) as e:
+                return None, f"{name} takes another type: {e}"
+            except REMOTE_ERRORS as e:
+                if not _ended_on_server(e):
+                    raise
+                return None, f"{name} had already ended"
+
+        signalled, late = await try_signal(value)
+        if signalled is not None:
+            return signalled
+        # An approve ask from before they took text: "yes" or a sentence for a bool condition.
+        approval = parse_approval(value)
+        if approval is not None:
+            signalled, late = await try_signal(approval)
+            if signalled is not None:
+                return signalled
+
+        if not str(value).strip():
+            raise ToolError(
+                f"The answer to {name} was NOT delivered: {late}, and an empty answer says nothing."
+            )
+        # The stock listing reads each condition's details, so it is the dearer way to find the inbox; it is
+        # only asked for here, when the answer would otherwise be lost.
+        conditions = cast(
+            list[dict[str, Any]],
+            await list_conditions(run_name=run_name, limit=500, project=project, domain=domain, ctx=ctx),
+        )
+        ended = next((c for c in conditions if c["name"] == name), None)
+        if ended is not None and late.endswith("had already ended"):
+            late += f" ({str(ended['phase']).removeprefix('ACTION_PHASE_')})"
+        inbox = next(
+            (
+                c["name"]
+                for c in conditions
+                if c["name"].startswith("direct-") and "PAUSED" in str(c["phase"])
+            ),
+            None,
+        )
+        if inbox is None:
+            raise ToolError(
+                f"The answer to {name} was NOT delivered: {late}, and run '{run_name}' has no open "
+                "direct- inbox right now. Tell the user it did not arrive and try again shortly."
+            )
+        await signal(inbox, f"/late-answer {name} {value}")
+        return {
+            "name": name,
+            "run_name": run_name,
+            "signaled": True,
+            "rerouted": True,
+            "delivered_to": inbox,
+            "reason": f"{late}; sent to the project's inbox as a late answer",
+        }
 
     return signal_condition
 
 
-def _scope_tools_to_the_factory(environment: FlyteMCPAppEnvironment) -> None:
-    """Swap every registered tool that takes a `project` or `domain` for one that refuses the wrong ones.
+def _registered_tool_functions(server: Any) -> dict[str, Any]:
+    """Return each registered tool of a FastMCP server: its name, function and annotations.
 
-    Run after `_use_patient_tools`, so the patient `wait_for_run` and `get_run_io` are the ones wrapped.
+    FastMCP's public API (`list_tools`, `call_tool`) hands out schemas and results, never a tool's function,
+    and the wrappers below need the stock function to call. `_tool_manager` is where FastMCP keeps its
+    `Tool` objects; the python-sdk has no public getter, so this is the one place that reaches in. Upstream
+    would need to add one (a `FastMCP.get_tool`) for it to go.
+    """
+    return {tool.name: tool for tool in server._tool_manager.list_tools()}
+
+
+def _use_the_factorys_tools(environment: FlyteMCPAppEnvironment) -> None:
+    """Replace the stock tools in `environment.mcp` that the factory needs different, and scope every one.
+
+    The patient `wait_for_run` and `get_run_io`, `list_projects`, `get_project` and `signal_condition` come
+    first, and then every tool that takes a project or a domain is wrapped to refuse any but the factory's.
     Tools with neither (`whoami`, the searches) are left alone.
     """
     server = environment.mcp
     assert server is not None  # built in the environment's __post_init__
-    for tool in server._tool_manager.list_tools():  # FastMCP has no public way to read a tool's function
-        name, fn = tool.name, cast(ToolFn, tool.fn)
-        if name == "list_projects":
-            replacement = _list_only_the_factory_project(fn)
-        elif name == "get_project":
-            replacement = _get_only_the_factory_project(fn)
-        elif name == "signal_condition":
-            replacement = _scoped_to_the_factory(
-                name, _signal_condition_that_reaches_the_project(environment, fn)
-            )
-        elif {"project", "domain"} & set(inspect.signature(fn).parameters):
-            replacement = _scoped_to_the_factory(name, fn)
-        else:
+    registered = _registered_tool_functions(server)
+    stock = {name: cast(ToolFn, tool.fn) for name, tool in registered.items()}
+
+    replacements: dict[str, ToolFn] = {}
+    replacements.update(_wrap_tools_to_wait_for_outputs(stock))
+    replacements["list_projects"] = _list_only_the_factory_project(stock["list_projects"])
+    replacements["get_project"] = _get_only_the_factory_project(stock["get_project"])
+    replacements["signal_condition"] = _signal_condition_that_reaches_the_project(
+        stock["signal_condition"], stock["list_conditions"]
+    )
+    for name, fn in stock.items():
+        fn = replacements.get(name, fn)
+        if _scoped_arguments(fn):
+            fn = _scoped_to_the_factory(name, fn)
+        if fn is stock[name]:
             continue
+        tool = registered[name]
         server.remove_tool(name)
-        server.add_tool(replacement, name=name, annotations=TOOL_REGISTRY[name].annotations())  # type: ignore[index]
+        # Annotations are the registered tool's: the SDK's own table of them is private.
+        server.add_tool(fn, name=name, title=tool.title, annotations=tool.annotations)
 
 
-_scope_tools_to_the_factory(app)
-
-
-# The environment built its Starlette app (which snapshots FastMCP's routes) when `app` was created, so a
-# route added now only shows up once that app is rebuilt. FastMCP serves it under the mount: `PAGE_PATH`.
-_grant_page.register(app.mcp)
-app._starlette_app = app._create_starlette_app()
+_use_the_factorys_tools(app)

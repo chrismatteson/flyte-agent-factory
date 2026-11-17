@@ -280,3 +280,14 @@ def test_the_start_has_no_blocking_gate_failure(tmp_path):
             capture_output=True,
         )
     assert _gates.run(workspace, "app", "", "", "", {}, _timeline._Timeline()) == ""
+
+
+def test_no_bench_brief_names_a_flyte_version_other_than_the_installed_one():
+    """A brief tells the agent what the check image has; that image installs the engine's own flyte."""
+    import re
+
+    import flyte
+
+    for task in _bench_suite.TASKS.values():
+        for version in re.findall(r"Flyte (\d+\.\d+\.\d+)", task.brief):
+            assert version == flyte.__version__, (task.id, version)

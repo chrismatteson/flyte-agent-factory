@@ -6,11 +6,11 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
-    # Volumes live in flyteplugins-union, whose Volume API (fork / finalize /
-    # from_locator) is the 0.15.x line, and that line pins flyte to 2.10.x.
     # Pinned in the project rather than relying on a globally installed `flyte`
-    # tool, so the CLI, the image and the tests all agree on one version.
-    "flyte[mcp]>=2.10.7,<2.11.0",
+    # tool, so the CLI, the image and the tests all agree on one version. The
+    # factory MCP server's image pins the same range (`_factory_mcp.FLYTE_PIN`),
+    # and `FLYTE_SDK_TAG` there must equal the installed version (a test).
+    "flyte[mcp]>=2.13.5,<2.14.0",
     # Resource-bound bearer middleware is available in this MCP SDK version.
     "mcp>=1.30.0,<2",
     "fastapi>=0.115,<1",
@@ -18,11 +18,12 @@ dependencies = [
     # environment-definition time -- i.e. on whatever machine runs
     # `flyte deploy`, not in the container. Pure Python, installs anywhere.
     "kubernetes>=31.0.0",
-    # Linux-x86 only (it ships a FUSE mount stack), so it cannot install on a
-    # macOS dev machine. Marked platform-conditional so `uv sync` works there,
-    # and imported lazily inside task bodies -- never at module scope, or
-    # `flyte deploy` from a Mac would fail on the import.
-    "flyteplugins-union>=0.15.5,<0.16.0 ; sys_platform == 'linux'",
+    # The remote ApiKey / Policy / Assignment API the bootstrap uses to make the
+    # factory's Union keys (`_bootstrap_flyte`). Linux only (manylinux wheels, no
+    # macOS), so it cannot install on a macOS dev machine. Marked
+    # platform-conditional so `uv sync` works there, and imported lazily -- never
+    # at module scope, or `flyte deploy` from a Mac would fail on the import.
+    "flyteplugins-union>=0.21.2,<0.22.0 ; sys_platform == 'linux'",
     "pyjwt[crypto]>=2.8,<3",
     # The state store's bucket backend. Pinned to the minor: its conditional-put and error classes are what
     # `_state_bucket` relies on (the contract suite's CAS tests).

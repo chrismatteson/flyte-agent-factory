@@ -301,7 +301,7 @@ def test_check_task_submits_the_agent_image_through_flyte_image_resolution(monke
     monkeypatch.setenv("_F_IMG_ID", "ghcr.io/flyteorg/flyte:py3.12-v2.10.7")
     monkeypatch.delenv("FLYTE_INTERNAL_IMAGE", raising=False)
 
-    async def echo_build(env_name, image):
+    async def echo_build(env_name, image, queue=None):
         return env_name, image.uri, None
 
     monkeypatch.setattr(deploy, "_build_image_bg", echo_build)

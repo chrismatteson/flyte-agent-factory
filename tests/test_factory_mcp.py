@@ -1,13 +1,16 @@
+import ast
+import importlib.metadata
 import inspect
 import json
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import flyte
 import pytest
-from flyte.ai.mcp import FlyteMCPAppEnvironment
-from flyte.ai.mcp._flyte_mcp_app import ALL_MCP_TOOLS, TOOL_REGISTRY
+from flyte._initialize import _get_init_config as real_get_init_config
+from flyte.ai.mcp import ALL_MCP_TOOLS, FlyteMCPAppEnvironment
 from flyte.models import ActionPhase
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -20,7 +23,9 @@ ROOT = Path(factory.__file__).resolve().parents[2]
 def test_is_the_stock_flyte_mcp_app_behind_union_auth():
     # Union's ingress authenticates each request and Flyte runs each call as the caller, so a
     # sign-in token and a Union API key both work as the bearer; nothing here checks tokens.
-    assert type(factory.app) is FlyteMCPAppEnvironment
+    # A subclass only to serve the grant page; every tool and setting is the stock environment's.
+    assert type(factory.app) is factory.FactoryMCPAppEnvironment
+    assert isinstance(factory.app, FlyteMCPAppEnvironment)
     assert factory.app.requires_auth is True
     # No token of its own: its one secret is the queue tier's Union key, so it acts as that key.
     assert [(s.key, s.as_env_var) for s in cast(list[flyte.Secret], factory.app.secrets)] == [
@@ -383,13 +388,14 @@ def _registered_tools() -> dict[str, Any]:
     return {tool.name: tool for tool in factory.app.mcp._tool_manager.list_tools()}
 
 
+def _scope_parameters(fn: Any) -> list[str]:
+    """The parameters of `fn` whose name mentions a project or a domain (`project`, `run_domain`, ...)."""
+    return [p for p in inspect.signature(fn).parameters if "project" in p or "domain" in p]
+
+
 def _scoped_tool_names() -> list[str]:
     """Every registered tool that takes a project or a domain, found from the tools themselves."""
-    return sorted(
-        name
-        for name, tool in _registered_tools().items()
-        if {"project", "domain"} & set(inspect.signature(tool.fn).parameters)
-    )
+    return sorted(name for name, tool in _registered_tools().items() if _scope_parameters(tool.fn))
 
 
 def _required_arguments(tool_name: str) -> dict[str, Any]:
@@ -400,7 +406,13 @@ def _required_arguments(tool_name: str) -> dict[str, Any]:
         for name, p in parameters.items()
         if p.default is inspect.Parameter.empty and name not in ("ctx", "project", "domain")
     }
-    return {name: {} if name == "inputs" else "x" for name in required}
+    # `run_task` and `get_task` cannot do without a project and a domain; the factory's are always valid.
+    in_scope = {
+        name: {"project": _factory.PROJECT, "domain": _factory.DOMAIN}[name]
+        for name in ("project", "domain")
+        if name in parameters and parameters[name].default is inspect.Parameter.empty
+    }
+    return {name: {} if name == "inputs" else "x" for name in required} | in_scope
 
 
 async def call_list(tool: str, **arguments: Any) -> list[dict[str, Any]]:
@@ -414,7 +426,8 @@ def test_exposes_launching_and_following_projects_only():
     """The tools for launching and following projects are there, limited to the factory's project.
 
     This test also pinned the absence of the secret and trigger tools; the brief asks for every stock tool,
-    so that is now `test_enables_every_stock_tool`, and "only" is the project/domain scope check.
+    so that is now `test_enables_every_stock_tool`, and "only" is the project/domain
+    scope check.
     """
     assert factory.app.enabled_tools == set(factory.TOOLS)
     assert "run_task" in factory.app.enabled_tools
@@ -427,7 +440,11 @@ def test_enables_every_stock_tool():
     assert factory.app.enabled_tools == set(ALL_MCP_TOOLS)
     assert set(factory.TOOLS) == set(ALL_MCP_TOOLS)
     assert set(_registered_tools()) == set(ALL_MCP_TOOLS)
-    assert len(ALL_MCP_TOOLS) == len(TOOL_REGISTRY)
+    # `ALL_MCP_TOOLS` is every tool the SDK implements: a plain stock environment registers exactly those.
+    # (This compared against the private `TOOL_REGISTRY` before; the stock app raises if the two drift.)
+    stock = FlyteMCPAppEnvironment(name="stock")
+    assert stock.mcp is not None
+    assert {tool.name for tool in stock.mcp._tool_manager.list_tools()} == set(ALL_MCP_TOOLS)
 
 
 def test_the_allowlist_is_exactly_the_factory_chat_tasks_and_benchmark():
@@ -481,7 +498,7 @@ def remote(lagging, monkeypatch):
         # A secret object that carries its value, as a careless SDK change might make it.
         yield SimpleNamespace(name="claude_token", type="regular", value="hunter2-secret-value")
 
-    async def secret_create(name, value, type):
+    async def secret_create(name, value, type="regular"):
         calls.append(("Secret.create", name))
 
     monkeypatch.setattr(flyte.remote.Task, "get", task_get)
@@ -533,12 +550,11 @@ async def test_run_task_reaches_the_queue_tasks_in_the_factory_project_only(remo
 
 
 def _scoped_tool_arguments() -> list[tuple[str, str]]:
-    """(tool, argument) for every registered tool and each of `project`/`domain` it takes."""
+    """(tool, argument) for every registered tool and each argument of it that names a project or domain."""
     return [
         (name, argument)
         for name in _scoped_tool_names()
-        for argument in ("project", "domain")
-        if argument in inspect.signature(_registered_tools()[name].fn).parameters
+        for argument in _scope_parameters(_registered_tools()[name].fn)
     ]
 
 
@@ -553,8 +569,9 @@ async def test_a_tool_refuses_another_project_or_domain_before_any_remote_call(
         pytest.fail(f"{tool} reached the remote scope")
 
     monkeypatch.setattr(factory.app, "_scoped", scoped)
-    arguments = _required_arguments(tool) | {argument: OTHER[argument]}
-    with pytest.raises(ToolError, match=OTHER[argument]):
+    other = OTHER["project" if "project" in argument else "domain"]
+    arguments = _required_arguments(tool) | {argument: other}
+    with pytest.raises(ToolError, match=other):
         assert factory.app.mcp is not None
         await factory.app.mcp.call_tool(tool, arguments)
     assert not reached and not remote
@@ -564,6 +581,8 @@ def test_every_tool_that_takes_a_project_or_domain_is_covered_by_the_scope_tests
     assert {"run_task", "get_task", "get_run", "wait_for_run", "get_run_io", "list_secrets"} <= set(
         _scoped_tool_names()
     )
+    # `run_task` can create its run in another project: the bypass the stock `project` check alone would miss.
+    assert {"run_project", "run_domain"} <= set(_scope_parameters(_registered_tools()["run_task"].fn))
     assert not {"whoami", "search_full_docs", "list_projects", "get_project"} & set(_scoped_tool_names())
 
 
@@ -573,7 +592,7 @@ async def test_the_factorys_own_project_and_domain_are_accepted(remote):
 
 
 async def test_scoping_leaves_each_tools_input_schema_unchanged():
-    stock = FlyteMCPAppEnvironment(name="stock", tools=list(ALL_MCP_TOOLS))
+    stock = FlyteMCPAppEnvironment(name="stock", tools=list(factory.TOOLS))
     assert stock.mcp is not None
     stock_tools = {t.name: t for t in stock.mcp._tool_manager.list_tools()}
     ours = _registered_tools()
@@ -585,6 +604,12 @@ async def test_scoping_leaves_each_tools_input_schema_unchanged():
 
 async def test_list_projects_shows_only_the_factory_project(remote):
     result = await call_list("list_projects")
+    assert [p["id"] for p in result] == [_factory.PROJECT]
+
+
+@pytest.mark.parametrize("limit", [-1, 0, 1])
+async def test_list_projects_shows_the_factory_project_for_any_limit_as_stock_does(remote, limit):
+    result = await call_list("list_projects", limit=limit)
     assert [p["id"] for p in result] == [_factory.PROJECT]
 
 
@@ -601,11 +626,84 @@ async def test_list_secrets_returns_names_and_types_only(remote):
     assert "hunter2-secret-value" not in json.dumps(result)
 
 
-async def test_create_secret_does_not_echo_the_value(remote):
-    result = await call("create_secret", name="claude_token", value="hunter2-secret-value")
-    assert result == {"name": "claude_token", "created": True}
-    assert "hunter2-secret-value" not in json.dumps(result)
+def _asgi_call(client: Any, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Call `tool` over the app's streamable-http endpoint, as a client does, and return its JSON result."""
+    response = client.post(
+        "/flyte-mcp/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        },
+        headers={"Accept": "application/json, text/event-stream", "Cookie": "union=signed-in"},
+    )
+    assert response.status_code == 200, response.text
+    [content] = response.json()["result"]["content"]
+    return cast(dict[str, Any], json.loads(content["text"]))
+
+
+@pytest.fixture
+def asgi_client(remote, monkeypatch):
+    """A client of the factory's real ASGI app, with the Flyte calls behind it faked."""
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+    from starlette.testclient import TestClient
+
+    async def init_passthrough(**_: Any) -> None:
+        return None
+
+    async def secret_get(name):
+        raise ConnectError(Code.NOT_FOUND, f"{name} not found")
+
+    monkeypatch.setattr(flyte, "init_passthrough", SimpleNamespace(aio=init_passthrough))
+    monkeypatch.setattr(flyte.remote.Secret, "get", SimpleNamespace(aio=secret_get))
+    flyte.init(project=_factory.PROJECT, domain=_factory.DOMAIN)
+    assert factory.app._starlette_app is not None
+    with TestClient(factory.app._starlette_app, base_url="https://factory-mcp.example") as client:
+        yield client
+
+
+def test_create_secret_does_not_echo_the_value(asgi_client, remote):
+    """The old test's property on the new tool: no value in the result; the value is typed elsewhere.
+
+    The stock `create_secret` no longer takes a `value` (2.13.5, `_secret_tools.py` `create_secret`): it
+    returns a one-time `/secret-input/` link on this server, and the owner types the value into that page.
+    One test for the whole flow, because an app's MCP session manager starts once per process.
+    """
+    from urllib.parse import urlsplit
+
+    result = _asgi_call(asgi_client, "create_secret", {"name": "claude_token"})
+    assert result["status"] == "awaiting_value" and "value" not in result
+    assert result["url"].startswith("https://factory-mcp.example/secret-input/")
+    assert (
+        "Secret.create",
+        "claude_token",
+    ) not in remote  # nothing is written until the owner opens the link
+
+    # The link is served by this app: the owner's form, then the write, with the value going to Flyte only.
+    path, signed_in = urlsplit(result["url"]).path, {"Cookie": "union=signed-in"}
+    form = asgi_client.get(path, headers=signed_in)
+    assert form.status_code == 200 and "type=password" in form.text
+    saved = asgi_client.post(path, data={"value": "hunter2-secret-value"}, headers=signed_in)
+    assert saved.status_code == 200 and "hunter2-secret-value" not in saved.text
     assert ("Secret.create", "claude_token") in remote
+    assert asgi_client.get(path, headers=signed_in).status_code == 410  # one use
+
+
+def test_the_secret_input_route_is_served_by_the_factory_app():
+    assert factory.app._starlette_app is not None
+    paths = {getattr(route, "path", "") for route in factory.app._starlette_app.routes}
+    assert "/secret-input/{token}" in paths
+    assert "create_secret" in factory.app.enabled_tools
+
+
+def test_the_secret_value_is_not_an_argument_of_any_served_tool():
+    assert factory.app.allow_inline_secret_values is False
+    assert all(
+        "value" not in inspect.signature(t.fn).parameters or n == "signal_condition"
+        for n, t in _registered_tools().items()
+    )
 
 
 async def test_the_patient_tools_are_still_patient_once_scoped(lagging):
@@ -616,6 +714,16 @@ async def test_the_patient_tools_are_still_patient_once_scoped(lagging):
     assert result["outputs"] == {"o0": '{"status": "started"}'}
     assert run.reads > 6
     assert "bounded" in (_registered_tools()["get_run_io"].description or "")
+
+
+def test_instructions_and_skill_describe_get_logs_as_a_tail_with_paging():
+    """Stock `get_logs` returns the newest `max_lines` lines and pages back with `before_line`."""
+    skill = (ROOT / "skills/agent-factory/SKILL.md").read_text()
+    for text in (factory.INSTRUCTIONS, skill):
+        flat = " ".join(text.split())
+        assert "before_line" in flat
+        assert "newest" in flat
+        assert "from the beginning" not in flat and "starts at the beginning" not in flat
 
 
 def test_instructions_describe_the_wider_surface_and_its_limits():
@@ -634,19 +742,30 @@ def test_search_tools_read_a_corpus_the_image_carries_outside_root():
         str(layer)
         for layer in factory.app.image._layers  # type: ignore[union-attr]
     )
-    assert "v2.10.7" in commands and "llms.txt" in commands and "/opt/flyte-mcp-docs" in commands
+    assert factory.FLYTE_SDK_TAG in commands and "llms.txt" in commands and "/opt/flyte-mcp-docs" in commands
+
+
+def _grant_page_client(requires_auth: bool) -> Any:
+    from starlette.testclient import TestClient
+
+    environment = factory.FactoryMCPAppEnvironment(
+        name="grant-test", requires_auth=requires_auth, tools=["whoami"]
+    )
+    assert environment._starlette_app is not None
+    return TestClient(environment._starlette_app)
 
 
 def test_the_grant_page_is_served_by_the_factory_app_at_its_public_path():
-    from starlette.testclient import TestClient
-
     from flyte_agent_factory import _grant_page
     from flyte_agent_factory._grant_seal import PAGE_PATH
 
     assert factory.app._starlette_app is not None
+    from starlette.testclient import TestClient
+
     client = TestClient(factory.app._starlette_app)
-    # The stock auth middleware wants the browser's Union cookie (or a bearer); with one it serves the page.
-    assert client.get(PAGE_PATH).status_code == 401
+    # Union mode: the stock auth middleware wants the browser's Union cookie (or a bearer), then serves it.
+    expected = 401 if factory.app.requires_auth else 200
+    assert client.get(PAGE_PATH).status_code == expected
     response = client.get(PAGE_PATH, headers={"Cookie": "union=signed-in"})
     assert response.status_code == 200
     assert response.text == _grant_page.PAGE_HTML
@@ -654,10 +773,27 @@ def test_the_grant_page_is_served_by_the_factory_app_at_its_public_path():
     assert "connect-src 'none'" in response.headers["Content-Security-Policy"]
 
 
+@pytest.mark.parametrize("requires_auth, unauthenticated", [(True, 401), (False, 200)])
+def test_the_grant_page_is_behind_the_stock_auth_of_each_mode(requires_auth, unauthenticated):
+    """Union mode asks for a sign-in, as when the page was a FastMCP route; proxy mode asks for nothing."""
+    from flyte_agent_factory import _grant_page
+    from flyte_agent_factory._grant_seal import PAGE_PATH
+
+    client = _grant_page_client(requires_auth)
+    assert client.get(PAGE_PATH).status_code == unauthenticated
+    signed_in = client.get(PAGE_PATH, headers={"Authorization": "Bearer t"})
+    assert signed_in.status_code == 200 and signed_in.text == _grant_page.PAGE_HTML
+    assert client.head(PAGE_PATH, headers={"Authorization": "Bearer t"}).status_code == 200
+    assert client.post(PAGE_PATH, headers={"Authorization": "Bearer t"}).text != _grant_page.PAGE_HTML
+    # Everything else is the stock app's: the health check is open, the MCP mount is still there.
+    assert client.get("/health").json() == {"status": "healthy"}
+    assert client.get("/flyte-mcp/not-a-route", headers={"Authorization": "Bearer t"}).status_code == 404
+
+
 def test_the_grant_page_adds_no_mcp_tool():
     assert factory.app.enabled_tools == set(factory.TOOLS)
     assert factory.app.mcp is not None
-    assert {tool.name for tool in factory.app.mcp._tool_manager.list_tools()} == set(factory.TOOLS)
+    assert set(_registered_tools()) == set(factory.TOOLS)
 
 
 def test_instructions_declare_the_operator_state_file_and_write_targets():
@@ -696,7 +832,7 @@ def test_write_targets_always_hold_the_workspace_even_when_mcp_repos_leave_it_ou
     ) == ["team/work", "team/engine"]
 
 
-# --- signal_condition: any answer to an ask reaches the project ---------------------------------
+# --- signal_condition: any answer to an ask reaches the project ---------------------------------------------
 
 
 class _Cond:
@@ -707,9 +843,17 @@ class _Cond:
         self.signalled: list[Any] = []
         self.pb2 = SimpleNamespace(expected=expected)
         self.signal = SimpleNamespace(aio=self._signal)
+        # What `list_conditions` reads of a `flyte.remote.Condition` (details included).
+        self.expected_type, self.action_name, self.run_name = expected, name, "run1"
+        self.prompt = self.prompt_type = self.description = self.timeout = None
+        self.fetch_details = SimpleNamespace(aio=self._details)
+
+    async def _details(self):
+        return self
 
     async def _signal(self, payload):
-        if self.refuse:
+        # The server signals only a paused condition: its refusal is "condition is X, expected PAUSED".
+        if self.refuse or "PAUSED" not in self.phase:
             from connectrpc.code import Code
             from connectrpc.errors import ConnectError
 
@@ -730,7 +874,7 @@ def conditions(remote, monkeypatch):
     async def get(name, run_name):
         return held.get(name)
 
-    async def listall(run_name, limit=100):
+    async def listall(run_name, limit=100, action_name=None):
         for condition in held.values():
             yield condition
 
@@ -799,7 +943,7 @@ async def test_an_empty_answer_to_an_ask_that_ended_is_not_reported_as_delivered
 
 async def test_a_value_the_condition_cannot_take_is_still_an_error_outside_asks(conditions):
     conditions["direct-a0-004"] = _Cond("direct-a0-004", expected=bool)
-    with pytest.raises(ToolError, match="neither yes nor no"):
+    with pytest.raises(ToolError, match="could not parse 'soon' as bool"):
         await _signal(name="direct-a0-004", value="soon")
 
 
@@ -811,3 +955,357 @@ async def test_signal_condition_still_refuses_another_project(conditions):
 def test_instructions_say_plain_answers_are_fine_and_late_ones_are_rerouted():
     assert "Plain yes or no, or a sentence" in factory.INSTRUCTIONS
     assert "rerouted" in factory.INSTRUCTIONS and "NOT delivered" in factory.INSTRUCTIONS
+
+
+# --- what each kept wrapper is for, shown on the stock flyte tool it wraps ----------------------------------
+#
+# The stock tools are fetched from a stock `FlyteMCPAppEnvironment` built here, so each test fails if the SDK
+# closes the gap, and says then that the wrapper can go.
+
+
+def _stock_tool(name: str) -> Any:
+    """Return the stock function of tool `name`, as flyte registers it on a plain environment."""
+    stock = FlyteMCPAppEnvironment(name="stock", tools=[name])
+    assert stock.mcp is not None
+    tool = stock.mcp._tool_manager.get_tool(name)
+    assert tool is not None
+    return tool.fn
+
+
+async def test_stock_get_run_io_gives_null_outputs_on_a_succeeded_run_the_read_model_still_shows_going(
+    lagging,
+):
+    """The gap `get_run_io` fills: the stock `_tools.py` `get_run_io` reads `Run.get` once, says nothing."""
+    run = lagging(LaggingRun(lag=6))
+    io = await _stock_tool("get_run_io")(name="r1")
+    assert io["outputs"] is None and "outputs_error" not in io
+    assert run.reads == 1
+    assert (await call("get_run_io", name="r1"))["outputs"] == {"o0": '{"status": "started"}'}
+
+
+async def test_stock_wait_for_run_returns_before_the_outputs_are_readable(lagging):
+    """The gap `wait_for_run` fills: the stock one returns on the watch stream; the outputs lag."""
+    lagging(LaggingRun(lag=6))
+    result = await _stock_tool("wait_for_run")(name="r1", timeout_s=5)
+    assert result["phase"] == "succeeded" and "outputs_ready" not in result
+    assert (await _stock_tool("get_run_io")(name="r1"))["outputs"] is None
+    assert (await call("wait_for_run", name="r1", timeout_s=5))["outputs_ready"] is True
+
+
+async def test_stock_signal_condition_raises_on_a_sentence_for_a_bool_ask(conditions):
+    """The gap `signal_condition` fills: the stock one coerces and raises, and the answer is lost."""
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001", expected=bool)
+    with pytest.raises(ValueError, match="could not parse"):
+        await _stock_tool("signal_condition")(name="ask-a0-001", run_name="run1", value="yes please")
+    assert ask.signalled == []
+    await _signal(value="yes please")
+    assert ask.signalled == [True]
+
+
+async def test_stock_signal_condition_raises_on_an_ask_that_has_ended(conditions):
+    from connectrpc.errors import ConnectError
+
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001", phase="ACTION_PHASE_TIMED_OUT")
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    with pytest.raises(ConnectError, match="expected PAUSED"):
+        await _stock_tool("signal_condition")(name="ask-a0-001", run_name="run1", value="no")
+    assert inbox.signalled == []
+    assert (await _signal(value="no"))["rerouted"] is True
+    assert ask.signalled == [] and inbox.signalled == ["/late-answer ask-a0-001 no"]
+
+
+async def test_a_yes_to_an_ask_that_ended_is_rerouted_too(conditions):
+    """A sentence for a bool ask that has also ended: the bool retry is refused as well, so it is rerouted."""
+    conditions["ask-a0-001"] = _Cond("ask-a0-001", expected=bool, refuse=True)
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+    result = await _signal(value="yes please")
+    assert result["rerouted"] is True and inbox.signalled == ["/late-answer ask-a0-001 yes please"]
+
+
+async def test_a_signal_the_server_refuses_for_another_reason_is_not_rerouted(conditions):
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+
+    conditions["ask-a0-001"] = ask = _Cond("ask-a0-001")
+    conditions["direct-a0-004"] = inbox = _Cond("direct-a0-004")
+
+    async def denied(payload):
+        raise ConnectError(Code.PERMISSION_DENIED, "not yours")
+
+    ask.signal = SimpleNamespace(aio=denied)
+    with pytest.raises(ToolError, match="not yours"):
+        await _signal(value="go")
+    assert inbox.signalled == []
+
+
+async def test_the_reroute_is_made_in_the_factorys_project_through_the_stock_tools(conditions, monkeypatch):
+    """`Condition.get/listall` take no project or domain (remote/_condition.py): the scope is the tools'."""
+    seen: list[tuple[str | None, str | None]] = []
+    listall = flyte.remote.Condition.listall
+
+    async def recording_listall(**kwargs):
+        config = real_get_init_config()
+        assert config is not None
+        seen.append((config.project, config.domain))
+        async for condition in listall.aio(**kwargs):
+            yield condition
+
+    conditions["ask-a0-001"] = _Cond("ask-a0-001", phase="ACTION_PHASE_ABORTED")
+    conditions["direct-a0-004"] = _Cond("direct-a0-004")
+    monkeypatch.setattr(flyte._initialize, "_get_init_config", real_get_init_config)
+    monkeypatch.setattr(flyte.remote.Condition, "listall", SimpleNamespace(aio=recording_listall))
+    flyte.init(project="elsewhere", domain="elsewhere-domain")
+    await _signal()
+    assert seen and set(seen) == {(_factory.PROJECT, _factory.DOMAIN)}
+
+
+async def test_stock_list_projects_lists_every_project(remote):
+    """The gap `list_projects` fills: `_tools.py` `list_projects` has no scope."""
+    ids = [p["id"] for p in await _stock_tool("list_projects")()]
+    assert ids == [_factory.PROJECT, "other-project"]
+    assert [p["id"] for p in await call_list("list_projects")] == [_factory.PROJECT]
+
+
+async def test_stock_get_project_gives_any_project(remote, monkeypatch):
+    async def project_get(name):
+        pb2 = SimpleNamespace(
+            id=name, name=name, description="", state=0, domains=[], HasField=lambda _: False
+        )
+        return SimpleNamespace(pb2=pb2)
+
+    monkeypatch.setattr(flyte.remote.Project, "get", SimpleNamespace(aio=project_get))
+    assert (await _stock_tool("get_project")(name="other-project"))["id"] == "other-project"
+
+
+@pytest.fixture
+def real_scope(monkeypatch):
+    """Use the SDK's own init config, as the tools do, so the scope a call really ran in can be read back."""
+    monkeypatch.setattr(flyte._initialize, "_get_init_config", real_get_init_config)
+    flyte.init(project="elsewhere", domain="elsewhere-domain")
+
+
+@pytest.mark.parametrize("argument", ["project", "domain", "run_project", "run_domain"])
+async def test_stock_run_task_runs_in_any_project_or_domain(remote, real_scope, monkeypatch, argument):
+    """The gap the scope wrappers fill: stock `run_task`, and `run_project`/`run_domain` since 2.13.x."""
+    context: dict[str, Any] = {}
+
+    async def run(**inputs):
+        return SimpleNamespace(url="http://run", name="r1")
+
+    def with_runcontext(**kwargs):
+        context.update(kwargs)
+        return SimpleNamespace(run=SimpleNamespace(aio=lambda task, **inputs: run()))
+
+    monkeypatch.setattr(flyte, "with_runcontext", with_runcontext)
+    arguments = {
+        "project": _factory.PROJECT,
+        "domain": _factory.DOMAIN,
+        "name": "factory.launch",
+        "inputs": {},
+    }
+    await _stock_tool("run_task")(**arguments | {argument: f"other-{argument}"})
+    [(_, task_get)] = [c for c in remote if c[0] == "Task.get"]
+    reached = {**task_get, **{f"run_{k}": v for k, v in context.items()}}
+    assert reached[argument] == f"other-{argument}"
+
+
+async def test_stock_list_secrets_reads_any_project(remote, real_scope, monkeypatch):
+    scopes: list[tuple[str | None, str | None]] = []
+
+    async def secret_listall(*args, **kwargs):
+        config = real_get_init_config()
+        assert config is not None
+        scopes.append((config.project, config.domain))
+        yield SimpleNamespace(name="claude_token", type="regular")
+
+    monkeypatch.setattr(flyte.remote.Secret, "listall", SimpleNamespace(aio=secret_listall))
+    await _stock_tool("list_secrets")(project="other-project", domain="other-domain")
+    assert scopes == [("other-project", "other-domain")]
+
+
+async def test_a_call_without_a_project_or_domain_runs_in_the_factorys(remote, real_scope, monkeypatch):
+    """With no project or domain the stock resolves `FLYTE_MCP_PROJECT`/`_DOMAIN`, which the app sets."""
+    assert factory.app.env_vars is not None
+    for key in ("FLYTE_MCP_PROJECT", "FLYTE_MCP_DOMAIN"):
+        monkeypatch.setenv(key, factory.app.env_vars[key])
+    scopes: list[tuple[str | None, str | None]] = []
+
+    async def get(name):
+        config = real_get_init_config()
+        assert config is not None
+        scopes.append((config.project, config.domain))
+        return SimpleNamespace(name=name, url="http://run", phase=ActionPhase.RUNNING, done=lambda: False)
+
+    monkeypatch.setattr(flyte.remote.Run, "get", SimpleNamespace(aio=get))
+    assert factory.app.resolve_scope(None, None) == (_factory.PROJECT, _factory.DOMAIN)
+    await call("get_run", name="r1")
+    assert scopes == [(_factory.PROJECT, _factory.DOMAIN)]
+
+
+@pytest.mark.parametrize("project_given", ["", None])
+async def test_an_empty_project_means_the_factorys(remote, project_given):
+    result = await call_list("list_secrets", project=project_given) if project_given is not None else None
+    assert result in (None, [{"name": "claude_token", "type": "regular"}])
+
+
+async def test_the_wrappers_keep_the_stock_input_schema_and_only_the_patient_ones_change_the_text():
+    stock = FlyteMCPAppEnvironment(name="stock", tools=list(factory.TOOLS))
+    assert stock.mcp is not None
+    stock_tools = {t.name: t for t in stock.mcp._tool_manager.list_tools()}
+    ours = _registered_tools()
+    for name, tool in ours.items():
+        assert tool.parameters == stock_tools[name].parameters, name
+        assert tool.annotations == stock_tools[name].annotations, name
+    changed = {n for n, t in ours.items() if t.description != stock_tools[n].description}
+    assert changed == {"get_run_io", "wait_for_run"}
+    # The new arguments of get_run_io are there, so a chat can use them.
+    assert {"action_name", "inputs_only", "outputs_only"} <= set(ours["get_run_io"].parameters["properties"])
+
+
+async def test_get_run_io_with_an_action_or_inputs_only_does_not_wait(lagging):
+    run = lagging(LaggingRun(lag=10**9))
+    inputs = await call("get_run_io", name="r1", inputs_only=True)
+    assert inputs == {"name": "r1", "inputs": {"name": "x"}}
+    assert run.reads == 1
+
+
+async def test_get_run_io_polls_for_the_outputs_only(lagging, monkeypatch):
+    """The polls ask for `outputs_only`, so the inputs are fetched once and not on every poll."""
+    inputs_fetched = 0
+    run = lagging(LaggingRun(lag=6))
+    stock_inputs = run._inputs
+
+    async def counted_inputs():
+        nonlocal inputs_fetched
+        inputs_fetched += 1
+        return await stock_inputs()
+
+    monkeypatch.setattr(run, "_inputs", counted_inputs)
+    result = await call("get_run_io", name="r1")
+    assert result["inputs"] == {"name": "x"} and result["outputs"] == {"o0": '{"status": "started"}'}
+    assert run.reads > 6 and inputs_fetched == 1
+
+
+# --- what the stock settings do, where a wrapper or a rebuild used to ---------------------------------------
+
+
+def test_the_stock_instructions_setting_is_what_the_server_tells_a_client():
+    stock = FlyteMCPAppEnvironment(name="stock", tools=["whoami"], instructions="read this first")
+    assert stock.mcp is not None and stock.mcp.instructions == "read this first"
+    assert factory.app.mcp is not None and factory.app.mcp.instructions == factory.INSTRUCTIONS
+
+
+async def test_the_stock_docs_paths_are_what_the_search_tools_read(tmp_path):
+    (tmp_path / "sdk").mkdir()
+    (tmp_path / "sdk" / "a.py").write_text("sdk_needle = 1\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "b.py").write_text("docs_needle = 1\n")
+    (tmp_path / "llms.txt").write_text("full_needle\n")
+    stock = FlyteMCPAppEnvironment(
+        name="stock",
+        tools=["search_flyte_sdk_examples", "search_flyte_docs_examples", "search_full_docs"],
+        sdk_examples_path=str(tmp_path / "sdk"),
+        docs_examples_path=str(tmp_path / "docs"),
+        full_docs_path=str(tmp_path / "llms.txt"),
+    )
+    assert stock.mcp is not None
+    for tool, needle in (
+        ("search_flyte_sdk_examples", "sdk_needle"),
+        ("search_flyte_docs_examples", "docs_needle"),
+        ("search_full_docs", "full_needle"),
+    ):
+        assert needle in str(await stock.mcp.call_tool(tool, {"pattern": needle}))
+    assert (factory.app.sdk_examples_path, factory.app.docs_examples_path, factory.app.full_docs_path) == (
+        f"{factory.DOCS_DIR}/flyte-sdk/examples",
+        f"{factory.DOCS_DIR}/unionai-examples/v2",
+        f"{factory.DOCS_DIR}/llms.txt",
+    )
+
+
+def test_the_stock_allowed_hosts_and_origins_settings_refuse_another_host_and_origin():
+    from starlette.testclient import TestClient
+
+    environment = FlyteMCPAppEnvironment(
+        name="stock",
+        tools=["whoami"],
+        requires_auth=False,
+        allowed_hosts=["factory-mcp.example"],
+        allowed_origins=["https://factory-mcp.example"],
+    )
+    assert environment._starlette_app is not None
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    accept = {"Accept": "application/json, text/event-stream"}
+    with TestClient(environment._starlette_app) as client:
+        assert (
+            client.post(
+                "/flyte-mcp/mcp", json=request, headers={**accept, "Host": "evil.example"}
+            ).status_code
+            == 421
+        )
+        elsewhere = {**accept, "Host": "factory-mcp.example", "Origin": "https://evil.example"}
+        assert client.post("/flyte-mcp/mcp", json=request, headers=elsewhere).status_code == 403
+        home = {**accept, "Host": "factory-mcp.example", "Origin": "https://factory-mcp.example"}
+        assert client.post("/flyte-mcp/mcp", json=request, headers=home).status_code == 200
+    if factory._public_url:
+        assert factory.app.resolved_allowed_hosts() == [factory._public_url.split("//", 1)[-1].split("/")[0]]
+        assert factory.app.resolved_allowed_origins() == [factory._public_url]
+
+
+def test_the_stock_scaling_setting_is_one_replica_for_the_secret_input_links():
+    assert flyte.app.Scaling(replicas=1).get_replicas() == (1, 1)
+    assert factory.app.scaling.get_replicas() == (1, 1)
+
+
+# --- the flyte pins and the SDK's private modules -----------------------------------------------------------
+
+
+def test_the_image_pins_the_same_flyte_as_the_project_and_its_tag_is_the_installed_one():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert factory.FLYTE_PIN in pyproject["project"]["dependencies"]
+    assert factory.FLYTE_SDK_TAG == f"v{importlib.metadata.version('flyte')}"
+    layers = " ".join(str(layer) for layer in factory.app.image._layers)  # type: ignore[union-attr]
+    assert factory.FLYTE_PIN in layers
+
+
+def _imports_of(path: Path) -> list[str]:
+    """Return every module a source file imports, and every string in it that names a module."""
+    found: list[str] = []
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            found += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            found += [f"{node.module}.{alias.name}" for alias in node.names]
+        elif (
+            isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("flyte.")
+        ):
+            found.append(node.value)
+    return found
+
+
+def test_no_module_imports_a_private_module_of_flyte_ai_mcp():
+    sources = sorted((ROOT / "src").rglob("*.py"))
+    assert factory.__file__ in {str(p) for p in sources}
+    offenders = [
+        f"{path.relative_to(ROOT)}: {module}"
+        for path in sources
+        for module in _imports_of(path)
+        if module.startswith("flyte.ai.mcp._")
+    ]
+    assert offenders == []
+
+
+def test_the_factory_mcp_server_uses_no_private_name_of_the_flyte_environment():
+    tree = ast.parse(Path(factory.__file__).read_text())
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert not attributes & {
+        "_scoped",
+        "_starlette_app",
+        "_create_starlette_app",
+        "_enabled_tools",
+        "_secret_inputs",
+    }
+    assert not [m for m in _imports_of(Path(factory.__file__)) if m.startswith("flyte.remote._")]
+    # FastMCP's registry is reached in one place, `_registered_tool_functions`.
+    assert [
+        n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_tool_manager"
+    ].__len__() == 1

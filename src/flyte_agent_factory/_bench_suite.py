@@ -1181,7 +1181,7 @@ Run locally with `python -m mlpipe`, without cluster access. Preserve the script
 holdout CSV drawn from the same distribution. Also accept `--eval-csv PATH --predictions OUT`
 when PATH has only the feature columns (no `churn` label). Write one predicted label (`0` or `1`)
 per input row to OUT, in input order, with no header. In this mode no accuracy output is required;
-the checker scores those predictions against hidden labels. Use Flyte 2.10.7,
+the checker scores those predictions against hidden labels. Use the Flyte 2 SDK (the `flyte` package),
 scikit-learn 1.6.1 and pandas 2.2.3, which are available in the check image.
 
 `{name}/ACCEPTANCE.md`, written before you build, gives a verdict per line and the command you ran

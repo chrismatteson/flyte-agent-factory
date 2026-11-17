@@ -769,8 +769,7 @@ def _delegate_reattach(timeline: _timeline._Timeline) -> Reattach:
     async def reattach(target: Path, run_name: str, name: str) -> str:
         with _union_identity.denied("reading a delegated action"):
             action = await flyte.remote.Action.get.aio(run_name=run_name, name=name)
-        # `Action.wait` is a plain coroutine in the SDK, not syncified: there is no `.aio`.
-        await action.wait(quiet=True)
+        await action.wait.aio(quiet=True)
         task = asyncio.current_task()
         if task is not None and task.cancelling():
             # `Action.wait` swallows a cancellation and returns with the action still running. Say it
@@ -791,7 +790,7 @@ def _delegate_reattach(timeline: _timeline._Timeline) -> Reattach:
         if details.phase != ActionPhase.SUCCEEDED:
             error = details.error_message or "no error recorded"
             raise RuntimeError(f"worker action {name} ended {details.phase.value}: {error}")
-        summary, output = await details.outputs()
+        summary, output = await details.outputs.aio()
         await output.download(str(target / "result"))
         return _usage._ingest_subagent_usage(
             summary,

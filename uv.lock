@@ -205,15 +205,6 @@ wheels = [
 ]
 
 [[package]]
-name = "aiosqlite"
-version = "0.22.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4e/8a/64761f4005f17809769d23e518d915db74e6310474e733e3593cfc854ef1/aiosqlite-0.22.1.tar.gz", hash = "sha256:043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650", size = 14821, upload-time = "2025-12-23T19:25:43.997Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", size = 17405, upload-time = "2025-12-23T19:25:42.139Z" },
-]
-
-[[package]]
 name = "annotated-doc"
 version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -324,19 +315,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e8/1f/989ecfef8e64109a489fff357450cb73fa73a865a92bd8c272170a6922c2/async_lru-2.3.0.tar.gz", hash = "sha256:89bdb258a0140d7313cf8f4031d816a042202faa61d0ab310a0a538baa1c24b6", size = 16332, upload-time = "2026-03-19T01:04:32.413Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/e2/c2e3abf398f80732e58b03be77bde9022550d221dd8781bf586bd4d97cc1/async_lru-2.3.0-py3-none-any.whl", hash = "sha256:eea27b01841909316f2cc739807acea1c623df2be8c5cfad7583286397bb8315", size = 8403, upload-time = "2026-03-19T01:04:30.883Z" },
-]
-
-[[package]]
-name = "asyncssh"
-version = "2.24.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cryptography" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/0f/c5/41a0d5477865c48cee65050586092dc3ba3fc1c52e29b47fba08d3a44581/asyncssh-2.24.1.tar.gz", hash = "sha256:efcd36e9b35f79873535b06444a7c9b0a3c61d97081b208c7fdd3fd8a40f1eca", size = 558085, upload-time = "2026-10-04T02:48:24.913Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/e5/8bc721f04ff545c5a84c9c23fbf788fbb56960bb57a86c6366bc35be0f66/asyncssh-2.24.1-py3-none-any.whl", hash = "sha256:fc560b4f43be0f0c602d184783e5e3876f5d24d933a25359d86e5a50a5f46fe5", size = 382514, upload-time = "2026-10-04T02:48:23.676Z" },
 ]
 
 [[package]]
@@ -944,13 +922,12 @@ wheels = [
 
 [[package]]
 name = "flyte"
-version = "2.10.7"
+version = "2.13.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aiolimiter" },
     { name = "async-lru" },
-    { name = "asyncssh" },
     { name = "click" },
     { name = "cloudpickle" },
     { name = "connectrpc" },
@@ -972,7 +949,7 @@ dependencies = [
     { name = "toml" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/a4/35f8b575949afdc1c4259d3c66cb20f33bea71b547ed7df244d3ff2454be/flyte-2.10.7-py3-none-any.whl", hash = "sha256:5c2385f3a972f62fecb19d26df43d5afcce20d2e89b4521ccf5b5fee23c42d64", size = 1130600, upload-time = "2026-10-02T19:42:45.57Z" },
+    { url = "https://files.pythonhosted.org/packages/68/60/061294d1f2f6a54cd48cfb10e925ad1729087dc4ad611042e15869e5c9e7/flyte-2.13.5-py3-none-any.whl", hash = "sha256:cd15ba937c9c215931156cb488c4d6ce08ff5b83e1cac98369b2caf8719565db", size = 1300474, upload-time = "2026-11-17T01:11:22.686Z" },
 ]
 
 [package.optional-dependencies]
@@ -1016,8 +993,8 @@ requires-dist = [
     { name = "coverage", specifier = ">=7,<8" },
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "flyte", extras = ["mcp"], specifier = ">=2.10.7,<2.11.0" },
-    { name = "flyteplugins-union", marker = "sys_platform == 'linux'", specifier = ">=0.15.5,<0.16.0" },
+    { name = "flyte", extras = ["mcp"], specifier = ">=2.13.5,<2.14.0" },
+    { name = "flyteplugins-union", marker = "sys_platform == 'linux'", specifier = ">=0.21.2,<0.22.0" },
     { name = "kubernetes", specifier = ">=31.0.0" },
     { name = "mcp", specifier = ">=1.30.0,<2" },
     { name = "obstore", specifier = ">=0.11,<0.12" },
@@ -1038,7 +1015,7 @@ dev = [
 
 [[package]]
 name = "flyteidl2"
-version = "2.0.50"
+version = "2.0.55"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "googleapis-common-protos" },
@@ -1047,26 +1024,22 @@ dependencies = [
     { name = "protovalidate" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/e9/b2adf0dadf127d1443e7785dbca0e217f23186630a3d52a39a54070a0d96/flyteidl2-2.0.50-py3-none-any.whl", hash = "sha256:33056d03e3b87b1539973b3c312894f4d0d20a9b547afeef3891df9e41a03f8a", size = 384743, upload-time = "2026-09-24T23:33:16.437Z" },
+    { url = "https://files.pythonhosted.org/packages/36/50/8e672e37f8e46de3a3678bb8eb53b3bd2035a5ea8d85142c492cd5e9f94e/flyteidl2-2.0.55-py3-none-any.whl", hash = "sha256:d687d7a394ecb0f1a4ead18bc014216b49f807defdf1db11153e3962658cc276", size = 392218, upload-time = "2026-11-13T01:04:56.227Z" },
 ]
 
 [[package]]
 name = "flyteplugins-union"
-version = "0.15.5"
+version = "0.21.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiosqlite", marker = "sys_platform != 'win32'" },
-    { name = "connectrpc", marker = "sys_platform != 'win32'" },
     { name = "flyte", marker = "sys_platform != 'win32'" },
-    { name = "flyteidl2", marker = "sys_platform != 'win32'" },
-    { name = "httpx", marker = "sys_platform != 'win32'" },
     { name = "httpx-ws", marker = "sys_platform != 'win32'" },
     { name = "kubernetes", marker = "sys_platform != 'win32'" },
-    { name = "pyyaml", marker = "sys_platform != 'win32'" },
-    { name = "rich-click", marker = "sys_platform != 'win32'" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/f1/44/e4b02c68db4d75e9f58bed697e57f834c4d2174b5cb1c007b4ff524bafac/flyteplugins_union-0.21.2.tar.gz", hash = "sha256:b3b2aa2bea6543fd5037fafe29f918520cedba14a51630d07e88cb971830d145", size = 683880, upload-time = "2026-11-15T23:25:01.514Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/86/0ab9877eb77a09a9cee738812207537b1ac7e92e43503493a95dae20dfe6/flyteplugins_union-0.15.5-py3-none-manylinux2014_x86_64.whl", hash = "sha256:815b7588e8d4824a91ec6d95b86d6e686b151d19e4883a6ded4b805433e2b354", size = 22354559, upload-time = "2026-10-08T00:06:27.794Z" },
+    { url = "https://files.pythonhosted.org/packages/44/b9/1210b7be6f4646d53a5834159768dc58204bacddfa28ab0698c153847548/flyteplugins_union-0.21.2-py3-none-manylinux2014_aarch64.whl", hash = "sha256:bb50a167c65c9eff94e2c512a419f74707259d9750320ae4b098d9c4026b0958", size = 20261970, upload-time = "2026-11-15T23:24:52.059Z" },
+    { url = "https://files.pythonhosted.org/packages/64/17/f8d2d78ea8f9650c48229baa8a9727d73fe2b75d8473ff41c4b5ec808a90/flyteplugins_union-0.21.2-py3-none-manylinux2014_x86_64.whl", hash = "sha256:4a8e142cbe8214989bc962c206f7f8d9dae77096d1fb0b1b0aa8be4819bf3e5a", size = 22759621, upload-time = "2026-11-15T23:24:55.46Z" },
 ]
 
 [[package]]
