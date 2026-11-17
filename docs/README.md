@@ -29,6 +29,9 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [standards.md](standards.md) | Writing your own standards: the rule format, how each rule is enforced, mapping your rule IDs to the factory's built-in checks |
 | [chat-operator.md](chat-operator.md) | The default interface: why a chat agent sits between you and the factory, what each side can do, and setting it up |
 | [factory-mcp-setup.md](factory-mcp-setup.md) | The factory MCP's authentication, scoping the API key, and building the chat skill |
+| [mcp-stock-move.md](mcp-stock-move.md) | The move to flyte 2.13.5's stock MCP server: each wrapper removed, set or kept, with evidence, and what changes on redeploy |
+| [mcp-sdk-requirements.md](mcp-sdk-requirements.md) | What the factory MCP still builds around Flyte's stock MCP server, written as requirements for flyte-sdk, ranked |
+| [mcp-operator-smoke.md](mcp-operator-smoke.md) | The live smoke test of the factory MCP from chat after a redeploy, on Union and on open-source Flyte, and the rollback |
 | [github-connector.md](github-connector.md) | GitHub issues and the Projects board from chat |
 | [branch-protection.md](branch-protection.md) | Requiring the factory's verdict before a merge |
 | [gcp-bootstrap.md](gcp-bootstrap.md) | Giving a project access to Google Cloud |

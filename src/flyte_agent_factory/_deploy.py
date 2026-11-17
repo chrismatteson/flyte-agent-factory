@@ -251,7 +251,7 @@ if _deployer.PROFILE.loop.enabled:
     envs += (_loop_flow.env,)
 check_environments(*envs)
 # flyte.deploy handles AppEnvironments too, including a real dry-run path.
-# In SDK 2.10.7 serve(dry_run=True) still calls _deploy_app without dryrun.
+# plan_deploy expands each environment to everything deploy ships, its dependencies included; check those too.
 from flyte._deploy import plan_deploy
 for plan in plan_deploy(*envs):
     check_environments(*plan.envs.values())

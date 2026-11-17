@@ -267,8 +267,8 @@ requirement. Search for an existing issue before filing a new one.
 
 `factory.status` accepts a project name or run id and optional `rows` (default 40). A name selects its live run,
 otherwise its newest ended run. It returns activity, dashboard/run phase, timeline, open questions, review,
-PR URL, meters and `snapshot_age_s`. Check freshness; most errors include the run URL (an unknown name returns only `error` and `name`). `get_logs` starts at the
-beginning and cannot show the newest progress of a long run.
+PR URL, meters and `snapshot_age_s`. Check freshness; most errors include the run URL (an unknown name returns only `error` and `name`). `get_logs` returns the newest
+`max_lines` lines, oldest first: page back with `before_line=next_before_line`, or pass `before_line=max_lines` to read from the start.
 
 Summarize current work, review round, blocking findings and who it is waiting on. Timeline markers:
 `📝` session progress, `🔧` workers, `🔍 ❌ ✅` review, `🧭 ⚖️` planner/arbiter, `🙋` question,

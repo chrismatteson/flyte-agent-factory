@@ -614,7 +614,7 @@ async def _poll_child_outputs(names: list[str]) -> tuple[str, File, File] | None
             phase=details.phase,
             error_code=error.code if error else "",
         )
-    return _read_lane_outputs(await details.output_literals())
+    return _read_lane_outputs(await details.output_literals.aio())
 
 
 @dataclasses.dataclass(frozen=True)

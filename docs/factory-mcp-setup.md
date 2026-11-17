@@ -9,7 +9,9 @@ backend; OSS Flyte cannot run it unchanged ([compatibility audit](oss-flyte-comp
 The factory MCP uses Flyte's stock `FlyteMCPAppEnvironment`, deployed as the app
 `factory-mcp` with `requires_auth=True`. Union authenticates every request at
 the app ingress and Flyte runs each call as the caller, so Union RBAC applies.
-The server exposes every stock tool (32, listed in [architecture.md](architecture.md#the-controls-on-the-mcp)).
+Which wrappers stock settings replaced and which remain, with evidence, is in
+[mcp-stock-move.md](mcp-stock-move.md). The server exposes every stock tool, as it always has (`TOOLS`, listed in
+[architecture.md](architecture.md#the-controls-on-the-mcp)); a tool a newer flyte adds is served and scoped too.
 Chat starts projects with `run_task` on `factory.launch` and follows them through the queue; the instructions
 steer it to `factory.launch`, `factory.status`, `factory.queue_list`, `factory.queue_cancel`,
 `factory.set_reserve`, `factory.get_reserve`, `factory.clear_limit`, `factory.rotate_token`, `factory.browser_link`, `factory.credential_link`,
@@ -20,8 +22,9 @@ task directly is unsupported (it skips validation and the queue) but not blocked
 names another project or domain is refused, `list_projects` shows only the factory project, and `get_project`
 refuses any other name. Inside that scope, what the caller may do is bounded by the caller's Union auth (the RBAC of
 the bearer token or API key), so give an API key only the role it needs. `list_secrets` shows names and types,
-and no tool returns a secret value. `create_secret` and `delete_secret` exist, but engine credentials are stored
-with local commands ([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat.
+and no tool returns a secret value. `create_secret` and `delete_secret` exist (`create_secret` returns a one-time link on
+this server where the owner types the value), but engine credentials are stored with local commands
+([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat.
 
 The search tools read the Flyte SDK examples, the Union examples and the Union docs from `/opt/flyte-mcp-docs`,
 fetched into the app image when it is built (the SDK at tag `v2.10.7`).

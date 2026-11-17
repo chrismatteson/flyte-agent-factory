@@ -16,7 +16,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from typing import Any
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
@@ -252,12 +251,3 @@ PAGE_HEADERS = {
 
 async def serve_grant_page(request: Request) -> Response:
     return HTMLResponse(PAGE_HTML, headers=PAGE_HEADERS)
-
-
-def register(server: Any) -> None:
-    """Add the page to a FastMCP server, before its ASGI app is built.
-
-    FastMCP serves custom routes inside its own app, which the MCP environment mounts at `/flyte-mcp`, so
-    this one is public at `_grant_seal.PAGE_PATH`.
-    """
-    server.custom_route("/grant", methods=["GET"])(serve_grant_page)

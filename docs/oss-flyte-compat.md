@@ -121,7 +121,7 @@ one live project with the default resources ([small-nodes.md](small-nodes.md)). 
   citation prefix is omitted because the existing shareable-file guard forbids that owner-specific literal. Its `flyte-gke/docs/preflight.md:64` describes the installation and
   `flyte-gke/docs/preflight.md:72` starts its feature findings; these were checked against source where possible.
   Its statement that no identity service exists is stale: the release registers one, but does not issue Union API keys.
-  That project used SDK **2.12.0**; this factory pins **2.10.x** (`pyproject.toml:12`).
+  That project used SDK **2.12.0**; this factory pins **2.13.x** (`pyproject.toml`).
 - The supplied live observation is HTTP **401**, OAuth required, at
   `https://<flyte-gke MCP host>/flyte-mcp/mcp`. No credentials are available here, so no authenticated
   live probe of that backend was possible. A 401 establishes an authentication boundary, not tool support.

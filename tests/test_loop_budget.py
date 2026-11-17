@@ -240,7 +240,8 @@ def test_retry_preserves_previous_attempt_spend(monkeypatch):
 
     async def get(name):
         return SimpleNamespace(
-            action=SimpleNamespace(details=details), get_report=SimpleNamespace(aio=report)
+            action=SimpleNamespace(details=SimpleNamespace(aio=details)),
+            get_report=SimpleNamespace(aio=report),
         )
 
     async def replace(html, **kwargs):
