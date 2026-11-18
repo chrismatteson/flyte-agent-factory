@@ -45,6 +45,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [operating.md](operating.md) | Launching, the queue, steering, questions, delegation |
 | [judgement.md](judgement.md) | Who decides a question: the owner or the factory, the no-waiver rule, overruling a decision |
 | [judge-inputs.md](judge-inputs.md) | What each review judge was shown, as recorded in the round row, and recreating the diff from it |
+| [scoped-key-deploy.md](scoped-key-deploy.md) | Why a deploy as a project-scoped `deployer_key` polls apps, deploys the deployer last and fails once without a key; run-time calls checked |
 | [deploy-webhook.md](deploy-webhook.md) | Push wake-ups, issue intake and the deploy safety net |
 | [state-escalation.md](state-escalation.md) | State backend benchmark results (git vs bucket vs volume under 12 writers) and the measurements and thresholds that would justify a Postgres backend |
 | [triggers.md](triggers.md) | Every timer, its cadence and what it costs |

@@ -122,6 +122,8 @@ class MissingSecrets(DeployError):
 
 #: Exit code of `_deploy_child check` when secrets are missing (1 is every other refusal).
 MISSING_SECRETS_EXIT = 3
+# The check prints this when it could not list the secrets; the one-off deploy script matches it.
+SECRETS_NOT_VERIFIED = "secrets not verified"
 
 
 #: A file each deploy child appends the names of the environments it deployed to, one per line, when set.
@@ -187,10 +189,13 @@ _profile.set_deployer_env(json.loads(os.environ.pop("{DEPLOYER_ENV}", "{{}}")))
 _INIT = (
     _TAKE_DEPLOYER_ENV
     + f"""
-from flyte_agent_factory._union_identity import init_for_script
-init_for_script(_profile.require(), key_env=os.environ.get("{DEPLOY_KEY_ENV}", ""),
-    project=sys.argv[3], domain=sys.argv[4], root_dir=root,
-    image_builder=_profile_oss.builder(_profile.require().backend))
+from flyte_agent_factory._union_identity import IdentityMissing, init_for_script
+try:
+    init_for_script(_profile.require(), key_env=os.environ.get("{DEPLOY_KEY_ENV}", ""),
+        project=sys.argv[3], domain=sys.argv[4], root_dir=root,
+        image_builder=_profile_oss.builder(_profile.require().backend))
+except IdentityMissing as exc:
+    raise SystemExit(str(exc))
 """
 )
 
@@ -256,19 +261,32 @@ from flyte._deploy import plan_deploy
 for plan in plan_deploy(*envs):
     check_environments(*plan.envs.values())
 check_unprivileged(*envs)
-deployments = flyte.deploy(*envs, dry_run=dry)
+# The deployer, and with it the `deploy-on-merge` trigger, goes last: once it is live, a factory that does
+# not come up makes the new deployer retry the same failure on every tick. Nothing else may pull it in
+# (`depends_on`), or the first deploy would ship it before the wait below.
+others = tuple(env for env in envs if env is not _deployer.env)
+for plan in plan_deploy(*others):
+    if _deployer.env.name in plan.envs:
+        raise SystemExit(f"{_deployer.env.name} is a dependency of another environment; it must deploy last")
+# flyte.deploy returns what it deployed only when it succeeds, so each call is recorded as soon as it does:
+# the report then says what a later failure left deployed.
+deployments = flyte.deploy(*others, dry_run=dry)
+record(deployments)
 for deployment in deployments:
     print(deployment.summary_repr())
     for deployed in deployment.envs.values():
         if deployed.get_name() == "factory-mcp" and not dry:
-            app = deployed.deployed_app.watch(wait_for="activated")
+            # Polled, not `watch`ed: the watch stream is refused to a key bound to one project and domain.
+            from flyte_agent_factory import _deploy_apps
+            from_root(_deploy_apps)
+            app = _deploy_apps.wait_until_active("factory-mcp")
             print(f"factory-mcp public URL: {app.endpoint}")
             print(f"Connector URL: {app.endpoint.rstrip('/')}/flyte-mcp/mcp")
             if _profile_oss.mcp_auth(_profile.require()) == "proxy":
                 print("Connect through your authenticating proxy; the app itself checks no token.")
             else:
                 print("Connect with header Authorization: Bearer <Union API key or access token>.")
-        # Not watched like factory-mcp: an app whose secret does not exist yet never activates, and the
+        # Not waited for like factory-mcp: an app whose secret does not exist yet never activates, and the
         # deploy must not hang or fail on it. The create response may not carry the URL yet.
         if deployed.get_name() == "factory-webhook" and not dry:
             endpoint = deployed.deployed_app.endpoint
@@ -277,8 +295,12 @@ for deployment in deployments:
                 print(f"GitHub webhook URL: {endpoint.rstrip('/')}/github")
             else:
                 print("factory-webhook has no public URL yet; see the console's Apps page.")
-record(deployments)
+last = flyte.deploy(_deployer.env, dry_run=dry)
+record(last)
+for deployment in last:
+    print(deployment.summary_repr())
 if not dry:
+    # `Trigger.delete` is a unary call, not the watch stream, so a key bound to one project may make it.
     from flyte_agent_factory._deploy import delete_retired_triggers
     delete_retired_triggers(_deployer.PROFILE)
 """
@@ -654,6 +676,7 @@ def check_in_tree(
     tree: Path | None,
     base_env: Mapping[str, str],
     diagnostics: dict[str, bool | str | None] | None = None,
+    warnings: list[str] | None = None,
 ) -> list[str]:
     """Return the environments `src` would deploy for the profile `text`; DeployError if it refuses it.
 
@@ -661,6 +684,8 @@ def check_in_tree(
     it deploys; the release's own code reads the profile, strictly. `tree` is the engine checkout the
     profile's standards come from, or None for text that already carries them (the pod's own).
     `diagnostics`, when supplied, receives the captured standards state; old engines report it as unknown.
+    `warnings`, when supplied, receives what a passing check printed on stderr (e.g. that it could not
+    list the secrets), redacted, for a caller that shows it to a person.
     """
     with tempfile.TemporaryDirectory(prefix="deploy-check-") as tmp:
         error = Path(tmp) / "error"
@@ -681,6 +706,8 @@ def check_in_tree(
             # A ProfileError already starts with `where`.
             reason = reason if reason.startswith(f"{where}: ") else f"{where}: {reason}"
             raise DeployError(redact(f"the engine being deployed refuses {reason}"))
+        if warnings is not None:
+            warnings[:] = [redact(line) for line in stderr.splitlines() if line.strip()]
         if diagnostics is not None:
             try:
                 metadata = json.loads(standards_report.read_text())
@@ -708,11 +735,14 @@ def deploy_in_tree(
     domain: str,
     ref: str,
     base_env: Mapping[str, str],
+    deployed: list[str] | None = None,
 ) -> list[str]:
     """Deploy the profile `text` with the code in `src`: slots, factory, apps; what it deployed.
 
     Which environments exist, each slot's recipe and the child scripts are all the tree's own (see
     `_deploy_child`). Its output goes to this process's log; the names come from `DEPLOY_REPORT_ENV`.
+    `deployed`, when given, is filled with those names even when the deploy fails part way, so a caller
+    can say what did get deployed.
     """
     with tempfile.TemporaryDirectory(prefix="deploy-run-") as tmp:
         error, report = Path(tmp) / "error", Path(tmp) / "deployed"
@@ -726,10 +756,16 @@ def deploy_in_tree(
             ref,
         ]
         env = {**base_env, DEPLOY_REPORT_ENV: str(report)}
-        code, _, _ = _run_in_tree(src, args, text=text, base_env=env, timeout=DEPLOY_TIMEOUT, capture=False)
+        try:
+            code, _, _ = _run_in_tree(
+                src, args, text=text, base_env=env, timeout=DEPLOY_TIMEOUT, capture=False
+            )
+        finally:  # the report goes with the temp dir; a timeout has written some of it too
+            names = sorted(set(report.read_text().split())) if report.is_file() else []
+            if deployed is not None:
+                deployed[:] = names
         if code:
             raise DeployError(redact(f"deploy of {ref} failed: {_child_error(error, '', code)}"))
-        names = sorted(set(report.read_text().split())) if report.is_file() else []
     if not names:  # it exited 0, so a child that does not report is not the tree's own (or is broken)
         raise DeployError(f"deploy of {ref} reported no environment deployed")
     return names

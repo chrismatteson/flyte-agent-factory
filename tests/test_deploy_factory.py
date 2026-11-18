@@ -147,18 +147,27 @@ def test_child_deploys_only_factory_and_prints_public_endpoint(monkeypatch, caps
     monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
     monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kw: got.update(init=kw))
-    handle = SimpleNamespace(watch=lambda **kw: SimpleNamespace(endpoint="https://public.example"))
+    # The wait polls `App.get`: the watch stream is refused to a key bound to one project and domain.
+    handle = SimpleNamespace(watch=lambda **kw: pytest.fail("must not watch"))
     deployed = SimpleNamespace(get_name=lambda: "factory-mcp", deployed_app=handle)
+    from flyte import remote
+
+    active = SimpleNamespace(is_active=lambda: True, endpoint="https://public.example")
+    monkeypatch.setattr(remote.App, "get", staticmethod(lambda name: active))
+    monkeypatch.setattr(remote.Trigger, "delete", lambda **kw: None)
+    calls: list[set[str]] = []
 
     def deploy_envs(*envs, **kw):
-        got.update(names={env.name for env in envs}, options=kw)
+        calls.append({env.name for env in envs})
+        got.update(options=kw)
         return [SimpleNamespace(summary_repr=lambda: "deployed", envs={"factory-mcp": deployed})]
 
     monkeypatch.setattr(flyte, "deploy", deploy_envs)
     monkeypatch.setattr(sys, "argv", ["child", str(root), "1" if dry else "0", "project", "domain"])
     monkeypatch.syspath_prepend(str(root.parent / "ops"))
     exec(deploy._CHILD, {})
-    assert got["names"] == {"factory", "factory-mcp", "factory-deployer"}
+    # The deployer, which carries the deploy-on-merge trigger, is the last call.
+    assert calls == [{"factory", "factory-mcp"}, {"factory-deployer"}]
     assert got["options"] == {"dry_run": dry}
     assert got["init"] == {
         "api_key": "operator-key",
@@ -228,16 +237,16 @@ def test_child_includes_configured_webhook(monkeypatch, capsys):
     monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
     monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "operator-key")
     monkeypatch.setattr(flyte, "init_from_api_key", lambda **kwargs: None)
-    got = {}
+    got: set[str] = set()
 
     def deploy_envs(*envs, **kwargs):
-        got["names"] = {env.name for env in envs}
+        got.update(env.name for env in envs)  # the deployer is a deploy of its own, last
         return []
 
     monkeypatch.setattr(flyte, "deploy", deploy_envs)
     monkeypatch.setattr(sys, "argv", ["child", str(root), "1", "project", "domain"])
     exec(deploy._CHILD, {})
-    assert got["names"] == {"factory", "factory-mcp", "factory-deployer", "factory-webhook"}
+    assert got == {"factory", "factory-mcp", "factory-deployer", "factory-webhook"}
 
 
 @pytest.mark.parametrize("endpoint", ["https://hook.example", ""])

@@ -298,6 +298,12 @@ that project and domain (the secret names are placeholders such as `factory_proj
 secret and never echoes it. It works on a Mac; nobody needs `flyte create api-key` locally. If you may not manage access in
 the organization, ask an admin for the `--grant` command it prints.
 
+**What the `deployer_key` must be able to do.** The deploy children act as it: build images with the remote image builder,
+register tasks, deploy, update, stop and delete apps and read their status, create, update and delete triggers, and list
+secrets (create and delete them too when the owner manages them through the factory). The project-scoped role
+(`contributor` on the one project and domain) is enough. The deploy waits for apps by polling their status and never
+opens the organization-wide app watch stream (measured: that stream is refused for a project-scoped key).
+
 **What a project tier cannot do** (measured live on 2026-11-12 with a key that was `contributor` on one project and
 domain): the pod authenticated with the scoped key and listed runs in its own project and domain; a child launched by that
 identity ran; listing projects org-wide was refused (unauthorized); and a launch into the staging domain was refused
@@ -315,8 +321,30 @@ For an owner whose factory already runs on the old credential.
 1. **Before merging**, create (or reuse) a key with `contributor` on the work project and domain for `project_key`, and a
    deployer key. Store both as secrets in that project and domain ([Union keys](#union-keys)), and add `[union]` to the
    direction repository's profile. The running deployer tolerates the unknown table.
-2. **Merge.** The running deployer deploys the engine with its old credential for the last time. Check that
-   `factory.status` lists the tiers and their client ids. Run a project, a review round, a queue dispatch and a deploy.
+2. **Deploy once as the deployer's key.** An install whose running deployer predates `[union]` cannot deploy the
+   current engine itself: the deployer starts, but every deploy child it launches has no key and, in a pod, no CLI
+   config, so the new engine stops it at its check with a message naming `ops/deploy_as_key.py`. After adding `[union]`
+   and the secrets, merge, then deploy once from a checkout of the engine at the release and a checkout of the
+   direction repository, on any machine or pod that holds the deployer key in `AGENT_FACTORY_UNION_KEY`:
+
+   ```
+   python ops/deploy_as_key.py --direction <direction checkout> --check   # plans; changes nothing
+   python ops/deploy_as_key.py --direction <direction checkout>           # deploys slots, factory and apps
+   ```
+
+   The last lines say what was deployed and what was not. Or hand deploy with a CLI login, which needs no key but does
+   not deploy the browser apps (the next auto-deploy does):
+
+   ```
+   python ops/deploy_work.py --ref <release>
+   python ops/deploy_factory.py --ref <release>
+   ```
+
+   Then the new deployer takes over: its first tick deploys the same commit again, this time with the tier
+   identities and the push mode its canary chooses (the one-off sets neither, and is not a deployer run). After
+   that, check that `factory.status` lists the tiers and their client ids. Run a project, a
+   review round, a queue dispatch and a deploy. To run the script in a pod, see
+   [Running the one-off deploy in a pod](#running-the-one-off-deploy-in-a-pod).
 3. **To move direction**, use the two-sided commit handoff ([profiles/README.md](../profiles/README.md)):
    commit in the new repository a profile whose `[direction]` names the new repository itself, then commit in the old
    repository `[direction]` naming the new one. No hand deploy is needed. Then archive the old repository.
@@ -331,3 +359,25 @@ For an owner whose factory already runs on the old credential.
    - Revert the engine commit; the deployer redeploys the previous engine.
    - Revoke keys individually.
    - Remove `push = "app"` to return to deploy keys, and keep those keys until a week of green.
+
+### Running the one-off deploy in a pod
+
+The script removes the key Union injects into every pod from its children's environment and never uses it; it acts
+only as the key in `AGENT_FACTORY_UNION_KEY`. The least a task needs:
+
+- **Image:** one with git, `uv` and Python 3.12. The factory's own agent image does (it is what the deployer runs on).
+- **Secrets:** the profile's `deployer_key` secret, mounted as `AGENT_FACTORY_UNION_KEY`. For a private direction
+  repository also its deploy-key secret, mounted as a file: `[secrets] deploy_key` when the direction repository is the
+  workspace repository, otherwise its `[repo_keys]` entry. Clone with it through
+  `GIT_SSH_COMMAND="ssh -i <file> -o IdentitiesOnly=yes"`.
+- **Environment:** the only variable to set is the secret mounted as `AGENT_FACTORY_UNION_KEY` (or the name you pass
+  to `--key-env`); the script sets the rest.
+- **Runtime:** not interruptible, and about an hour (the deploy itself is bounded at 50 minutes, image builds included).
+
+```
+git clone <engine repository> engine && git -C engine checkout <release>
+GIT_SSH_COMMAND="ssh -i <deploy key file> -o IdentitiesOnly=yes" git clone <direction repository> direction
+cd engine && uv sync --python 3.12
+uv run python ops/deploy_as_key.py --direction ../direction --check
+uv run python ops/deploy_as_key.py --direction ../direction
+```

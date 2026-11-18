@@ -190,7 +190,9 @@ def find_missing_secrets(
         raise  # a deploy with no usable identity would fail anyway; say so, not "cannot tell"
     except REMOTE_ERRORS as exc:  # any failure to list is "cannot tell", never "none exist"
         print(
-            f"secrets not verified: listing them failed ({type(exc).__name__})", file=sys.stderr, flush=True
+            f"{_deploy.SECRETS_NOT_VERIFIED}: listing them failed ({type(exc).__name__})",
+            file=sys.stderr,
+            flush=True,
         )
         return {}
     missing: dict[str, list[str]] = {}
@@ -283,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _from_src(src)
         profile = load(sys.stdin.read(), args.where, args.tree)
+        # Before any import or child: the children would each fail with the SDK's traceback instead.
+        _union_identity.check_script_identity(profile, os.environ.get(_deploy.DEPLOY_KEY_ENV, ""))
         if args.step == "check":
             _deploy.check_slots(profile, [s.env for s in profile.slots])
             needed = collect_planned_secrets(profile, src, os.environ)

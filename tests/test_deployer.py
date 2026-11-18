@@ -1786,8 +1786,8 @@ flyte.init_from_config = lambda *args, **kw: None
 class _App:
     endpoint = "https://factory.example"
 
-    def watch(self, wait_for):
-        return self
+    def is_active(self):
+        return True
 
 
 class _Deployed:
@@ -1833,6 +1833,8 @@ class _NoApps:
         from connectrpc.code import Code
         from connectrpc.errors import ConnectError
 
+        if name == "factory-mcp":  # the factory stage polls it until it is active
+            return _App()
         raise ConnectError(Code.NOT_FOUND, name)
 
 
@@ -1883,7 +1885,8 @@ async def test_a_new_key_that_adds_an_env_and_a_slot_variable_deploys_both(direc
     directed.ship_direction_profile(directed.profile.text + WIDGET)
     result = await directed.tick()
     assert result.startswith(f"deployed {SHA} with direction {DIRECTION_SHA}")
-    slots, (factory,) = deploys(directed)[:-1], deploys(directed)[-1:]
+    *slots, factory, last = deploys(directed)  # the deployer is a deploy of its own, after the wait
+    assert last["envs"] == ["factory-deployer"] and "factory-deployer" not in factory["envs"]
     assert [s["envs"] for s in slots] == [
         ["agent-one", "factory-setup", "sub-one"],
         ["agent-two", "factory-setup", "sub-two"],
@@ -1896,7 +1899,7 @@ async def test_a_new_key_that_adds_an_env_and_a_slot_variable_deploys_both(direc
     assert directed.last["sha"] == SHA and directed.failed is None
     assert "widget" in capsys.readouterr().err  # the running deployer says what it did not read
     assert (await directed.tick()).startswith("up to date")
-    assert len(deploys(directed)) == 3
+    assert len(deploys(directed)) == 4
 
 
 async def test_a_new_key_in_the_engine_trees_own_profile_deploys_with_that_engine(world, monkeypatch):

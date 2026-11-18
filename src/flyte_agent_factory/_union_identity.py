@@ -227,6 +227,66 @@ def _identity_for_message() -> Identity:
         return Identity(os.environ.get(TIER_ENV, "unknown"), os.environ.get(SECRET_ENV, "unknown"), "unknown")
 
 
+#: The supported one-off deploy for an install whose deployer is too old, and where docs/setup.md explains it.
+ONE_OFF_DEPLOY = "ops/deploy_as_key.py"
+ONE_OFF_DEPLOY_DOC = "docs/setup.md#migrating-an-existing-install"
+
+
+def _sdk_finds_a_config() -> bool:
+    """Whether `flyte.init_from_config(None)` would find a config file; True if that cannot be told."""
+    try:
+        from flyte.config._reader import resolve_config_path
+    except ImportError:  # a private SDK name: without it, leave the decision to the SDK, as before
+        return True
+    return resolve_config_path() is not None
+
+
+def check_script_identity(profile: Profile, key_env: str = "", decode: bool = True) -> None:
+    """Raise `IdentityMissing`, once and in words, if `init_for_script` could not act as anyone.
+
+    Without this a deploy child in a pod that has neither the deployer's key nor a CLI config falls into
+    `flyte.init_from_config`, and every child prints an SDK traceback. That pod is a deployer older than
+    the profile's `[union]` table, which does not set `key_env` for the children of this engine.
+    A laptop with no config file is left alone: the SDK searches its default places, and says so itself.
+    A key variable whose value is not an API key is refused too (`decode`): the deploy's check could not
+    list the secrets with it, and would otherwise go on. `init_for_script` does not decode again: the
+    deploy child's preflight has, and its other callers' keys go to the SDK, which refuses a bad one.
+    """
+    if _profile_oss.keyless(profile):
+        return
+    if key_env:
+        if not os.environ.get(key_env):
+            raise IdentityMissing(
+                f"AGENT_FACTORY_DEPLOY_KEY_ENV names {key_env}, but {key_env} is not set: it must hold the "
+                "Union API key this deploy acts as. To deploy as your own CLI login, unset "
+                "AGENT_FACTORY_DEPLOY_KEY_ENV"
+            )
+        try:
+            if decode:
+                _decode(os.environ[key_env])
+        except ValueError:
+            raise IdentityMissing(
+                f"AGENT_FACTORY_DEPLOY_KEY_ENV names {key_env}, but its value is not a Union API key "
+                "(it does not decode to endpoint, client id, secret and org): it must hold the "
+                "deployer_key's API key as Union issued it"
+            ) from None
+        return
+    if not os.environ.get("FLYTE_INTERNAL_EXECUTION_ID"):
+        return
+    if profile.backend.config:
+        found = Path(profile.backend.config).expanduser().is_file()
+    else:  # `init_from_config(None)` searches the SDK's own places (FLYTECTL_CONFIG, ~/.flyte, ...)
+        found = _sdk_finds_a_config()
+    if not found:
+        raise IdentityMissing(
+            "this deploy runs in a pod with no deployer key and no CLI config, so it has no Union identity. "
+            "The deployer that started it is too old to deploy this engine: it predates the profile's "
+            "[union] table and does not hand its key to the deploy. Deploy once with "
+            f"`python {ONE_OFF_DEPLOY}` ({ONE_OFF_DEPLOY_DOC}), or by hand with a CLI login; the deployer "
+            "deployed by that release then deploys the rest."
+        )
+
+
 def init_for_script(profile: Profile, key_env: str = "", **init_kwargs: Any) -> None:
     """Initialise the SDK for a laptop script or a deploy child.
 
@@ -241,6 +301,7 @@ def init_for_script(profile: Profile, key_env: str = "", **init_kwargs: Any) -> 
     """
     import flyte
 
+    check_script_identity(profile, key_env, decode=False)
     oss = _profile_oss.keyless(profile)
     if oss:  # fail the deploy here, not in a pod that cannot reach Flyte
         _profile_oss.endpoint_for_pods(profile.backend)
@@ -257,10 +318,7 @@ def init_for_script(profile: Profile, key_env: str = "", **init_kwargs: Any) -> 
         config = str(Path(profile.backend.config).expanduser()) if profile.backend.config else None
         flyte.init_from_config(config, **init_kwargs)
         return
-    key = os.environ.get(key_env, "")
-    if not key:
-        raise IdentityMissing(f"{key_env} is not set: it must hold the Union API key this script acts as")
-    flyte.init_from_api_key(api_key=key, **init_kwargs)
+    flyte.init_from_api_key(api_key=os.environ[key_env], **init_kwargs)  # `check_script_identity` saw it set
 
 
 def controller_kwargs() -> dict[str, Any]:

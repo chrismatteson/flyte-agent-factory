@@ -1438,14 +1438,23 @@ def test_a_timed_out_command_is_killed_with_everything_it_started(tmp_path):
 
 def test_a_command_is_judged_by_the_load_clock_with_its_own_limit(tmp_path, monkeypatch):
     limits = []
+    polled = tmp_path / "polled"
 
     class Spy(_load_clock.LoadClock):
         def poll(self):
             limits.append(self.limit_s)
+            polled.touch()
             return super().poll()
 
     monkeypatch.setattr(_load_clock, "LoadClock", Spy)
-    command = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+    # The command outlives the first poll however long the clock's first sample of /proc takes on a busy
+    # node: a fixed sleep could end before it, and then nothing would have been judged.
+    wait_for_poll = (
+        "import pathlib, time\n"
+        f"p = pathlib.Path({str(polled)!r}); end = time.monotonic() + 20\n"
+        "while not p.exists() and time.monotonic() < end: time.sleep(0.01)"
+    )
+    command = [sys.executable, "-c", wait_for_poll]
     assert _gate_base._run(command, tmp_path, timeout=30) == (0, "")
     assert limits and set(limits) == {30}
 
