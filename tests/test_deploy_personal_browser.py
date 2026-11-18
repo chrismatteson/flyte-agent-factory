@@ -7,6 +7,7 @@ The deployer and the slot pods run in the agent image, which has no `kubernetes`
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -21,6 +22,8 @@ import pytest
 
 from flyte_agent_factory import _deploy, _profile
 
+# Well-formed but fake: the deploy check refuses a key variable that does not decode as a Union API key.
+FAKE_KEY = base64.b64encode(b"dns:///example.invalid:client:secret:org").decode()
 SRC = Path(__file__).resolve().parents[1] / "src"
 WORK = (Path(__file__).parent / "profiles/work.toml").read_text()
 PERSONAL = (
@@ -461,7 +464,7 @@ def test_the_apps_child_without_kubernetes_says_so_instead_of_a_traceback(no_kub
     profile = _profile.parse(WORK + PERSONAL)
     env = _profile.child_env(
         profile,
-        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY="unused"),
+        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY=FAKE_KEY),
     )
     done = subprocess.run(
         [no_kubernetes, "-c", _deploy.APPS_CHILD, str(SRC), "0", "p", "d"],
@@ -527,7 +530,7 @@ def _main_check(monkeypatch, tmp_path, text):
 @pytest.fixture
 def key(monkeypatch):
     monkeypatch.setenv("AGENT_FACTORY_DEPLOY_KEY_ENV", "AGENT_FACTORY_UNION_KEY")
-    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", "unused")
+    monkeypatch.setenv("AGENT_FACTORY_UNION_KEY", FAKE_KEY)
 
 
 def test_a_missing_secret_stops_the_check_naming_it_and_what_needs_it(monkeypatch, tmp_path, capsys, key):
@@ -635,7 +638,7 @@ def test_the_secret_lookup_acts_as_the_deployer_key_inside_the_deployer(monkeypa
     monkeypatch.setenv("_UNION_EAGER_API_KEY", "injected")
     profile = _profile.parse(WORK)
     assert _deploy_child._list_existing_secrets(profile, "p", "d") == {"a"}
-    assert seen == {"api_key": "unused", "project": "p", "domain": "d"}
+    assert seen == {"api_key": FAKE_KEY, "project": "p", "domain": "d"}
 
 
 def test_the_secret_lookup_on_a_laptop_uses_the_cli_login(monkeypatch):
@@ -743,7 +746,7 @@ def test_the_real_apps_child_stops_a_failed_browser_the_profile_dropped(tmp_path
     )
     env = _profile.child_env(
         profile,
-        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY="unused"),
+        _env(AGENT_FACTORY_DEPLOY_KEY_ENV="AGENT_FACTORY_UNION_KEY", AGENT_FACTORY_UNION_KEY=FAKE_KEY),
     )
     done = subprocess.run(
         [sys.executable, "-c", script, str(SRC), "0", "p", "d"],

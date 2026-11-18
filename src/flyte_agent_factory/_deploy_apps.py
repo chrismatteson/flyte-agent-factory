@@ -35,6 +35,8 @@ ACTIVE_TIMEOUT_SECONDS = 15 * 60
 STOP_TIMEOUT_SECONDS = 5 * 60
 
 _FAILED = app_definition_pb2.Status.DeploymentStatus.DEPLOYMENT_STATUS_FAILED
+#: What a key that may not read the app gets: no poll will get further, so a wait stops on the first.
+_REFUSED = frozenset({Code.UNAUTHENTICATED, Code.PERMISSION_DENIED})
 
 
 class _NotReached(Exception):
@@ -69,19 +71,22 @@ def _wait_until(
     *,
     what: str,
     failed_is_fatal: bool,
-) -> None:
-    """Return when `reached(get())`; `_NotReached` if `timeout` passes, or on FAILED when that is fatal."""
+) -> Any:
+    """Return the app when `reached(get())`; `_NotReached` if `timeout` passes, or on FAILED when fatal."""
     deadline = clock() + timeout
     app = None
     while True:
         try:
             app = get()
-        except REMOTE_ERRORS:
-            # A control-plane blip must not roll back a deploy under way; the deadline still ends this.
-            pass
+        except REMOTE_ERRORS as exc:
+            # A control-plane blip must not roll back a deploy under way; the deadline still ends this. A
+            # refusal is not a blip: the key will not be let in on the next poll either, so say so now.
+            if isinstance(exc, ConnectError) and exc.code in _REFUSED:
+                reason = f"could not be read ({exc.code.name}: {_deploy.redact(exc.message)})"
+                raise _NotReached(reason, "") from None
         else:
             if reached(app):
-                return
+                return app
             if failed_is_fatal and app.deployment_status == _FAILED:
                 raise _NotReached("failed to start", _latest_condition_messages(app))
         if clock() >= deadline:
@@ -92,9 +97,9 @@ def _wait_until(
 
 def _wait_active(
     get: Callable[[], Any], sleep: Callable[[float], None], clock: Callable[[], float], timeout: float
-) -> None:
-    """Return when the deployed app is active; `_NotReached` if it fails or `timeout` passes."""
-    _wait_until(
+) -> Any:
+    """Return the deployed app when it is active; `_NotReached` if it fails or `timeout` passes."""
+    return _wait_until(
         lambda app: app.is_active(), get, sleep, clock, timeout, what="become active", failed_is_fatal=True
     )
 
@@ -109,6 +114,26 @@ def _wait_stopped(
     _wait_until(
         lambda app: app.is_deactivated(), get, sleep, clock, timeout, what="stop", failed_is_fatal=False
     )
+
+
+def wait_until_active(
+    name: str,
+    *,
+    app_cls: Any = remote.App,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timeout: float = ACTIVE_TIMEOUT_SECONDS,
+) -> Any:
+    """Poll the app `name` until it is active and return it (for its `.endpoint`); DeployError if it is not.
+
+    The SDK's `watch(wait_for="activated")` opens the watch stream, which an API key bound to one project
+    and domain is refused (UNAUTHENTICATED / PERMISSION_DENIED on the organization); `App.get` is not.
+    The error names the app and carries its own condition messages (`_describe_failure`).
+    """
+    try:
+        return _wait_active(lambda: app_cls.get(name=name), sleep, clock, timeout)
+    except _NotReached as exc:
+        raise _deploy.DeployError(f"{name} {_describe_failure(exc)}") from None
 
 
 def _roll_back(name: str, old_spec: Any, app_cls: Any) -> str:
@@ -157,10 +182,7 @@ def deploy_app(
 
     if old is None:
         deployments = deploy(env)
-        try:
-            _wait_active(lambda: app_cls.get(name=name), sleep, clock, timeout)
-        except _NotReached as exc:
-            raise _deploy.DeployError(f"{name} {_describe_failure(exc)}") from None
+        wait_until_active(name, app_cls=app_cls, sleep=sleep, clock=clock, timeout=timeout)
         return list(deployments)
 
     # `App.replace` compares specs this way: the creator is the old one's, whoever deploys.
