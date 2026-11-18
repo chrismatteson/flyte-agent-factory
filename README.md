@@ -4,6 +4,11 @@ A software factory that runs on Flyte. You describe a change to a chat agent; th
 coding-agent session on it (Claude Code or Codex, your choice per role), checks the result with independent
 reviewers, and delivers a reviewed pull request for you to merge.
 
+[![One-minute explainer of the agent factory (61 s, with narration). Click to play.](docs/media/agent-factory-explainer.png)](docs/media/agent-factory-explainer.mp4)
+
+The one-minute explainer above was written, recorded, edited and narrated by the factory itself, as an ordinary
+project run.
+
 The Python package is `flyte_agent_factory` and the distribution `flyte-agent-factory`.
 
 ```mermaid
