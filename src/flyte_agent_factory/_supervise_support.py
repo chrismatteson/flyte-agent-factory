@@ -39,6 +39,7 @@ from flyte_agent_factory import (
     _issues,
     _load_clock,
     _policy,
+    _proc_health,
     _pull_requests,
     _roles,
     _session_config,
@@ -122,6 +123,9 @@ _PREFLIGHT_MAX_BOUNCES = 5
 _CHECKS_TIMEOUT_S = 15 * 60
 # How long a finished checks run may keep flushing output before its pipe is closed (a seam for tests).
 _READER_CLOSE_WAIT_S = 5
+#: PID 1 commands that reap orphans (tini, and the inits of docker, podman and systemd hosts); anything else
+#: (the flyte `a0` process) lets zombies pile up.
+_INITS = {"tini", "docker-init", "catatonit", "dumb-init", "systemd", "init"}
 # After this long, output a handed-over session has produced since the question counts as its answer.
 _HANDOVER_ANSWER_GRACE_S = 60.0
 _board_worker: _board.Supervisor | None = None
@@ -212,7 +216,12 @@ def _pre_review_row(total: float, checks: float, work: _gate_tests.GateWork) -> 
         parts.append(
             "base cached" if work.base_hits == work.base_runs else f"base {work.seconds['base']:.0f}s"
         )
-    return f"pre-review {total:.0f}s: " + ", ".join(parts) + no_capacity
+    row = f"pre-review {total:.0f}s: " + ", ".join(parts) + no_capacity
+    # Only when it explains a slow gate: a healthy pod's row stays as it was.
+    health = _proc_health.snapshot()
+    if health.burdened or health.init not in _INITS:
+        row += f" [{health.describe()}]"
+    return row
 
 
 async def _run_declared_checks(
@@ -1282,6 +1291,23 @@ def _in_flight_children() -> tuple[int, str]:
     except (*REMOTE_ERRORS, AttributeError) as e:  # a status heuristic must never break the pump
         return 0, f"{type(e).__name__}: {e}"[:300]
     return count, ""
+
+
+def _write_identity_rows(timeline: _timeline._Timeline, identity: str) -> None:
+    """Open the report with who the slot is and what its PID 1 is: an init that reaps, or not (issue #34)."""
+    timeline.row("🔑", identity)
+    timeline.row("🧹", _proc_health.snapshot().describe())
+
+
+def _warn_on_zombies(timeline: _timeline._Timeline, warned: bool) -> bool:
+    """Say so in the report, once, when zombies pile up under PID 1; return whether it has been said."""
+    if warned:
+        return True
+    health = _proc_health.snapshot()
+    if not health.burdened:
+        return False
+    timeline.row("⚠️", f"{health.describe()}: nothing is reaping them, and every scan of /proc gets slower.")
+    return True
 
 
 def _warn_on_low_headroom(

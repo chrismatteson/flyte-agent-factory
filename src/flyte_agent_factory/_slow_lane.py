@@ -275,7 +275,11 @@ tail -c "$tail_bytes" "$work/log" >"$out/tail"
 [[ -e $out/junit ]] || : >"$out/junit"
 exit 0
 """
-LANE_COMMAND = ["bash", "-c", _LANE_SCRIPT, "test-lane"]
+# Under tini: a ContainerTask has no `a0` to re-exec, so PID 1 would be this bash, which does not reap
+# orphans either. The same command as `_images.INIT_COMMAND`, copied for the reason `TERRAFORM_VERSION` is;
+# a test keeps the two equal.
+_INIT_COMMAND = ["tini", "-s", "--"]
+LANE_COMMAND = [*_INIT_COMMAND, "bash", "-c", _LANE_SCRIPT, "test-lane"]
 
 
 def _memory_limit(cpus: int) -> str:

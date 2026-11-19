@@ -43,6 +43,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 |---|---|
 | [chat-operator.md](chat-operator.md#what-to-ask-it) | What to ask the chat operator day to day |
 | [operating.md](operating.md) | Launching, the queue, steering, questions, delegation |
+| [process-reaping.md](process-reaping.md) | Why tini is PID 1 in every factory pod: where orphans come from, what zombies cost (the `/proc` scan, the pids limit), the probe that proves reaping, and the process-health line in status and gate output |
 | [judgement.md](judgement.md) | Who decides a question: the owner or the factory, the no-waiver rule, overruling a decision |
 | [judge-inputs.md](judge-inputs.md) | What each review judge was shown, as recorded in the round row, and recreating the diff from it |
 | [scoped-key-deploy.md](scoped-key-deploy.md) | Why a deploy as a project-scoped `deployer_key` polls apps, deploys the deployer last and fails once without a key; run-time calls checked |

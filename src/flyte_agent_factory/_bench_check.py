@@ -28,9 +28,9 @@ if TYPE_CHECKING:
 else:
     from flyte_agent_factory import _bench_suite, _profile, _resources, _union_identity
 if TYPE_CHECKING:
-    from ._images import TERRAFORM_SHA256, TERRAFORM_VERSION, run_as_flyte
+    from ._images import TERRAFORM_SHA256, TERRAFORM_VERSION, run_as_flyte, with_init
 else:
-    from flyte_agent_factory._images import TERRAFORM_SHA256, TERRAFORM_VERSION, run_as_flyte
+    from flyte_agent_factory._images import TERRAFORM_SHA256, TERRAFORM_VERSION, run_as_flyte, with_init
 
 #: Seconds each check command may take; a hung server in the agent's code must not hold the case.
 COMMAND_TIMEOUT_S = 15 * 60
@@ -65,7 +65,7 @@ def _b64(text: str) -> str:
 env = flyte.TaskEnvironment(
     name="factory-bench-check",
     image=run_as_flyte(
-        flyte.Image.from_debian_base(name="factory-bench-check", python_version=(3, 12))
+        with_init(flyte.Image.from_debian_base(name="factory-bench-check", python_version=(3, 12)))
         .with_pip_packages("pytest", "scikit-learn==1.6.1", "pandas==2.2.3")
         .with_apt_packages("curl", "ca-certificates", "unzip")
         .with_commands(

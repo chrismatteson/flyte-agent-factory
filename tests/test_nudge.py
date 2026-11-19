@@ -30,6 +30,7 @@ from flyte_agent_factory import (
     _instructions,
     _load_clock,
     _policy,
+    _proc_health,
     _review,
     _reviewer,
     _session_config,
@@ -5836,3 +5837,13 @@ def test_pre_review_row_shows_load_when_it_made_a_difference():
     work.seconds["gate"] = 5.0
     row = _supervise_support._pre_review_row(900.0, 890.0, work)
     assert "checks 890s [610s load-adjusted, load average up to 19.4 on 4 CPUs]" in row
+
+
+@pytest.mark.asyncio
+async def test_the_pump_reports_zombies_once_when_they_pile_up(monkeypatch, no_idle_delay):
+    """A pod whose PID 1 does not reap says so in the report, one row however many ticks pass."""
+    monkeypatch.setattr(_proc_health, "snapshot", lambda proc=None: _proc_health.ProcHealth(500, 80, "a0"))
+
+    timeline = await _run_pump(_Bridge([]), _Proc(), ticks=50)
+
+    assert len([r for r in timeline._rows if "80 zombies" in r[2]]) == 1
