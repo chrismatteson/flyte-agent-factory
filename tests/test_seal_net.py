@@ -354,7 +354,8 @@ def _is_gone(pid):
     # A killed process nobody reaps (a container without an init) stays as a zombie: dead for our purpose.
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
+        # Gone before or while we read its stat: the kernel answers ENOENT or ESRCH.
         return True
 
 
