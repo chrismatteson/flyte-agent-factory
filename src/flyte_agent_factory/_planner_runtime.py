@@ -444,6 +444,7 @@ def execute(
             demo=request.demo_package if request else "",
             policy=policy,
             identities=request.browser if request else (),
+            seal=request.seal if request else "",
             workspace_in=workspace,
             labels={
                 **labels,

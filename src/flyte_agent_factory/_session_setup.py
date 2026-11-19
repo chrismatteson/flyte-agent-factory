@@ -37,6 +37,7 @@ from flyte_agent_factory import (
     _push_guard,
     _reviewer,
     _roles,
+    _seal_session,
     _secret_env,
     _session_config,
     _session_log,
@@ -322,19 +323,37 @@ async def _prepare_workspace(
 ) -> None:
     _session_config.WORKSPACE.mkdir(parents=True, exist_ok=True)
     slug, store = await _arm_https_push(app_key, repo, timeline), _push_token_path()
-    if not slug:
+    sealed = _session_config._seal
+    if sealed is not None:
+        _seal_session.require_https_push(slug)
+    elif not slug:
         slug, store = await _arm_https_read(app_key, repo, timeline), _read_token_path()
 
     # Clone before anything else writes here: `git clone` refuses a non-empty
     # target, and the inbox/brief below would make it non-empty.
     if repo and not resuming and not (_session_config.WORKSPACE / ".git").exists():
         timeline.row("📥", f"cloning {repo}")
-        if slug:
+        if sealed is not None:
+            # Single-branch: the benchmark repo holds other arms' branches, which this clone must never have.
+            await _git.clone(
+                _git_https.remote_url(slug), branch, _session_config.WORKSPACE, store, single_branch=True
+            )
+        elif slug:
             await _clone(_git_https.remote_url(slug), branch, _session_config.WORKSPACE, store)
         else:
             await _clone(repo, branch, _session_config.WORKSPACE)
     if repo and (_session_config.WORKSPACE / ".git").exists():
-        if slug:
+        if sealed is not None:
+            _seal_session.arm_workspace(_session_config.WORKSPACE, _git_https.remote_url(slug), store)
+            _git_https.install(_session_config.WORKSPACE, slug, store)
+            # Before route_pushes (this push goes direct) and limit_fetch (which lists what the remote has).
+            if not await asyncio.to_thread(
+                _seal_session.claim_branch, _session_config.WORKSPACE, _session_config._project_name
+            ):
+                timeline.row("⚠️", "could not create the project branch on the remote; the first push will")
+            _seal_session.route_pushes(_session_config.WORKSPACE, _git_https.remote_url(slug))
+            _seal_session.limit_fetch(_session_config.WORKSPACE, _session_config._project_name)
+        elif slug:
             _git_https.install(_session_config.WORKSPACE, slug, store)
             assert _session_config._PROFILE is not None  # the arm functions return a slug only with one
             workflows = bool(getattr(_session_config._PROFILE.github, "workflows", False))
@@ -361,6 +380,15 @@ async def _prepare_workspace(
 
     # Route once the clone exists, from the launch's brief: refused here rather than judged empty later.
     _session_config._project_folder = _project_folder.route(_session_config._project_name, brief, timeline)
+    if sealed is not None:
+        await asyncio.to_thread(
+            _seal_session.place_task_repo,
+            _session_config.WORKSPACE,
+            sealed,
+            _session_config._project_name,
+            _session_config._layout(),
+            _session_config._project_folder,
+        )
 
 
 def _kickoff_prompt() -> str:
@@ -792,6 +820,9 @@ def _delegate_reattach(timeline: _timeline._Timeline) -> Reattach:
             raise RuntimeError(f"worker action {name} ended {details.phase.value}: {error}")
         summary, output = await details.outputs.aio()
         await output.download(str(target / "result"))
+        if _session_config._seal is not None:
+            # The worker's record was not merged when it was collected here, after a restart.
+            await _reviewer.merge_record(output, _session_config.SEAL_RECORD)
         return _usage._ingest_subagent_usage(
             summary,
             "delegate",

@@ -52,6 +52,7 @@ Every page, grouped by the reader it is written for. The project overview is the
 | [triggers.md](triggers.md) | Every timer, its cadence and what it costs |
 | [personal-browser.md](personal-browser.md) | The single-seat logged-in browser |
 | [browser-exit-node.md](browser-exit-node.md) | Routing the in-pod browser through a Tailscale exit node |
+| [sealed-runs.md](sealed-runs.md) | Sealing a benchmark run: what to redeploy, launching sealed, the plain arm, the record, the audit and `gold.json`, the report, and the rerun procedure for the 14 tasks |
 | [slot-tools.md](slot-tools.md) | The tools installed in the slot image |
 | [context-guard.md](context-guard.md) | The guard (on by default, with an off-switch) that trims the coordinator's CLAUDE.md, denies whole-file reads of large files and compacts earlier |
 

@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import flyte
 import flyte.errors
 from flyte.io import Dir
 
-from flyte_agent_factory import _policy, _timeline, _union_identity, _usage
+from flyte_agent_factory import (
+    _policy,
+    _seal_role,
+    _session_config,
+    _timeline,
+    _union_identity,
+    _usage,
+)
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 #: How long a reviewer may wait to be placed before it is moved to on-demand, and
@@ -90,7 +99,7 @@ async def _call_reviewer(
     announce()
     started = _usage.read_wall_clock()
     try:
-        text, out = await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
+        text, out = await _call_sealed(purpose, engine, **kwargs)
     except REMOTE_ERRORS as e:  # what a failed sub-agent action raises
         limited = _usage.USAGE_LIMIT_MARK in str(e)
         # A cross-check is preferred, not required: when the other engine fails outright, the review
@@ -128,7 +137,7 @@ async def _call_reviewer(
         announce()
         started = _usage.read_wall_clock()
         try:
-            text, out = await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
+            text, out = await _call_sealed(purpose, engine, **kwargs)
         except Exception as retry_error:
             if _usage.USAGE_LIMIT_MARK in str(retry_error):
                 _usage._note_engine_limit(engine, str(retry_error))
@@ -150,6 +159,32 @@ async def _call_reviewer(
 #: The `subagent` task. It has to stay in agent.py (its module path is its registered identity) and
 #: this module cannot import agent, so agent.py sets this right after defining the task.
 subagent_task: Any = None
+
+
+async def _call_sealed(purpose: str, engine: str, **kwargs: Any) -> tuple[str, Dir]:
+    """Run one routed sub-agent call; in a sealed project, register its role first and merge its record after.
+
+    The role is registered before the call and has no dir until its record is merged, so a call that fails,
+    times out or is lost leaves a role the audit reports as incomplete. Each call is its own role: a retry
+    on the other engine is a new sub-agent run.
+    """
+    spec = _session_config._seal
+    if spec is None:
+        return await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
+    root = _session_config.SEAL_RECORD
+    role_id = _seal_role.register_subagent(spec, root, _seal_role.kind_for(purpose), engine)
+    text, out = await _call_reviewer_raw(
+        engine=engine, routed=True, seal=spec.to_json(), seal_role=role_id, **kwargs
+    )
+    await merge_record(out, root)
+    return text, out
+
+
+async def merge_record(out: Dir, root: Path) -> None:
+    """Download only the `.seal-record/` part of a sub-agent's returned `Dir` and merge it into `root`."""
+    with tempfile.TemporaryDirectory(prefix="seal-bundle-") as tmp:
+        await _seal_role.fetch_bundle(out, Path(tmp))
+        _seal_role.merge_result(Path(tmp), root)
 
 
 async def _call_reviewer_raw(**kwargs: Any) -> tuple[str, Dir]:

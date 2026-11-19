@@ -111,6 +111,11 @@ from obstore.exceptions import BaseError as ObstoreError
 
 from flyte_agent_factory import _lane_shards, _resources
 
+#: Git that runs no hook or fsmonitor of the tree's (a sealed role can write `.git/`), stdlib only: everything
+#: this launcher imports must be test harness (`_gates._TEST_HARNESS`), so not `_seal_git`.
+_GIT = ("git", *"-c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.ext.allow=never".split())
+_GIT += ("-c", "safe.bareRepository=explicit")
+
 #: Same name as `_gate_tests.SLOW_LANE_ENV`, which sets it for the pre-review.
 ENV_VAR = "AGENT_FACTORY_SLOW_LANE"
 #: How long a shard's spot placement may queue before it goes on-demand. Short on purpose: spot places
@@ -379,7 +384,7 @@ Submit = Callable[[list[str], bool], Any]
 def _listed_files(root: Path) -> list[str]:
     """Return the tracked and untracked-but-not-ignored files, relative to `root`."""
     out = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"],
+        [*_GIT, "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"],
         check=True,
         capture_output=True,
     ).stdout
@@ -406,18 +411,21 @@ def pack_history(root: Path) -> bytes:
     container commits the packed tree instead (`commit_packed_tree`).
     """
     if subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "-q", "--verify", "HEAD"], capture_output=True
+        [*_GIT, "-C", str(root), "rev-parse", "-q", "--verify", "HEAD"], capture_output=True
     ).returncode:
         return b""
     top = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"], check=True, capture_output=True, text=True
+        [*_GIT, "-C", str(root), "rev-parse", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     if Path(top).resolve() != root.resolve():
         return b""
     with tempfile.TemporaryDirectory(prefix="slow-lane-") as tmp:
         bundle = Path(tmp) / "history.bundle"
         subprocess.run(
-            ["git", "-C", str(root), "bundle", "create", "-q", str(bundle), "HEAD"],
+            [*_GIT, "-C", str(root), "bundle", "create", "-q", str(bundle), "HEAD"],
             check=True,
             capture_output=True,
         )

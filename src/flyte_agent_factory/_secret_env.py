@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import _board, _browser_exit_node, _git, _names, _profile, _pull_requests, _union_identity
+from . import _board, _browser_exit_node, _git, _names, _profile, _pull_requests, _seal_git, _union_identity
 
 if TYPE_CHECKING:
     from ._profile import Profile
@@ -154,8 +154,13 @@ def child_env(**extra: str) -> dict[str, str]:
 
 
 def git_argv(*args: str) -> list[str]:
-    """`git` with `GIT_SAFE_CONFIG`, for a workspace the session controls. Run it with `child_env()`."""
-    return ["git", *GIT_SAFE_CONFIG, *args]
+    """`git` with `GIT_SAFE_CONFIG`, for a workspace the session controls. Run it with `child_env()`.
+
+    For a sealed project the workspace's config is sanitised first (`_seal_git.prepare`), so every
+    harness git call that is built here runs on a config the role did not shape.
+    """
+    _seal_git.prepare()
+    return ["git", *GIT_SAFE_CONFIG, *_seal_git.config_args(), *_seal_git.submodules_off(args)]
 
 
 def _remove(path: Path) -> None:

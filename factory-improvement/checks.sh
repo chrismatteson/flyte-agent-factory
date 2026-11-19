@@ -95,14 +95,16 @@ pytest_lane() {
 lane_logs=$(mktemp -d)
 # One EXIT trap replaces another: this one also takes back the lent `.flyte/`.
 trap 'rm -rf "$lane_logs"; [[ -z $lent_context ]] || rm -f .flyte' EXIT
-pytest_lane fast "not slow" "$@" > >(tee "$lane_logs/fast.log") &
+# Piped, not a process substitution: waiting for the lane then waits for its `tee` too, so every line of its
+# output is out before the verdicts are printed.
+{ pytest_lane fast "not slow" "$@" | tee "$lane_logs/fast.log"; exit "${PIPESTATUS[0]}"; } &
 fast=$!
 # The slow lane (benchmark hidden checks: real Terraform, pytest-in-pytest) costs about two thirds of the suite's
 # CPU. It runs when asked for (through the launcher, or here), and always in CI's slow job; beside a fast lane
 # also running here, on a 4-CPU pod, it would hold these checks past their time limit.
 slow=
 if [[ ${AGENT_FACTORY_SLOW_LANE:-} == child || -n ${AGENT_FACTORY_RUN_SLOW:-} ]]; then
-  pytest_lane slow slow "$@" > >(tee "$lane_logs/slow.log") &
+  { pytest_lane slow slow "$@" | tee "$lane_logs/slow.log"; exit "${PIPESTATUS[0]}"; } &
   slow=$!
 else
   echo "slow lane: not run here (CI's slow job runs it); AGENT_FACTORY_RUN_SLOW=1 or AGENT_FACTORY_SLOW_LANE=child runs it" >&2
@@ -121,8 +123,6 @@ verdict() {
 status=0 fast_code=0 slow_code=0
 wait "$fast" || fast_code=$?
 [[ -z $slow ]] || wait "$slow" || slow_code=$?
-# The tee of each lane's output may still be writing after its lane is waited for.
-wait 2>/dev/null || true
 verdict fast "$fast_code"
 [[ -z $slow ]] || verdict slow "$slow_code"
 [[ $fast_code -eq 0 && $slow_code -eq 0 ]] || status=1

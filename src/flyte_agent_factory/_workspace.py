@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import _seal_git
+
 TEMPLATE = Path(__file__).resolve().parent / "_assets" / "workspace_template"
 #: A commit needs an identity, and the operator's global one may not exist (a fresh machine, CI).
 _IDENTITY = ("-c", "user.name=agent-workspace", "-c", "user.email=agent-workspace@users.noreply.github.com")
@@ -29,11 +31,21 @@ def run_git(repo: Path, *args: str, timeout: int = 300, neutral_identity: bool =
 
     `neutral_identity=True` (the default) commits as the fixed neutral identity `_IDENTITY`; `False` leaves
     the commit identity to the person's own git configuration.
+
+    In a repository a sealed role can write (`_seal_git.arm`) the config is sanitised first and git runs
+    with hooks off and no system or global config; any other repository is run as before.
     """
+    _seal_git.prepare(repo)
     try:
         proc = subprocess.run(
-            ["git", *(_IDENTITY if neutral_identity else ()), *args],
+            [
+                "git",
+                *_seal_git.config_args(),
+                *(_IDENTITY if neutral_identity else ()),
+                *_seal_git.submodules_off(args),
+            ],
             cwd=repo,
+            env=_seal_git.harness_env(repo),
             capture_output=True,
             text=True,
             timeout=timeout,

@@ -13,13 +13,18 @@ import functools
 import json
 import multiprocessing
 import socket
+import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import boto3  # type: ignore[import-untyped]
 import obstore
 import pytest
+from moto.s3.models import S3Backend
+from moto.s3.responses import S3Response
 from moto.server import ThreadedMotoServer
 
 from flyte_agent_factory import _queue, _state_bucket, _state_store, _state_volume
@@ -37,13 +42,29 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _one_at_a_time(put: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap moto's PutObject handler so its precondition check and its write happen as one step."""
+    lock = threading.Lock()
+
+    @functools.wraps(put)
+    def put_atomically(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            return put(*args, **kwargs)
+
+    return put_atomically
+
+
 @pytest.fixture(scope="module")
 def moto_endpoint() -> Iterator[str]:
     port = _free_port()
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
-    server.start()
-    yield f"http://127.0.0.1:{port}"
-    server.stop()
+    with pytest.MonkeyPatch.context() as patch:
+        # S3 decides a conditional PutObject atomically: of two writers on one etag, one wins. moto 5.2 checks
+        # If-Match / If-None-Match and then writes, and its server is threaded, so under load both could win.
+        patch.setattr(S3Response, "put_object", _one_at_a_time(S3Response.put_object))
+        server = ThreadedMotoServer(ip_address="127.0.0.1", port=port, verbose=False)
+        server.start()
+        yield f"http://127.0.0.1:{port}"
+        server.stop()
 
 
 @pytest.fixture
@@ -69,6 +90,42 @@ def test_moto_honours_conditional_writes(s3_uri, moto_endpoint):
     found = adapter.get("k")
     assert found is not None
     assert found[0] == b"3"
+
+
+def test_moto_lets_one_of_many_racing_if_match_writes_win(s3_uri, moto_endpoint, monkeypatch):
+    """As on S3: writers racing with the same etag, exactly one replaces the object; the rest are refused."""
+    adapter = _state_bucket.open_adapter(s3_uri, endpoint=moto_endpoint, region="us-east-1")
+    # moto runs in this process. A pause between its If-Match check and its write is what a loaded machine
+    # does at random; here it happens every time, so a check-then-write that is not one step lets two win.
+    write = S3Backend.put_object
+
+    def slow_write(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0.02)
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(S3Backend, "put_object", slow_write)
+    _race_if_match_writes(adapter)
+
+
+def _race_if_match_writes(adapter: _state_bucket.ObstoreAdapter) -> None:
+    """Race 16 If-Match writers on one etag, 5 times; exactly one must win each time."""
+    for round_ in range(5):
+        key = f"k{round_}"
+        assert adapter.create(key, b"0")
+        tag = adapter.head(key)
+        assert tag is not None
+        start = threading.Barrier(16)
+
+        def replace(
+            i: int, key: str = key, tag: _state_bucket.Tag = tag, start: threading.Barrier = start
+        ) -> bool:
+            start.wait()
+            # Each body differs from "0": equal bytes keep the etag, so a later If-Match would rightly pass.
+            return adapter.replace(key, f"w{i}".encode(), tag)
+
+        with concurrent.futures.ThreadPoolExecutor(16) as pool:
+            won = list(pool.map(replace, range(16)))
+        assert won.count(True) == 1, (round_, won)
 
 
 class Backend:

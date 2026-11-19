@@ -1,0 +1,9 @@
+{
+  "fix_patch": "diff --git a/CHANGES.rst b/CHANGES.rst\nindex 3c72a79..941fcd7 100644\n--- a/CHANGES.rst\n+++ b/CHANGES.rst\n@@ -4,6 +4,7 @@ Version 3.0.1\n Unreleased\n \n -   Address compiler warnings that became errors in GCC 14. :issue:`466`\n+-   Fix compatibility with proxy objects. :issue:`467`\n \n \n Version 3.0.0\ndiff --git a/src/markupsafe/__init__.py b/src/markupsafe/__init__.py\nindex 0afddc0..fee8dc7 100644\n--- a/src/markupsafe/__init__.py\n+++ b/src/markupsafe/__init__.py\n@@ -34,7 +34,9 @@ def escape(s: t.Any, /) -> Markup:\n     \"\"\"\n     # If the object is already a plain string, skip __html__ check and string\n     # conversion. This is the most common use case.\n-    if s.__class__ is str:\n+    # Use type(s) instead of s.__class__ because a proxy object may be reporting\n+    # the __class__ of the proxied value.\n+    if type(s) is str:\n         return Markup(_escape_inner(s))\n \n     if hasattr(s, \"__html__\"):\n",
+  "test_patch": "",
+  "shas": [
+    "7add29c77b088299841e1017a7cd2f96133a6659",
+    "54bb00bfafe57582bc196ac92eda32cb942f0025",
+    "ef0b95e2544ea0d09230a57dc01ac91e3bab9689"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "roles": [
+    {
+      "kind": "plain",
+      "registered_at": "2026-11-17T05:21:48Z",
+      "role_id": "plain-20261117T052147Z-b8df11"
+    }
+  ],
+  "spec_sha256": "36f8e0aede27c9ae78cc3990228048ea6222ad9a662c63b3e04fa6bbd39d38ea"
+}

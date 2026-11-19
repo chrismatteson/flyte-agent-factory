@@ -29,6 +29,7 @@ from flyte_agent_factory import (
     _vendored,
 )
 from flyte_agent_factory._bridge import INBOX_SUBDIR
+from flyte_agent_factory._seal_spec import SealSpec
 
 # Tasks here run as an unprivileged user (`flyte`), not root, so nothing may
 # assume it can create a directory at the filesystem root. Every writable path
@@ -44,6 +45,10 @@ BASE_DIR = Path(_names.getenv("AGENT_FACTORY_BASE") or os.environ.get("HOME") or
 STATE_ROOT = BASE_DIR / "state"
 
 WORKSPACE = STATE_ROOT / _state.WORKSPACE_SUBDIR
+
+#: A sealed project's record root. Under STATE_ROOT, so it is on the checkpointed volume and survives a
+#: pod restart and `ops/seal_record.py`; not under WORKSPACE, so it is never in the project's git tree.
+SEAL_RECORD = STATE_ROOT / "seal-record"
 
 # Claude Code keeps transcripts here. On the volume alongside the workspace, so
 # one commit captures a consistent pair -- the work and the conversation that
@@ -223,6 +228,10 @@ _project_name = ""
 _project_repo = ""
 
 _project_brief = ""
+
+#: The seal this project was launched with, set once by `project`; None for an ordinary project. Every
+#: sub-agent call made from this process checks it (`_seal_subagent.check_call`).
+_seal: SealSpec | None = None
 
 #: The `projects/<folder>/` this project's files are judged in, set once from the launch by
 #: `_session_setup._prepare_workspace` (`_project_folder.route`): "" means the project's name. Never read from

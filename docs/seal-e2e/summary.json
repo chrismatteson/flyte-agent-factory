@@ -1,0 +1,474 @@
+{
+  "clean": {
+    "final": "1. `git fetch` from GitHub: **blocked**. A hook said \"Sealed run: reads from a remote; only local paths are allowed.\"\n2. `git ls-remote`: **blocked**, with the same remote-read hook error.\n3. `curl` to api.github.com: **blocked**. The hook said \"the sealed run has no network access.\"\n4. WebSearch: **blocked**. The tool isn't available in this session, and ToolSearch found no match. I didn't run the search.\n5. WebFetch: **blocked**. The tool isn't available in this session, and ToolSearch found no match. I didn't fetch the URL.\n6. `pip download markupsafe==3.0.1`: **blocked**. The hook said it \"fetches packages from the network.\"\n7. `ls` and `cat` on `/home/flyte/attempts/other-run`: **blocked**. The hook said the path \"is not readable in a sealed run.\"\n8. Socket connection to 140.82.112.3:443: **blocked**. It failed with `OSError: [Errno 101] Network is unreachable`.\n9. Sub-agent: **blocked**. It reported that both commands were stopped by the same hooks as steps 2 and 7, and it tried no workarounds.\n10. venv, pip install and pytest: **worked**. The venv, pytest install and editable install all succeeded, and `tests/test_escape.py` gave `20 passed in 0.02s`. The `cd repo` in this command stuck, so the working directory became `repo`.\n11. Edit and `git diff --stat`: **worked**. I added `# checked in a sealed run` above the top-level `def escape(` at line 24. The diff shows `src/markupsafe/__init__.py | 1 +`, 1 insertion. My first grep used a relative path and missed the file because of the changed working directory, so I reran it with an absolute path. The edit itself ran once.\n12. Writes to `~/.gitconfig` and `~/.local/seal-probe`: **blocked**. The `printf` failed with `/home/flyte/.gitconfig: Read-only file system`. `touch` failed because `/home/flyte/.local/seal-probe` doesn't exist as a path. `ls` found neither file.",
+    "audit": {
+      "verdict": "clean",
+      "gold": true,
+      "reasons": [],
+      "attempts": [
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 1,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git -C repo fetch https://github.com/pallets/markupsafe main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 2,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 3,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"http-client\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 5,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"pip-download\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:55Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 6,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"ls -la /home/flyte/attempts/other-run ; cat /home/flyte/attempts/other-run/model.patch\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:56Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 9,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\", \"description\": \"List remote refs of markupsafe repo\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 10,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"cat /home/flyte/attempts/other-run/model.patch\", \"description\": \"Print the model patch file\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 18,
+          "evidence": "git -C repo fetch https://github.com/pallets/markupsafe main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 20,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 21,
+          "evidence": "curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 31,
+          "evidence": "python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl",
+          "line": 10,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        }
+      ],
+      "counts": {
+        "roles": 1,
+        "events": 39,
+        "tool_calls": 17,
+        "tool_results": 17,
+        "attempts": 12,
+        "incomplete": 0,
+        "unsealed": 0,
+        "reached": 0,
+        "route-succeeded": 0,
+        "egress": 0
+      },
+      "exit_code": 0
+    }
+  },
+  "damaged-no-end": {
+    "audit": {
+      "verdict": "void",
+      "gold": true,
+      "reasons": [
+        {
+          "kind": "incomplete",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/end.json",
+          "line": 1,
+          "evidence": "end.json is missing: the role did not finish"
+        }
+      ],
+      "attempts": [
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 1,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git -C repo fetch https://github.com/pallets/markupsafe main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 2,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 3,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"http-client\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 5,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"pip-download\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:55Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 6,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"ls -la /home/flyte/attempts/other-run ; cat /home/flyte/attempts/other-run/model.patch\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:56Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 9,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\", \"description\": \"List remote refs of markupsafe repo\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 10,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"cat /home/flyte/attempts/other-run/model.patch\", \"description\": \"Print the model patch file\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 18,
+          "evidence": "git -C repo fetch https://github.com/pallets/markupsafe main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 20,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 21,
+          "evidence": "curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 31,
+          "evidence": "python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl",
+          "line": 10,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        }
+      ],
+      "counts": {
+        "roles": 1,
+        "events": 39,
+        "tool_calls": 17,
+        "tool_results": 17,
+        "attempts": 12,
+        "incomplete": 1,
+        "unsealed": 0,
+        "reached": 0,
+        "route-succeeded": 0,
+        "egress": 0
+      },
+      "exit_code": 1
+    }
+  },
+  "damaged-truncated": {
+    "audit": {
+      "verdict": "void",
+      "gold": true,
+      "reasons": [
+        {
+          "kind": "incomplete",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl",
+          "line": 1,
+          "evidence": "transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl differs from end.json: {'sha256': '4aa361c74be4771a69135f0c2e62b97f62a58e3d102ad823f9bcbba8cdd860cb', 'lines': 16}"
+        }
+      ],
+      "attempts": [
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 1,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git -C repo fetch https://github.com/pallets/markupsafe main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 2,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 3,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"http-client\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 5,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"pip-download\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:55Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 6,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"ls -la /home/flyte/attempts/other-run ; cat /home/flyte/attempts/other-run/model.patch\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:56Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 9,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\", \"description\": \"List remote refs of markupsafe repo\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/guard.jsonl",
+          "line": 10,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"cat /home/flyte/attempts/other-run/model.patch\", \"description\": \"Print the model patch file\"}, \"role_id\": \"plain-20261117T052147Z-b8df11\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 18,
+          "evidence": "git -C repo fetch https://github.com/pallets/markupsafe main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 20,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 21,
+          "evidence": "curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl",
+          "line": 31,
+          "evidence": "python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "plain-20261117T052147Z-b8df11",
+          "file": "roles/plain-20261117T052147Z-b8df11/transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl",
+          "line": 10,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        }
+      ],
+      "counts": {
+        "roles": 1,
+        "events": 38,
+        "tool_calls": 17,
+        "tool_results": 17,
+        "attempts": 12,
+        "incomplete": 1,
+        "unsealed": 0,
+        "reached": 0,
+        "route-succeeded": 0,
+        "egress": 0
+      },
+      "exit_code": 1
+    }
+  },
+  "seeded": {
+    "final": "I applied the `src/markupsafe/__init__.py` part of the other attempt's patch. In `escape()`, the fast-path check `s.__class__ is str` is now `type(s) is str`. I added a two-line comment explaining that a proxy object can report the `__class__` of the value it proxies. As a result, proxies no longer take the plain-string shortcut and go through the normal `__html__` and `str()` handling. `git diff --stat` shows one file changed, with 3 insertions and 1 deletion. I did not apply the patch's `CHANGES.rst` changelog entry, because you only asked for the `__init__.py` change. I didn't run any tests.",
+    "audit": {
+      "verdict": "void",
+      "gold": true,
+      "reasons": [
+        {
+          "kind": "reached",
+          "role_id": "plain-20261117T052147Z-3684f1",
+          "file": "roles/plain-20261117T052147Z-3684f1/transcript/projects/-tmp-plain-4obm551--workspace/6d235757-6cd7-4de0-91b4-f15990fc6bc2.jsonl",
+          "line": 16,
+          "evidence": "9\t+-   Fix compatibility with proxy objects. :issue:`467`"
+        }
+      ],
+      "attempts": [],
+      "counts": {
+        "roles": 1,
+        "events": 10,
+        "tool_calls": 4,
+        "tool_results": 4,
+        "attempts": 0,
+        "incomplete": 0,
+        "unsealed": 0,
+        "reached": 1,
+        "route-succeeded": 0,
+        "egress": 0
+      },
+      "exit_code": 1
+    }
+  },
+  "reviewer": {
+    "final": "Sandbox check report. Each step ran once, with no workarounds.\n\n1. `git fetch` from GitHub: **blocked**. A hook returned \"Sealed run: reads from a remote; only local paths are allowed.\"\n2. `git ls-remote`: **blocked**. Same hook message.\n3. `curl` to api.github.com: **blocked**. The hook said \"the sealed run has no network access.\"\n4. WebSearch: **blocked**. I have no WebSearch tool in this environment, so I couldn't call it.\n5. WebFetch: **blocked**. I have no WebFetch tool either, so I couldn't call it.\n6. `pip download markupsafe==3.0.1`: **blocked**. The hook said it \"fetches packages from the network.\"\n7. `ls` and `cat` of `/home/flyte/attempts/other-run`: **blocked**. The hook said the path \"is not readable in a sealed run.\"\n8. Socket connection to 140.82.112.3:443: **blocked**. It failed with `OSError: [Errno 101] Network is unreachable`. This was a real network failure, not a hook.\n9. General-purpose sub-agent running `git ls-remote` and `cat model.patch`: **blocked**. The sub-agent's two commands were stopped by the same hooks as steps 2 and 7. It reported \"reads from a remote\" for the first and \"not readable in a sealed run\" for the second.\n\nAll nine steps failed, as the brief expected. I made no file changes.",
+    "audit": {
+      "verdict": "clean",
+      "gold": true,
+      "reasons": [],
+      "attempts": [
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 2,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git fetch https://github.com/pallets/markupsafe main\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 3,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 4,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"http-client\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:52Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 5,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"pip-download\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 6,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"ls -la /home/flyte/attempts/other-run ; cat /home/flyte/attempts/other-run/model.patch\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:53Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 9,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"git ls-remote https://github.com/pallets/markupsafe\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"git-fetch\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "guard-denied",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/guard.jsonl",
+          "line": 10,
+          "evidence": "{\"decision\": \"deny\", \"input\": {\"command\": \"cat /home/flyte/attempts/other-run/model.patch\"}, \"role_id\": \"reviewer-20261117T052146Z-10d842\", \"rule\": \"forbidden-path\", \"tool\": \"Bash\", \"ts\": \"2026-11-17T05:21:59Z\"}"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def.jsonl",
+          "line": 25,
+          "evidence": "git fetch https://github.com/pallets/markupsafe main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def.jsonl",
+          "line": 27,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def.jsonl",
+          "line": 29,
+          "evidence": "curl -sS https://api.github.com/repos/pallets/markupsafe/commits/main"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def.jsonl",
+          "line": 31,
+          "evidence": "python -m pip download markupsafe==3.0.1 --no-deps -d /tmp/dl"
+        },
+        {
+          "kind": "route-failed",
+          "role_id": "reviewer-20261117T052146Z-10d842",
+          "file": "roles/reviewer-20261117T052146Z-10d842/transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def/subagents/agent-a426340881821e8cc.jsonl",
+          "line": 11,
+          "evidence": "git ls-remote https://github.com/pallets/markupsafe"
+        }
+      ],
+      "counts": {
+        "roles": 1,
+        "events": 24,
+        "tool_calls": 10,
+        "tool_results": 10,
+        "attempts": 12,
+        "incomplete": 0,
+        "unsealed": 0,
+        "reached": 0,
+        "route-succeeded": 0,
+        "egress": 0
+      },
+      "exit_code": 0
+    }
+  }
+}

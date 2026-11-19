@@ -322,6 +322,7 @@ class Profile:
     bench: Bench | None = None
     loop: Loop = Loop()
     gardening: Gardening = Gardening()
+    seal: _profile_policy.Seal = _profile_policy.Seal()
     judgement: JudgementPolicy = JudgementPolicy()
     # [resources.<component>] -> the keys it sets; `_resources.for_component` lays them over the defaults.
     resources: Mapping[str, _profile_resources.Spec] = field(default_factory=lambda: MappingProxyType({}))
@@ -774,6 +775,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             "bench",
             "loop",
             "gardening",
+            "seal",
             "judgement",
             "resources",
             "standards",
@@ -892,7 +894,6 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         _check_pinned_engine({**policy, **s.policy}, s, secrets, where)
 
     repo_keys = _repo_keys(_table(data, "repo_keys", where, required=False), repo, secrets, where)
-
     repo_aliases = _repo_aliases(_table(data, "repo_aliases", where, required=False), repo, where)
 
     mcp = None
@@ -1135,6 +1136,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
     try:
         gardening = _profile_policy.parse_gardening(_table(data, "gardening", where, required=False))
         judgement = _profile_policy.parse_judgement(_table(data, "judgement", where, required=False))
+        seal = _profile_policy.parse_seal(_table(data, "seal", where, required=False))
         resources = _profile_resources.parse(_table(data, "resources", where, required=False))
     except (_profile_policy.PolicyError, _profile_resources.ResourcesError) as exc:
         raise ProfileError(f"{where}: {exc}") from exc
@@ -1149,7 +1151,6 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         raise ProfileError(
             f"{where}: [planner] admission = planner needs [[slots]]: it places launches on slots"
         )
-
     return Profile(
         name=name,
         text=re.sub(r'^standards_payload = "[^"\n]*"\n', "", text, count=1),
@@ -1175,6 +1176,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         bench=bench,
         loop=loop,
         gardening=gardening,
+        seal=seal,
         judgement=judgement,
         resources=MappingProxyType(resources),
         repo_aliases=repo_aliases,

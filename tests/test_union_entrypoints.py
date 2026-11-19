@@ -166,7 +166,8 @@ NO_UNION = {
 
 #: Functions that build an environment per call, and the test that checks what they build.
 FACTORIES = {
-    ("flyte_agent_factory.browser", "personal_app"): "test_personal_browser_apps_act_as_the_queue_tier"
+    ("flyte_agent_factory.browser", "personal_app"): "test_personal_browser_apps_act_as_the_queue_tier",
+    ("ops/seal_e2e.py", "child_env"): "test_the_seal_e2e_child_holds_no_union_key",
 }
 
 ROOT = SRC.parent
@@ -315,6 +316,13 @@ def test_personal_browser_apps_act_as_the_queue_tier():
     profile = _profile.require()
     identity = _profile.BrowserIdentity("alice", "alice-token")
     _assert_tier(browser.personal_app(profile, identity, ""), "queue")
+
+
+def test_the_seal_e2e_child_holds_no_union_key():
+    _, env = _load("ops/seal_e2e.py").child_env("registry.invalid/agent:tag")
+    assert env.image == "registry.invalid/agent:tag"
+    assert not [s for s in env.secrets if getattr(s, "as_env_var", None) == _union_identity.KEY_ENV]
+    assert _union_identity.TIER_ENV not in (env.env_vars or {})
 
 
 def test_bench_check_environment_holds_no_union_credential():

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -345,6 +346,42 @@ def test_checks_sh_ends_with_each_lanes_verdict_whichever_lane_finished_last(tmp
     assert tail.endswith(
         "=== factory-improvement/checks.sh: slow lane exit 0 ===\n=== 7 passed in 9.00s ===\n"
     )
+
+
+def test_checks_sh_waits_for_each_lanes_tee_before_its_verdicts(tmp_path):
+    """A lane's output still in its `tee` when the lane ends is out before the verdicts, not after them."""
+    repo = Path(__file__).resolve().parents[1]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"not slow"* ]]; then echo \'=== 1 failed in 1.00s ===\'; exit 1; fi\n'
+        "if [[ \"$*\" == *pytest* ]]; then echo '=== 7 passed in 9.00s ==='; fi\n"
+    )
+    # A `tee` that writes a second after the lane has finished: a loaded pod's, made certain.
+    real_tee = shutil.which("tee")
+    assert real_tee
+    (bin_dir / "tee").write_text(f'#!/bin/bash\nsleep 1\nexec {real_tee} "$@"\n')
+    for name in ("uv", "tee"):
+        (bin_dir / name).chmod(0o755)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("AGENT_FACTORY_SLOW_LANE", _gate_tests.PYTEST_JUNIT_ENV)
+    }
+    env.update(PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", AGENT_FACTORY_RUN_SLOW="1")
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 1
+    assert run.stdout.endswith(
+        "=== factory-improvement/checks.sh: fast lane exit 1 ===\n=== 1 failed in 1.00s ===\n"
+        "=== factory-improvement/checks.sh: slow lane exit 0 ===\n=== 7 passed in 9.00s ===\n"
+    ), run.stdout[-2000:]
 
 
 def test_checks_sh_leaves_the_slow_lane_to_ci_unless_asked(tmp_path):

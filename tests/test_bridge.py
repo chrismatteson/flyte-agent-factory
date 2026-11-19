@@ -2734,3 +2734,17 @@ async def test_a_late_answer_for_an_unknown_ask_still_reaches_the_inbox(bridge_r
     await bridge.late_answer("ask-a9-001", "use sqlite")
     [late] = list((tmp_path / "ws" / _bridge.INBOX_SUBDIR).glob("late-*.md"))
     assert "ask-a9-001" in late.read_text() and "use sqlite" in late.read_text()
+
+
+def test_write_atomic_does_not_write_through_a_planted_temp_link(tmp_path):
+    from flyte_agent_factory._bridge_common import _write_atomic
+
+    outside, target = tmp_path / "outside", tmp_path / "bridge" / "questions.json"
+    target.parent.mkdir()
+    outside.write_text("intact")
+    target.with_suffix(".json.tmp").symlink_to(outside)
+    _write_atomic(target, {"ok": True})
+    assert outside.read_text() == "intact"
+    assert json.loads(target.read_text()) == {"ok": True}
+    assert not target.is_symlink()
+    assert [p.name for p in target.parent.iterdir() if p.name.endswith(".tmp") and not p.is_symlink()] == []

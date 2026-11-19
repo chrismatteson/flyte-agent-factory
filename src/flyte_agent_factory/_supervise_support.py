@@ -42,6 +42,7 @@ from flyte_agent_factory import (
     _proc_health,
     _pull_requests,
     _roles,
+    _seal_session,
     _session_config,
     _session_setup,
     _timeline,
@@ -177,9 +178,15 @@ async def _done_preflight(workspace: Path) -> str:
         )
 
     _, remotes = await _checkpoint._git_out(workspace, "remote")
+    if remotes and _session_config._seal is not None:
+        # The session cannot fetch; its first push may have created the branch the clone has no tracking
+        # ref for yet. The harness can reach the remote, so it brings the ref in before `@{u}` is judged.
+        await asyncio.to_thread(_seal_session.refresh_upstream, workspace, _session_config._project_name)
     if remotes:
         push = _instructions._push_command(
-            _session_setup._pr.branch if _session_setup._pr else "", _session_setup._default_branch
+            _session_setup._pr.branch if _session_setup._pr else "",
+            _session_setup._default_branch,
+            _session_config._seal is not None,
         )
         code, ahead = await _checkpoint._git_out(workspace, "rev-list", "--count", "@{u}..HEAD")
         if code != 0:

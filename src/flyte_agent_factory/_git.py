@@ -121,7 +121,9 @@ def install_deploy_key(repo: str = "") -> str | None:
     return str(key_path)
 
 
-async def clone(repo: str, branch: str, dest: Path, credential: Path | None = None) -> None:
+async def clone(
+    repo: str, branch: str, dest: Path, credential: Path | None = None, *, single_branch: bool = False
+) -> None:
     """Clone `repo` into `dest`, installing its deploy key first.
 
     `credential` is a git credential-store file holding an installation token (`_git_https.write_token`):
@@ -141,7 +143,15 @@ async def clone(repo: str, branch: str, dest: Path, credential: Path | None = No
         env = {**os.environ, **_git_https.config_env(credential)}
     else:
         install_deploy_key(repo)
-    cmd = ["git", "clone", *(["--branch", branch] if branch else []), repo, str(dest)]
+    # `single_branch`: a sealed project's clone holds one branch, so no other project's work is in it.
+    cmd = [
+        "git",
+        "clone",
+        *(["--single-branch"] if single_branch else []),
+        *(["--branch", branch] if branch else []),
+        repo,
+        str(dest),
+    ]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
     )

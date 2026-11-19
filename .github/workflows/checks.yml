@@ -80,6 +80,9 @@ jobs:
         with:
           path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
           key: ${{ steps.scanners.outputs.tflint }}
+      - name: Allow unprivileged user namespaces
+        # The seal tests launch through them, as a sealed run does; Ubuntu 24.04's AppArmor default refuses them.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install scanners
         run: |
           python3 src/flyte_agent_factory/_scanners.py install --cache ~/.cache/factory-scanners --bin "$RUNNER_TEMP/scanners" gitleaks tflint
@@ -158,6 +161,9 @@ jobs:
         with:
           path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
           key: ${{ steps.scanners.outputs.tflint }}
+      - name: Allow unprivileged user namespaces
+        # The seal tests launch through them, as a sealed run does; Ubuntu 24.04's AppArmor default refuses them.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Install scanners
         run: |
           python3 src/flyte_agent_factory/_scanners.py install --cache ~/.cache/factory-scanners --bin "$RUNNER_TEMP/scanners" gitleaks tflint

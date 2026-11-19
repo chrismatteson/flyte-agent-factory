@@ -1,0 +1,30 @@
+{
+  "ended_at": "2026-11-17T05:22:07Z",
+  "exit_code": 0,
+  "files": {
+    "guard.jsonl": {
+      "lines": 10,
+      "sha256": "94a0684ca5fb80593924bcf7b77bd6ecee844caa6e7fa4275347967d97b237e0"
+    },
+    "proxy.jsonl": {
+      "lines": 3,
+      "sha256": "ee7432fbfbb3dff6c0d2b8dd5ea6aa1a087b7453cf792b605800fb2f3c47f208"
+    },
+    "role.json": {
+      "lines": 15,
+      "sha256": "e3516e4554b5895e7652dceeb29500adfc0c751aa210f7f8dc66460fb60d5137"
+    },
+    "transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def.jsonl": {
+      "lines": 44,
+      "sha256": "d6221fde4e541ad942aaa765b96190bdd5f9227484e6bbe597d3f1c41782bcb0"
+    },
+    "transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def/subagents/agent-a426340881821e8cc.jsonl": {
+      "lines": 18,
+      "sha256": "1da212b6e94521e9aefd916753d06a447d3b96b5130219437ba3ebccc0ed98b5"
+    },
+    "transcript/projects/-tmp-subagent-nol4dkpv-workspace/27843c01-c43d-46b9-a023-eefb8d743def/subagents/agent-a426340881821e8cc.meta.json": {
+      "lines": 1,
+      "sha256": "fc59e3da8a66d2764624999e94091dfc46a16cd2137722f7c3590dbc05c3b6cc"
+    }
+  }
+}
