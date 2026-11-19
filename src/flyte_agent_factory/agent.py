@@ -449,7 +449,7 @@ async def project(
 
     timeline.header("project", project_name)
     timeline.header("run", run_name)
-    timeline.row("🔑", _union_identity.describe_identity(identity))
+    _supervise_support._write_identity_rows(timeline, _union_identity.describe_identity(identity))
     timeline.header("model", f"{model} ({effort or 'default effort'})")
     # The console's run page, from the same profile the probes use; "" where there is no console.
     timeline.run_url = _board.run_url(_session_config._PROFILE, run_name) if ctx and ctx.action else ""

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import _lane_shards, _load_clock, _secret_env
+from . import _lane_shards, _load_clock, _proc_health, _secret_env
 
 
 class Status(enum.Enum):
@@ -147,14 +147,17 @@ def _run(
         # The limit is on load-adjusted time: a busy shared node must not fail a tool that is working.
         clock = _load_clock.LoadClock(timeout, proc.pid)
         try:
-            while True:
+            # Poll before waiting, so a command is judged at least once: the clock's first scan of /proc can
+            # outlast a short command in a pod with a large process table (#34).
+            while not clock.poll():
                 try:
                     proc.wait(timeout=0.05)
                     break
                 except subprocess.TimeoutExpired:
-                    if clock.poll():
-                        _kill_group(proc)
-                        return 124, f"command timed out after {timeout} seconds ({clock.attribution()})"
+                    pass
+            else:
+                _kill_group(proc)
+                return 124, _describe_timeout(timeout, clock)
         except BaseException:
             _kill_group(proc)  # this thread was interrupted: no tool is left running behind the gate
             raise
@@ -162,6 +165,17 @@ def _run(
         err.seek(0)
         output = out.read() + err.read()
     return proc.returncode, output if args[0] == "git" or tail is None else output[-tail:]
+
+
+def _describe_timeout(timeout: int, clock: _load_clock.LoadClock) -> str:
+    message = f"command timed out after {timeout} seconds ({clock.attribution()})"
+    health = _proc_health.snapshot()
+    if health.burdened:
+        message += (
+            f"; this pod has {health.zombies} zombie processes under PID 1 {health.init or 'unknown'}, "
+            "which slows every scan of /proc"
+        )
+    return message
 
 
 def _kill_group(proc: subprocess.Popen[bytes]) -> None:

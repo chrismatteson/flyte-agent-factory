@@ -108,6 +108,9 @@ jobs:
             printf '%s\n' "$LITERALS" > "$RUNNER_TEMP/owner-literals.txt"
             echo "FACTORY_OWNER_LITERALS=$RUNNER_TEMP/owner-literals.txt" >> "$GITHUB_ENV"
           fi
+      # tests/test_reaping.py runs a real tini (the factory images install it) and fails without it.
+      - name: Install tini
+        run: sudo apt-get update && sudo apt-get install -y tini
       - run: uv sync --frozen
       # The cutover's tree (ops/public_tree.py), scanned with the owner's list when there is one: the log says how
       # many owner literals were loaded and how many files were read.
@@ -201,6 +204,9 @@ jobs:
           done
           echo "could not locate playwright-core cli.js under $root" >&2
           exit 1
+      # tests/test_reaping.py runs a real tini (the factory images install it) and fails without it.
+      - name: Install tini
+        run: sudo apt-get update && sudo apt-get install -y tini
       - run: uv sync --frozen
       # The junit file and the commit it ran on are what the standards gate reads instead of running this again.
       - name: pytest -m "slow"

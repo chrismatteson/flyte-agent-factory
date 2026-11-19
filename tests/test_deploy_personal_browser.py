@@ -299,7 +299,7 @@ def test_the_personal_app_serializes_with_its_grace_period():
     pod = MessageToDict(_get_k8s_pod(app, app.pod_template, SerializationContext(version="v1")).pod_spec)
     assert pod["terminationGracePeriodSeconds"] == 90
     assert [c["name"] for c in pod["containers"]] == ["app"]
-    assert pod["containers"][0]["command"] == ["/bin/bash", "/opt/browser/start.sh"]
+    assert pod["containers"][0]["command"] == ["tini", "-s", "--", "/bin/bash", "/opt/browser/start.sh"]
 
 
 def test_the_personal_app_mounts_the_state_volume_and_runs_as_the_browser_account():

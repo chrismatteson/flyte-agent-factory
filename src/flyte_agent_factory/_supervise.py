@@ -86,6 +86,7 @@ async def _pump(
     nudges = 0
     warned_disk = False
     warned_memory = False
+    warned_zombies = False
     in_flight = 0
     # -inf, not 0: `time.monotonic()` counts from boot, and 0 held the first listing on a fresh host.
     last_children_check = float("-inf")
@@ -954,6 +955,7 @@ async def _pump(
             warned_disk, warned_memory = _supervise_support._warn_on_low_headroom(
                 timeline, warned_disk, warned_memory
             )
+            warned_zombies = _supervise_support._warn_on_zombies(timeline, warned_zombies)
 
             now = time.monotonic()
             out_at = getattr(proc, "last_output", None)

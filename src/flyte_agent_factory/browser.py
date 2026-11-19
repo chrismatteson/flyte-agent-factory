@@ -62,7 +62,7 @@ import flyte.app
 # Keep runtime imports usable when deployment tools load this file by path.
 if TYPE_CHECKING:
     from . import _names, _profile, _profile_oss, _profile_state, _resources, _state_pod, _union_identity
-    from ._images import browser_image
+    from ._images import INIT_COMMAND, browser_image
 else:
     from flyte_agent_factory import (
         _names,
@@ -73,7 +73,7 @@ else:
         _state_pod,
         _union_identity,
     )
-    from flyte_agent_factory._images import browser_image
+    from flyte_agent_factory._images import INIT_COMMAND, browser_image
 
 APP_NAME = "claude-browser"
 APP_PORT = 8080
@@ -86,7 +86,7 @@ _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_spec(_PROFILE, "queue") if _PRO
 browser_env = flyte.app.AppEnvironment(
     name=APP_NAME,
     image=browser_image(),
-    command=["/bin/bash", "/opt/browser/start.sh"],
+    command=[*INIT_COMMAND, "/bin/bash", "/opt/browser/start.sh"],
     port=APP_PORT,
     # Chromium is memory-hungry and the agent may drive several tabs at once;
     # shm matters because Chromium's default /dev/shm in a container is 64MB,
@@ -149,7 +149,7 @@ def personal_app(
         name=identity.app,
         **_state_pod.environment_kwargs(profile, "browser", grace_seconds=_PERSONAL_GRACE_S),
         image=browser_image(tailscale=bool(exit_node)),
-        command=["/bin/bash", "/opt/browser/start.sh"],
+        command=[*INIT_COMMAND, "/bin/bash", "/opt/browser/start.sh"],
         port=APP_PORT,
         resources=replace(_resources.for_component(profile, "browser").to_flyte(), shm="2Gi"),
         scaling=flyte.app.Scaling(replicas=(1, 1)),

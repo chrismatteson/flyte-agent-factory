@@ -158,6 +158,7 @@ NO_UNION = {
     ("browser_doctor", "env"): "checks the browser image's binaries",
     ("mcp_startup_probe", "env"): "starts playwright-mcp in the browser image",
     ("ops/probes/podman_rootless.py", "env"): "runs podman inside the pod",
+    ("ops/probes/reaping.py", "env"): "starts orphans and times the load clock inside the pod",
     ("ops/probes/reviewer_placement.py", "plain"): "returns a constant; the probe is where it is placed",
     ("ops/probes/reviewer_placement.py", "actor"): "returns a constant; the probe is where it is placed",
     ("ops/model_eval/mechanical.py", "env"): "runs a project's checks; deliberately declares no secrets",

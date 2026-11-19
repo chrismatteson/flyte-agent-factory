@@ -33,6 +33,7 @@ shared app stays deployed for that.
 from __future__ import annotations
 
 import base64
+import shlex
 from pathlib import Path
 
 import flyte
@@ -61,6 +62,20 @@ CODEX_SHA256 = "582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182
 TAILSCALE_VERSION = "1.82.5"
 # Official tailscale_1.82.5_amd64.tgz.sha256; these images target linux/amd64.
 TAILSCALE_SHA256 = "41a8931fa52055bd7ea4b51df9acff2ba2d4e9000c2380b667539b5b99991464"
+
+
+# PID 1 of a factory pod is the flyte `a0` process, which never reaps the orphans re-parented to it, so
+# zombies piled up (thousands in ~10 h) and made every walk of /proc slow. The flyte SDK's runtime
+# (`flyte/_bin/runtime.py::_maybe_reexec_under_wrapper`, flyte 2.13.5 pinned in uv.lock) re-execs `a0` under
+# the command in env `_F_EXEC_WRAPPER`; exec keeps the PID, so tini becomes PID 1 and `a0` its child. tini
+# reaps every orphan and forwards signals; `-s` makes it a subreaper so it still reaps when not PID 1.
+INIT_WRAPPER = "tini -s --"
+INIT_COMMAND: list[str] = shlex.split(INIT_WRAPPER)
+
+
+def with_init(image: flyte.Image) -> flyte.Image:
+    """Return `image` with tini installed and the SDK told to run the task under it."""
+    return image.with_apt_packages("tini").with_env_vars({"_F_EXEC_WRAPPER": INIT_WRAPPER})
 
 
 def run_as_flyte(image: flyte.Image) -> flyte.Image:
@@ -299,7 +314,7 @@ def agent_image(
             ]
         )
     )
-    image = _with_podman(image)
+    image = with_init(_with_podman(image))
     if tailscale:
         image = _with_tailscale(image)
     if not browser:
@@ -383,5 +398,6 @@ def browser_image(
         .with_commands(["chmod +x /opt/browser/install.sh /opt/browser/start.sh"])
         .with_commands(["/opt/browser/install.sh"])
     )
+    image = with_init(image)
 
     return run_as_flyte(_with_tailscale(image) if tailscale else image)

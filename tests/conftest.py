@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import _cpu_budget
+from tests import _cpu_budget, _tini
 from tests._git import git
 
 # Pytest loads this file as `conftest`; tests that `from tests.conftest import ...` would otherwise run it a
@@ -33,6 +33,9 @@ if str(SRC) not in sys.path:
 # Subprocesses (`sys.executable -c ...`) get it too: pytest's `pythonpath` setting only changes this
 # process, and a slot pod's PYTHONPATH points at the deployed copy of the package.
 os.environ["PYTHONPATH"] = os.pathsep.join([str(SRC), *filter(None, [os.environ.get("PYTHONPATH")])])
+
+# The reaping tests and the test-lane script run a real tini, which a pod from an older image lacks (#34).
+_tini.ensure_on_path()
 
 
 # The deployment profile the whole suite runs against, selected before any module that reads
@@ -160,6 +163,16 @@ def _tests_run_as_the_unprivileged_user_the_factory_expects(monkeypatch):
     exercise them. A test of the refusal sets `os.geteuid` itself, after this."""
     if os.geteuid() == 0:
         monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+
+@pytest.fixture(autouse=True)
+def _the_pod_is_healthy_whatever_runs_the_tests(monkeypatch):
+    """Rows and timeout messages name the process table only when it is unhealthy (`_proc_health`); the pod
+    that runs the suite may have the flyte `a0` process as PID 1 and zombies of its own. A test of the
+    unhealthy case sets its own snapshot, after this."""
+    from flyte_agent_factory import _proc_health
+
+    monkeypatch.setattr(_proc_health, "snapshot", lambda proc=None: _proc_health.ProcHealth(100, 0, "tini"))
 
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
