@@ -1,0 +1,15 @@
+{
+  "action": "",
+  "engine": "claude",
+  "kind": "reviewer",
+  "parent": "",
+  "role_id": "reviewer-20261117T052146Z-10d842",
+  "seal": {
+    "fs_readonly": true,
+    "guard": true,
+    "net": true,
+    "spec_sha256": "36f8e0aede27c9ae78cc3990228048ea6222ad9a662c63b3e04fa6bbd39d38ea",
+    "tools_off": true
+  },
+  "started_at": "2026-11-17T05:21:46Z"
+}

@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import _seal_git
+
 #: The canonical diff's identity. Change the argv below only with a new version: old rows name the one
 #: they were hashed with, and `recreate_diff` refuses an argv that is not the one its spec names.
 DIFF_SPEC = "git-diff/1"
@@ -128,7 +130,14 @@ def _stream(
     Blocking, so callers on the event loop use `asyncio.to_thread`. The output is never held whole here:
     a diff of a large change is the point. stderr goes to a temporary file, not a pipe that could fill
     while stdout is being read.
+
+    A sealed project's repository has its config sanitised first (`_seal_git.prepare`): `status` runs a
+    `filter.*.clean` driver, which the argv's `-c` options cannot switch off.
     """
+    _seal_git.prepare(cwd)
+    base_env = dict(env) if env is not None else _git_env()
+    # An armed repository is addressed by `GIT_DIR`, so a bare repository at its root is not what git uses.
+    env_for_git = _seal_git.harness_env(cwd, base_env) or base_env
     try:
         with tempfile.TemporaryFile() as stderr:
             proc = subprocess.Popen(
@@ -137,7 +146,7 @@ def _stream(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
-                env=dict(env) if env is not None else _git_env(),
+                env=env_for_git,
                 start_new_session=True,
             )
             timed_out = threading.Event()
@@ -223,7 +232,10 @@ async def _diff_sha256(repo: Path, base: str, head: str) -> tuple[str | None, st
 
 def _worktree_clean_sync(repo: Path) -> bool | None:
     seen: list[bytes] = []
-    if _stream(list(_STATUS_ARGV), repo, _STATUS_TIMEOUT_S, seen.append):
+    argv = list(_STATUS_ARGV)
+    if _seal_git.is_armed(repo):
+        argv.append(_seal_git.SUBMODULES_OFF)  # a nested repository's own config is not the harness's to read
+    if _stream(argv, repo, _STATUS_TIMEOUT_S, seen.append):
         return None
     return not seen
 

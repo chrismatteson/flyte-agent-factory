@@ -1,7 +1,8 @@
-"""The profile's `[gardening]` and `[judgement]` tables: what it sets for gardening and the judge."""
+"""The profile's `[gardening]`, `[judgement]` and `[seal]` tables."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,30 @@ class Gardening:
     max_days_between: int = 7
     escalate_on_regression: bool = True
     max_open_issues: int = 10
+
+
+@dataclass(frozen=True)
+class Seal:
+    """Where sealed benchmark projects live: `[seal] workspace_repo = "owner/name"`, the empty benchmark repo.
+
+    Never the regular workspace repo: its history holds earlier attempts a sealed project must not see.
+    """
+
+    workspace_repo: str = ""
+
+
+_OWNER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def parse_seal(table: Mapping[str, Any]) -> Seal:
+    """Parse `[seal]`: only `workspace_repo`, as `owner/name`."""
+    unknown = sorted(set(table) - set(Seal.__dataclass_fields__))
+    if unknown:
+        raise PolicyError(f"unknown key(s) in [seal]: {', '.join(unknown)}")
+    repo = table.get("workspace_repo", "")
+    if not isinstance(repo, str) or (repo and not _OWNER_NAME.fullmatch(repo)):
+        raise PolicyError(f"[seal] workspace_repo must be owner/name, got {repo!r}")
+    return Seal(workspace_repo=repo)
 
 
 @dataclass(frozen=True)

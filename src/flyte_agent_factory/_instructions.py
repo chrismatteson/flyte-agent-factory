@@ -17,6 +17,7 @@ from flyte_agent_factory import (
     _target_ci,
 )
 from flyte_agent_factory._reserved import list_owner_reserved
+from flyte_agent_factory._seal_spec import SealSpec
 from flyte_agent_factory.browser import personal_guidance
 
 #: The paths no `May edit:` line can grant; the gate's scope check blocks them whatever the brief says.
@@ -26,8 +27,11 @@ _SCOPE_NEVER_EDIT = (
 )
 
 
-def _push_command(branch: str, default_branch: str) -> str:
+def _push_command(branch: str, default_branch: str, sealed: bool = False) -> str:
     """Return the line the session is told to run to bring in the remote and push.
+
+    A sealed session cannot fetch (its only way out is a push route), and its clone holds nothing to merge:
+    it is told the plain push.
 
     On a project branch this merges and never rebases or forces: a rebase rewrites pushed commits
     and then needs a force-push, which can discard work a human or an earlier pod pushed to the
@@ -35,6 +39,8 @@ def _push_command(branch: str, default_branch: str) -> str:
     from a detached HEAD or from the default branch. `--prune` drops `origin/<branch>` once the
     branch is deleted on the remote (a merged PR), so the push then recreates it.
     """
+    if sealed:
+        return f"git push -u origin HEAD:refs/heads/{branch}"
     if branch:
         return (
             f"git fetch --prune origin && (! git rev-parse -q --verify origin/{branch} >/dev/null "
@@ -222,6 +228,67 @@ def _context_hygiene_note(delegation_available: bool) -> str:
     )
 
 
+def _stale_clone_note(sealed: SealSpec | None, branch: str, push_command: str, scoped: bool) -> str:
+    """Return the bullet that says how to push: bring the remote in first, or (sealed) just push.
+
+    `scoped` is whether the project has a `May edit:` scope (a root or workspace layout).
+    """
+    if sealed is not None:
+        return (
+            "- **Push with the one command below.** Your clone is the only copy of the repo you can see and "
+            "nothing can be fetched (there is no route to the remote but this push), so there is nothing to "
+            "merge first:\n"
+            "  ```sh\n"
+            f"  {push_command}\n"
+            "  ```\n"
+            "  **Check that the push succeeded**: `git rev-list --count @{u}..HEAD` is 0 when the remote "
+            "actually has it.\n"
+        )
+    return (
+        "- **Your clone goes stale, because other runs push to the same repo.** You cloned once, "
+        "at the start, possibly days ago; other projects have pushed since. A plain `git push` is "
+        "then rejected as a non-fast-forward, and the rejection is easy to miss if you are "
+        "looking at the commit rather than the push. "
+        + (
+            "Bring the remote in first, every time, by merging, so that work already on the remote "
+            "is never discarded; the push writes only this branch:\n"
+            if branch
+            else "Rebase onto the remote first, every time:\n"
+        )
+        + "  ```sh\n"
+        f"  {push_command}\n"
+        "  ```\n"
+        + (
+            f"  If the {'merge' if branch else 'rebase'} conflicts, keep upstream for anything outside "
+            "your `May edit:` paths, and do not resolve by overwriting someone else's work. "
+            if scoped
+            else f"  If the {'merge' if branch else 'rebase'} conflicts, it will be in a directory that is "
+            "not yours -- keep theirs, keep your own directory, and do not resolve by overwriting "
+            "someone else's work. "
+        )
+        + "**Check "
+        "that the push succeeded**: `git rev-list --count @{u}..HEAD` is 0 when the remote "
+        "actually has it. One run reported its work committed, which was true, while nothing had "
+        "left the pod at all.\n"
+    )
+
+
+def _sealed_note(sealed: SealSpec, task_dir: str) -> str:
+    """Return the "Sealed run" bullet: what this run can reach (a backstop, not the mechanism)."""
+    cutoff = sealed.index_cutoff[:10]
+    return (
+        f"- **Sealed run.** The task repository is at `{task_dir}/`, at its base commit and nothing "
+        "else. The network is limited to the model API, the package index (frozen at "
+        f"{cutoff}, and the task's own project is blocked) and the push above; web tools are off. "
+        "Child actions and the Flyte API are unavailable here: use `delegate` for work in parallel "
+        "(its workers are sealed too, and get the task repository). A worker's edits inside "
+        f"`{task_dir}/` come back as a separate `task.patch`, whose path `delegate wait` prints: apply it "
+        f"with `git -C {task_dir} apply --3way <path>`; the main patch holds everything else. "
+        "Every tool call is recorded and audited, so do not look for the "
+        "upstream fix or tests: a run that does is void.\n"
+    )
+
+
 def _project_memory(
     browser_enabled: bool,
     *,
@@ -237,6 +304,7 @@ def _project_memory(
     engine: str = "claude",
     personal_browsers: Sequence[str] = (),
     folder: str | None = None,
+    sealed: SealSpec | None = None,
 ) -> str:
     root = layout == "root"
     workspace = layout == "workspace"
@@ -248,7 +316,7 @@ def _project_memory(
         or bool(_session_config._demo_kind)
         or _context_guard.wants_demo(_session_config._project_brief)
     )
-    push_command = _push_command(branch, default_branch)
+    push_command = _push_command(branch, default_branch, sealed is not None)
     branch_note = (
         f"- **You work on the branch `{branch}`, not on `{default_branch}`.** Commit and push there and "
         f"never push to `{default_branch}`. When you declare DONE the supervisor opens a draft pull "
@@ -372,6 +440,7 @@ def _project_memory(
     folder = _session_config._project_folder if folder is None else folder  # the launch's, unless named
     checks = _session_config._checks_rel(name, layout, folder)
     project_rel = _gate_base.project_rel(name, layout, folder)
+    task_dir = os.path.normpath(f"{project_rel}/{sealed.task_dir}") if sealed is not None else ""
     delivery_note = (
         "- **This project delivers to another repo, so two criteria are always on that list:** "
         '"target repo CI green locally (the commands `factory:target-ci` runs)" and "100% branch '
@@ -499,34 +568,11 @@ def _project_memory(
         "whenever you finish something you would not want to redo -- do not save it all for the "
         "end.\n"
         f"{branch_note}"
-        "- **Your clone goes stale, because other runs push to the same repo.** You cloned once, "
-        "at the start, possibly days ago; other projects have pushed since. A plain `git push` is "
-        "then rejected as a non-fast-forward, and the rejection is easy to miss if you are "
-        "looking at the commit rather than the push. "
-        + (
-            "Bring the remote in first, every time, by merging, so that work already on the remote "
-            "is never discarded; the push writes only this branch:\n"
-            if branch
-            else "Rebase onto the remote first, every time:\n"
-        )
-        + "  ```sh\n"
-        f"  {push_command}\n"
-        "  ```\n"
-        + (
-            f"  If the {'merge' if branch else 'rebase'} conflicts, keep upstream for anything outside "
-            "your `May edit:` paths, and do not resolve by overwriting someone else's work. "
-            if root or workspace
-            else f"  If the {'merge' if branch else 'rebase'} conflicts, it will be in a directory that is "
-            "not yours -- keep theirs, keep your own directory, and do not resolve by overwriting "
-            "someone else's work. "
-        )
-        + "**Check "
-        "that the push succeeded**: `git rev-list --count @{u}..HEAD` is 0 when the remote "
-        "actually has it. One run reported its work committed, which was true, while nothing had "
-        "left the pod at all.\n"
+        f"{_stale_clone_note(sealed, branch, push_command, root or workspace)}"
         "- **Stay in this run.** Do not call `flyte run`, `flyte deploy` or `flyte serve`; they are "
         "blocked. Everything below runs *inside* this run as a child action, which is what you "
         "want.\n"
+        f"{_sealed_note(sealed, task_dir) if sealed is not None else ''}"
         f"{browser_note}"
         + (
             f"- **This project works at the repository root.** The repo is one codebase, not a shared "
@@ -733,15 +779,20 @@ def _project_memory(
         "Flyte literal type blob` means you omitted it). And `description` is capped at 255 "
         "characters. Read `attrs` before trusting an artifact's contents: whoever published it "
         "may have recorded that part of it is suspect.\n\n"
-        "**Delegating a whole chunk of work** goes to a sub-agent, which is also a child action "
-        "with its own logs:\n\n"
-        "```python\n"
-        "from flyte_agent_factory.agent import subagent\n"
-        "summary, artifacts = await subagent(brief='...', role='verify', workdir=None)\n"
-        "```\n\n"
-        "Nothing it produces is merged automatically -- you review and take what you want. "
-        "A sub-agent's action is not yours to abort; ask it to finish instead.\n"
-        f"{api_key_note}"
+        + (
+            "**Delegating a whole chunk of work** goes to a sub-agent: use `delegate`. Nothing a "
+            "sub-agent produces is merged automatically -- you review and take what you want.\n"
+            if sealed is not None
+            else "**Delegating a whole chunk of work** goes to a sub-agent, which is also a child action "
+            "with its own logs:\n\n"
+            "```python\n"
+            "from flyte_agent_factory.agent import subagent\n"
+            "summary, artifacts = await subagent(brief='...', role='verify', workdir=None)\n"
+            "```\n\n"
+            "Nothing it produces is merged automatically -- you review and take what you want. "
+            "A sub-agent's action is not yours to abort; ask it to finish instead.\n"
+        )
+        + f"{api_key_note}"
         f"{recording_note}"
     )
 

@@ -51,6 +51,7 @@ from flyte_agent_factory import (  # noqa: E402 -- must follow select_from_argv(
     _factory_policy,
     _meter,
     _queue,
+    _seal_launch,
     _state_store,
     _union_identity,
 )
@@ -103,8 +104,10 @@ def launch(args: argparse.Namespace) -> None:
     policy = _factory_policy.normalize_policy(policy)
     brief = Path(args.brief).read_text()
     model = getattr(args, "model", "")
+    # Parsed here, before anything starts: a bad spec fails the launch, not a run that is queued for it.
+    seal = _seal_launch.spec_from_file(args.seal) if getattr(args, "seal", "") else ""
     # Refuse what will be refused before the watcher exists: a refused launch starts nothing.
-    _factory.prepare_launch(brief, args.name, model, "", args.demo, policy)
+    _factory.prepare_launch(brief, args.name, model, "", args.demo, policy, seal=seal)
     # Structural, not a habit: the watcher that reports open questions starts
     # *before* the run exists (run 2 sat blocked on the operator for 40 minutes),
     # so no failure part-way through a launch can leave a live run unwatched.
@@ -115,7 +118,14 @@ def launch(args: argparse.Namespace) -> None:
     print(f"watcher pid {pid}; log {watch.LOG}  (attach a Monitor to it)", flush=True)
     try:
         result = _factory.launch_project(
-            brief, args.name, model, "", args.demo, policy, priority=getattr(args, "priority", "normal")
+            brief,
+            args.name,
+            model,
+            "",
+            args.demo,
+            policy,
+            priority=getattr(args, "priority", "normal"),
+            seal=seal,
         )
     except ValueError as e:
         # A past run: under /opt/venv the client cannot rebuild the task's
@@ -527,6 +537,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         choices=_queue.PRIORITIES,
         default="normal",
         help="low starts only when nothing else waits; expedite goes first",
+    )
+    s.add_argument(
+        "--seal",
+        metavar="FILE.toml",
+        default="",
+        help="run sealed: no network but the model API, a date-frozen package index and push to the "
+        "benchmark workspace repo (docs/sealed-runs.md); needs [seal] workspace_repo in the profile",
     )
     s.set_defaults(fn=launch)
     s = sub.add_parser("queue", parents=[profile_arg])

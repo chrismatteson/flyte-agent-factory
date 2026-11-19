@@ -30,12 +30,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import html
 import json
 import os
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -67,7 +65,6 @@ from flyte_agent_factory import (
     _issue_file,
     _issues,
     _judgement,
-    _meter,
     _names,
     _policy,
     _profile,
@@ -77,6 +74,9 @@ from flyte_agent_factory import (
     _review,
     _reviewer,
     _router,
+    _seal_plain,
+    _seal_session,
+    _seal_subagent,
     _session_config,
     _session_log,
     _session_setup,
@@ -242,6 +242,7 @@ env = flyte.TaskEnvironment(
         "_factory_status.py",
         "_grants_cli.py",
         "_lane_shards.py",
+        "_seal_launch.py",
         "_tick_guard.py",
         # The gate launches this by name; importing it would also register its task environment.
         "_slow_lane.py",
@@ -372,10 +373,14 @@ async def project(
     issue: str = "",
     hard_pin: bool = False,
     engine: str = "",
+    seal: str = "",
 ) -> tuple[str, Dir]:
     """Run a Claude Code project for as long as it takes.
 
     Args:
+        seal: A canonical seal spec (`SealSpec.to_json`) makes this a sealed run: the author and every
+            sub-agent run without a route to anything but the model API, a frozen package index and the push.
+            Empty is an ordinary project. Set only by the operator's launch (`docs/sealed-runs.md`).
         engine: `claude` or `codex` pins the engine the author session runs on. Empty uses the profile's
             `COORDINATOR_ENGINE` policy, else the router's choice among the engines the slot has a token for.
         hard_pin: Wait for pinned engines instead of moving benchmark arms to another engine.
@@ -513,6 +518,10 @@ async def project(
     os.environ["AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE"] = author_engine
     if previous_owner := _author._record_author_choice(author_engine, state.resumed, timeline):
         await _author._queue_resume_handoff(previous_owner, author_engine, brief, timeline)
+    _seal_session.end()  # the seal of an earlier project run by this process
+    if seal:
+        browser = False  # a browser is a way out
+        _seal_session.begin(seal, author_engine, _session_setup._push_token_path())
     if author_engine == "codex":
         setting = _policy.resolve_codex("author", warn=timeline.row)
         model = (
@@ -545,7 +554,11 @@ async def project(
         # from anywhere, durable across restarts. Nobody is assumed to be watching,
         # so forwarded dialogs expire into their default rather than hold the session.
         mode = permission_mode or _AUTO_PERMISSION_MODE
-        write_settings(_session_config.CONFIG_DIR, hold_dialogs=False, extra=_context_guard.settings_extra())
+        write_settings(
+            _session_config.CONFIG_DIR,
+            hold_dialogs=False,
+            extra=_seal_session.settings_extra(_context_guard.settings_extra()),
+        )
         mark_trusted(_session_config.CONFIG_DIR, _session_config.WORKSPACE)
 
     # --- workspace ------------------------------------------------------ #
@@ -611,6 +624,7 @@ async def project(
             branch_problem=_session_setup._branch_sync_problem,
             engine=author_engine,
             personal_browsers=gate.identities if gate else (),
+            sealed=_session_config._seal,
         ),
     )
     if author_engine == "codex":
@@ -694,6 +708,7 @@ async def project(
         max_jobs=delegate_limit(timeline.row),
         setting=_session_setup._delegate_setting,
         reattach=_session_setup._delegate_reattach(timeline),
+        task_dir=_seal_session.task_dir_rel(_session_config._seal),
     )
     timeline.delegations = delegations
     ci_status = CiStatus(BRIDGE_DIR, lambda: _session_setup._pr, timeline.row)
@@ -751,6 +766,7 @@ async def project(
     except BaseException:
         inbox.cancel()
         credentials.close()
+        _seal_session.end()
         raise
     if len(_usage._author_engines()) > 1:
         if not state.resumed:
@@ -946,6 +962,7 @@ async def project(
         credentials.close()  # before the final checkpoint: nothing of a grant outlives the project
         # A clean exit or crash can also leave background tools writing into the workspace.
         await _inbox._stop_author(proc, timeline)
+        _seal_session.end()  # before the final checkpoint, so the record it carries is complete
         if not waiter.done():
             waiter.cancel()
             await asyncio.gather(waiter, return_exceptions=True)
@@ -1039,6 +1056,8 @@ async def subagent(
     routed: bool = False,
     hard_pin: bool = False,
     partial_base: str = "",
+    seal: str = "",
+    seal_role: str = "",
 ) -> tuple[str, Dir]:
     """Return a nested Claude Code or Codex session in its own container, as a child action.
 
@@ -1073,6 +1092,10 @@ async def subagent(
         partial_base: A delegation's base commit in `repo/` of the workdir. When a Claude session ends at
             `max_turns`, the sub-agent still returns, with `factory.partial.patch` (a diff against this
             commit) and `plan.md` (what remains) in the workspace, instead of failing and losing the work.
+        seal: A sealed project's `SealSpec` (JSON): the engine runs sealed and the record of its role comes
+            back in the returned `Dir` under `.seal-record/`. A call without one from a sealed project is
+            refused.
+        seal_role: The role id the caller registered for this call (`_seal_role.register_subagent`).
         role: One of the roles in `_assets/agents` -- `scope`, `discover`, `prototype`, `shape`,
             `build`, `verify`, or an old name (`product`, `designer`, `dev`, `qa`). Passed to Claude
             Code as `--agent`, which is its own mechanism for this; empty runs a general-purpose session.
@@ -1081,6 +1104,7 @@ async def subagent(
     import flyte.report
 
     _unprivileged.refuse_root("a sub-agent")
+    spec = _seal_subagent.check_call(seal)  # before anything starts: a refused call must not start anything
     _auth.set_non_dumpable()  # as in `project`: the sub-agent's children cannot read this process's secrets
     _union_identity.establish()
     route_blob = None
@@ -1108,67 +1132,45 @@ async def subagent(
         )
     engine = engine or "claude"
 
-    # Per-invocation paths. `reusable` shares the container *and* the Python
-    # process between concurrent sub-agents, so a fixed path here would let two
-    # of them overwrite each other's workspace and cross-wire their questions.
-    slot = tempfile.mkdtemp(prefix="subagent-")
-    base = Path(slot)
-    work = base / "workspace"
-    work.mkdir(parents=True, exist_ok=True)
-
-    if workdir is not None:
-        await _checkpoint._download_workspace(workdir, work)
-    elif repo:
-        await _session_setup._clone(repo, branch, work)
+    base, work = await _subagent_run._subagent_workspace(workdir, repo, branch)
     # So the sub-agent can stop the child actions it starts (`python -m flyte_agent_factory.child abort`,
     # which reads the context from where it runs). `.flyte/` is a harness path, so git leaves it out.
     # A local call is in no task and has no run to join.
-    if flyte.ctx():
+    # A sealed role cannot reach the Flyte API, and the context file holds what could.
+    if flyte.ctx() and spec is None:
         write_context(work)
+    sealed = _seal_subagent.SubagentSeal(spec, seal_role, base, work) if spec else None
 
     # Each refusal excludes an engine, so this makes at most two CLI attempts.
     while True:
         try:
-            config_dir = base / "claude"
+            config_dir = sealed.config_dir("claude") if sealed else base / "claude"
             bridge_dir = base / "bridge"
 
             if engine == "codex":
-                # The same setup as the Claude path -- the brief written, the harness excluded, the
-                # bridge up -- before Codex starts. Returning before it left Codex with no brief, or a
-                # parent's stale one, and no `ask-human` (found by Codex reviewing this very change).
-                _session_setup._exclude_harness(work)
-                (work / _session_config._BRIEF_FILE).parent.mkdir(parents=True, exist_ok=True)
-                (work / _session_config._BRIEF_FILE).write_text(brief.strip() + "\n")
-                bridge = Bridge(ensure_dirs(bridge_dir))
-                _session_setup._install_bridge_commands()
-                bridge_task = asyncio.create_task(bridge.run(), name="subagent-bridge")
-                try:
-                    summary = await _subagent_run._run_codex(
-                        work,
-                        base,
-                        brief,
-                        answer_only=answer_only,
-                        role=role,
-                        model=model,
-                        effort=effort,
-                        extra_env={
-                            **_session_setup._session_env(_session_setup._export_runtime_env()),
-                            "AGENT_FACTORY_WORKSPACE": str(work),
-                            "AGENT_FACTORY_BRIDGE_DIR": str(bridge_dir),
-                        },
-                    )
-                finally:
-                    bridge_task.cancel()
-                    await asyncio.gather(bridge_task, return_exceptions=True)
+                summary = await _subagent_run._run_codex_session(
+                    work,
+                    base,
+                    bridge_dir,
+                    brief,
+                    sealed=sealed,
+                    role=role,
+                    model=model,
+                    effort=effort,
+                    answer_only=answer_only,
+                )
                 return await _subagent_run._subagent_result(
                     summary, route_blob, routes=routes, refusals=refusals, unusable=unusable
-                ), await Dir.from_local(str(work))
+                ), await _seal_subagent.result_dir(sealed, work)
 
             if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
                 raise RuntimeError(
                     "no Claude setup-token available for the sub-agent ([secrets] claude_token)"
                 )
-            write_settings(config_dir, hold_dialogs=False)
+            jail = sealed.open("claude", config_dir) if sealed else None
+            write_settings(
+                config_dir, hold_dialogs=False, extra=_seal_subagent.claude_settings(jail) if jail else None
+            )
             mark_trusted(config_dir, work)
 
             _session_setup._exclude_harness(work)
@@ -1215,6 +1217,7 @@ async def subagent(
                 "CLAUDE_CONFIG_DIR": str(config_dir),
                 "AGENT_FACTORY_WORKSPACE": str(work),
                 "AGENT_FACTORY_BRIDGE_DIR": str(bridge_dir),
+                **(jail.env if jail else {}),
             }
 
             try:
@@ -1225,7 +1228,7 @@ async def subagent(
                 ):
                     proc = await _unprivileged.spawn(
                         "a Claude Code sub-agent",
-                        *argv,
+                        *(jail.wrap(argv) if jail else argv),
                         cwd=str(work),
                         env=child_env,
                         stdout=asyncio.subprocess.PIPE,
@@ -1233,70 +1236,31 @@ async def subagent(
                         pass_fds=pass_fds,
                     )
                 raw, err = await proc.communicate()
+                if sealed:
+                    sealed.exit_code = proc.returncode
             finally:
                 bridge_task.cancel()
                 await asyncio.gather(bridge_task, return_exceptions=True)
 
-            stderr = err.decode(errors="replace")
-            try:
-                payload = json.loads(raw.decode(errors="replace"))
-            except ValueError:
-                payload = {}
-            observed = _meter.from_claude_events([payload], _session_config._claude_account())
-            if observed:
-                if observed.limited_until:
-                    observed.limited_until = _usage._keep_later_reset(
-                        str(payload.get("result") or ""), observed.limited_until
-                    )
-                try:
-                    await flyte.report.log.aio(_meter.report_comment(observed), do_flush=True)
-                except (*_usage._METER_ERRORS, *REMOTE_ERRORS, RuntimeError) as exc:
-                    _timeline._log_line(f"[meter] claude: {type(exc).__name__}", err=True)
-            if partial_base and not answer_only and payload.get("subtype") == "error_max_turns":
-                # Checked before the exit code: the CLI exits non-zero at the turn limit.
-                summary = await _subagent_run._partial_handback(
-                    work,
-                    partial_base,
-                    max_turns,
-                    payload,
-                    functools.partial(
-                        _subagent_run._ask_remaining_work, argv[0], work, env, payload, model, effort
-                    ),
-                )
-                return await _subagent_run._subagent_result(
-                    summary + _usage._usage_trailer(raw.decode(errors="replace")),
-                    route_blob,
-                    routes=routes,
-                    refusals=refusals,
-                    unusable=unusable,
-                ), await Dir.from_local(str(work))
-            if proc.returncode != 0:
-                # A usage-limit refusal exits 1 with the result JSON on stdout: name it as such.
-                _subagent_run._raise_on_cli_error(raw.decode(errors="replace"), only_limit=True)
-                if not payload and 0 < (proc.returncode or 0) < 128:  # it never started; a signal is a crash
-                    raise _unprivileged.no_result_error(proc.returncode, raw.decode(errors="replace"), stderr)
-                # stdout too: `claude -p` puts its own errors there, not on stderr.
-                raise RuntimeError(
-                    f"sub-agent exited {proc.returncode}.\n"
-                    f"stdout: {raw.decode(errors='replace')[-1500:] or '(empty)'}\n"
-                    f"stderr: {stderr[-1500:] or '(empty)'}"
-                )
-
-            _subagent_run._raise_on_cli_error(raw.decode(errors="replace"))
-            summary = _subagent_run._final_text(raw.decode(errors="replace")) or _reviewer._NO_FINAL_MESSAGE
-            await flyte.report.log.aio(
-                f"<h3>Sub-agent{f' · {html.escape(role)}' if role else ''}</h3>"
-                f"<pre>{html.escape(brief[:1000])}</pre><hr><pre>{html.escape(summary[:4000])}</pre>",
-                do_flush=True,
+            summary = await _subagent_run._claude_summary(
+                raw,
+                err,
+                proc.returncode,
+                work,
+                argv,
+                env,
+                brief=brief,
+                role=role,
+                model=model,
+                effort=effort,
+                max_turns=max_turns,
+                answer_only=answer_only,
+                partial_base=partial_base,
+                jail=jail,
             )
-            # Added after the report log so the log stays clean; `_call_reviewer` strips it.
             return await _subagent_run._subagent_result(
-                summary + _usage._usage_trailer(raw.decode(errors="replace")),
-                route_blob,
-                routes=routes,
-                refusals=refusals,
-                unusable=unusable,
-            ), await Dir.from_local(str(work))
+                summary, route_blob, routes=routes, refusals=refusals, unusable=unusable
+            ), await _seal_subagent.result_dir(sealed, work)
 
         except flyte.errors.NonRecoverableError:
             raise  # a RuntimeError too, but never a usage limit to reroute
@@ -1320,13 +1284,38 @@ async def subagent(
                 if handback is not None:
                     return await _subagent_run._subagent_result(
                         handback, route_blob, routes=routes, refusals=refusals, unusable=unusable
-                    ), await Dir.from_local(str(work))
+                    ), await _seal_subagent.result_dir(sealed, work)
             if deferred is not None:
                 raise deferred from exc
             raise
+        finally:
+            if sealed:  # after a result its record is already bundled; this closes an attempt that failed
+                sealed.close(failed=True)
 
 
 _reviewer.subagent_task = subagent
+
+
+@subagent_env.task(report=True)
+async def sealed_plain(
+    brief: str,
+    seal: str,
+    engine: str = "claude",
+    model: str = "",
+    max_turns: int = 200,
+) -> tuple[str, Dir]:
+    """Return the final message and work dir of one bare, sealed engine session: the benchmark's plain arm.
+
+    The task repo is snapshotted into `<work>/<spec.task_dir>`; the engine gets `brief` as its prompt and no
+    factory memory, roles or bridge. The returned `Dir` holds the work dir, `model.patch` (the task repo's
+    diff against its base commit) and `.seal-record/` (the manifest and the role, for the audit).
+    """
+    _unprivileged.refuse_root("the plain arm")
+    _auth.set_non_dumpable()  # as in `subagent`
+    _union_identity.establish()
+    return await _seal_plain.run(brief, seal, engine, model, max_turns)
+
+
 _author.project_task = project
 _gcp_setting = _gcp.setting
 

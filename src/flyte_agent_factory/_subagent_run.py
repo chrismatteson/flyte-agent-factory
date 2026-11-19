@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import html
 import json
 import os
 import subprocess
+import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +21,7 @@ import flyte.errors
 import flyte.remote
 import flyte.report
 import flyte.sandbox
+from flyte.io import Dir
 
 from flyte_agent_factory import (
     _auth,
@@ -27,8 +31,12 @@ from flyte_agent_factory import (
     _meter,
     _names,
     _policy,
+    _reviewer,
     _roles,
     _router,
+    _seal_guard,
+    _seal_role,
+    _seal_subagent,
     _session_config,
     _session_setup,
     _timeline,
@@ -36,6 +44,8 @@ from flyte_agent_factory import (
     _usage,
 )
 from flyte_agent_factory._bridge import (
+    Bridge,
+    ensure_dirs,
     redact_tokens,
 )
 
@@ -195,7 +205,14 @@ _PLAN_PROMPT = (
 
 
 async def _ask_remaining_work(
-    claude: str, work: Path, env: dict[str, str], payload: dict[str, Any], model: str, effort: str
+    claude: str,
+    work: Path,
+    env: dict[str, str],
+    payload: dict[str, Any],
+    model: str,
+    effort: str,
+    *,
+    launcher: Sequence[str] = (),
 ) -> str:
     """Return the worker's own plan for what remains: one short `--resume` turn on its session."""
     session = payload.get("session_id")
@@ -205,6 +222,7 @@ async def _ask_remaining_work(
     with _auth.token_fd(env, os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()) as (child_env, pass_fds):
         proc = await _unprivileged.spawn(
             "a Claude Code sub-agent",
+            *launcher,  # a sealed worker's follow-up turn is inside the same seal
             claude,
             "-p",
             _PLAN_PROMPT,
@@ -217,6 +235,7 @@ async def _ask_remaining_work(
             "2",
             "--permission-mode",
             "bypassPermissions",
+            *(_seal_guard.cli_deny_args() if launcher else ()),
             cwd=str(work),
             env=child_env,
             stdin=asyncio.subprocess.DEVNULL,
@@ -397,23 +416,8 @@ def _codex_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
     return total
 
 
-async def _run_codex(
-    work: Path,
-    base: Path,
-    brief: str,
-    *,
-    answer_only: bool,
-    role: str,
-    model: str,
-    effort: str = "medium",
-    extra_env: dict[str, str] | None = None,
-) -> str:
-    """Run one Codex sub-agent in `work`; its final message, plus the usage trailer.
-
-    Same contract as the Claude path: the brief is in `.claude-flyte/BRIEF.md`, the house rules
-    in `AGENTS.md` (Codex's CLAUDE.md), a role file prepended when one is named. A usage-limit
-    refusal raises with USAGE_LIMIT_MARK so the caller waits or falls back like any limit.
-    """
+async def _codex_home(base: Path) -> Path:
+    """Return a private `CODEX_HOME` for the sub-agent working under `base`, logged in with its credential."""
     credential = os.environ.get(_session_config.CODEX_TOKEN_ENV_VAR, "").strip()
     if not credential:
         raise RuntimeError(
@@ -438,6 +442,28 @@ async def _run_codex(
         _auth.write_private(home / "auth.json", _codex_auth.strip_refresh_token(credential))
     else:
         await asyncio.to_thread(_author._login_with_access_token, home, credential)
+    return home
+
+
+async def _run_codex(
+    work: Path,
+    base: Path,
+    brief: str,
+    *,
+    answer_only: bool,
+    role: str,
+    model: str,
+    effort: str = "medium",
+    extra_env: dict[str, str] | None = None,
+    sealed: _seal_subagent.SubagentSeal | None = None,
+) -> str:
+    """Run one Codex sub-agent in `work`; its final message, plus the usage trailer.
+
+    Same contract as the Claude path: the brief is in `.claude-flyte/BRIEF.md`, the house rules
+    in `AGENTS.md` (Codex's CLAUDE.md), a role file prepended when one is named. A usage-limit
+    refusal raises with USAGE_LIMIT_MARK so the caller waits or falls back like any limit.
+    """
+    home = await _codex_home(base)
     _session_setup._write_managed_block(work / "AGENTS.md", _subagent_memory(answer_only=answer_only))
     role_text = ""
     if role:
@@ -461,6 +487,7 @@ async def _run_codex(
         f"did."
     )
     last = base / "codex-last.txt"
+    jail = sealed.open("codex", home) if sealed else None
     argv = [
         "codex",
         "exec",
@@ -482,11 +509,17 @@ async def _run_codex(
     if model:
         argv += ["-m", model]
     # After `--`: a prompt starting with "-" (a role file's `---` header did) was read as an option.
+    if jail:
+        argv += _seal_role.CODEX_TOOLS_OFF_ARGS
     argv += ["--", prompt]
-    env = {**_session_setup._session_env({**os.environ, **(extra_env or {})}), "CODEX_HOME": str(home)}
+    env = {
+        **_session_setup._session_env({**os.environ, **(extra_env or {})}),
+        "CODEX_HOME": str(home),
+        **(jail.env if jail else {}),
+    }
     proc = await _unprivileged.spawn(
         "a Codex sub-agent",
-        *argv,
+        *(jail.wrap(argv) if jail else argv),
         cwd=str(work),
         env=env,
         stdin=asyncio.subprocess.DEVNULL,  # it otherwise waits for more input on stdin
@@ -494,6 +527,8 @@ async def _run_codex(
         stderr=asyncio.subprocess.PIPE,
     )
     out, err = await proc.communicate()
+    if sealed:
+        sealed.exit_code = proc.returncode
     stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
     events: list[Any] = []  # parsed JSON lines
     for line in stdout.splitlines():
@@ -574,3 +609,144 @@ def _subagent_memory(answer_only: bool = False) -> str:
         + hand_back
         + "- You cannot spin off further jobs. Finish your slice and report back.\n"
     )
+
+
+async def _run_codex_session(
+    work: Path,
+    base: Path,
+    bridge_dir: Path,
+    brief: str,
+    *,
+    sealed: Any,
+    role: str,
+    model: str,
+    effort: str,
+    answer_only: bool,
+) -> str:
+    """Run one Codex sub-agent session, with the brief written, the harness excluded and the bridge up.
+
+    The same setup as the Claude path before Codex starts. Returning without it left Codex with no brief,
+    or a parent's stale one, and no `ask-human` (found by Codex reviewing this very change).
+    """
+    _session_setup._exclude_harness(work)
+    (work / _session_config._BRIEF_FILE).parent.mkdir(parents=True, exist_ok=True)
+    (work / _session_config._BRIEF_FILE).write_text(brief.strip() + "\n")
+    bridge = Bridge(ensure_dirs(bridge_dir))
+    _session_setup._install_bridge_commands()
+    bridge_task = asyncio.create_task(bridge.run(), name="subagent-bridge")
+    try:
+        return await _run_codex(
+            work,
+            base,
+            brief,
+            answer_only=answer_only,
+            role=role,
+            model=model,
+            effort=effort,
+            sealed=sealed,
+            extra_env={
+                **_session_setup._session_env(_session_setup._export_runtime_env()),
+                "AGENT_FACTORY_WORKSPACE": str(work),
+                "AGENT_FACTORY_BRIDGE_DIR": str(bridge_dir),
+            },
+        )
+    finally:
+        bridge_task.cancel()
+        await asyncio.gather(bridge_task, return_exceptions=True)
+
+
+async def _report_claude_meter(payload: dict[str, Any]) -> None:
+    """Log the usage meter a Claude result carries to the report; a failure to log is only noted."""
+    observed = _meter.from_claude_events([payload], _session_config._claude_account())
+    if observed:
+        if observed.limited_until:
+            observed.limited_until = _usage._keep_later_reset(
+                str(payload.get("result") or ""), observed.limited_until
+            )
+        try:
+            await flyte.report.log.aio(_meter.report_comment(observed), do_flush=True)
+        except (*_usage._METER_ERRORS, *REMOTE_ERRORS, RuntimeError) as exc:
+            _timeline._log_line(f"[meter] claude: {type(exc).__name__}", err=True)
+
+
+async def _claude_summary(
+    raw: bytes,
+    err: bytes,
+    returncode: int | None,
+    work: Path,
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    brief: str,
+    role: str,
+    model: str,
+    effort: str,
+    max_turns: int,
+    answer_only: bool,
+    partial_base: str,
+    jail: Any,
+) -> str:
+    """Return the text a finished `claude -p` sub-agent leaves, or raise the error its exit stands for."""
+    out = raw.decode(errors="replace")
+    stderr = err.decode(errors="replace")
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        payload = {}
+    await _report_claude_meter(payload)
+    if partial_base and not answer_only and payload.get("subtype") == "error_max_turns":
+        # Checked before the exit code: the CLI exits non-zero at the turn limit.
+        summary = await _partial_handback(
+            work,
+            partial_base,
+            max_turns,
+            payload,
+            functools.partial(
+                _ask_remaining_work,
+                argv[0],
+                work,
+                env,
+                payload,
+                model,
+                effort,
+                launcher=jail.argv_prefix if jail else (),
+            ),
+        )
+        return summary + _usage._usage_trailer(out)
+    if returncode != 0:
+        # A usage-limit refusal exits 1 with the result JSON on stdout: name it as such.
+        _raise_on_cli_error(out, only_limit=True)
+        if not payload and 0 < (returncode or 0) < 128:  # it never started; a signal is a crash
+            raise _unprivileged.no_result_error(returncode, out, stderr)
+        # stdout too: `claude -p` puts its own errors there, not on stderr.
+        raise RuntimeError(
+            f"sub-agent exited {returncode}.\n"
+            f"stdout: {out[-1500:] or '(empty)'}\n"
+            f"stderr: {stderr[-1500:] or '(empty)'}"
+        )
+
+    _raise_on_cli_error(out)
+    summary = _final_text(out) or _reviewer._NO_FINAL_MESSAGE
+    await flyte.report.log.aio(
+        f"<h3>Sub-agent{f' · {html.escape(role)}' if role else ''}</h3>"
+        f"<pre>{html.escape(brief[:1000])}</pre><hr><pre>{html.escape(summary[:4000])}</pre>",
+        do_flush=True,
+    )
+    # Added after the report log so the log stays clean; `_call_reviewer` strips it.
+    return summary + _usage._usage_trailer(out)
+
+
+async def _subagent_workspace(workdir: Dir | None, repo: str, branch: str) -> tuple[Path, Path]:
+    """Make this call's scratch directory; fill its `workspace/` from `workdir` or a clone of `repo`."""
+    # Per-invocation paths. `reusable` shares the container *and* the Python
+    # process between concurrent sub-agents, so a fixed path here would let two
+    # of them overwrite each other's workspace and cross-wire their questions.
+    base = Path(tempfile.mkdtemp(prefix="subagent-"))
+    work = base / "workspace"
+    work.mkdir(parents=True, exist_ok=True)
+
+    if workdir is not None:
+        await _checkpoint._download_workspace(workdir, work)
+    elif repo:
+        await _session_setup._clone(repo, branch, work)
+    return base, work

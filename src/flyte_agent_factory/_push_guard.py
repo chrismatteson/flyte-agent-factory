@@ -44,6 +44,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import _seal_git
 from ._bridge import find_credential_shape
 from ._grants import TOKEN_ENV, URL_ENV
 from ._secret_env import GIT_NO_DRIVERS
@@ -91,20 +92,39 @@ def install(
         run_git(checkout, "remote", "set-url", remote, workspace_url)
     else:
         run_git(checkout, "remote", "add", remote, workspace_url)
-    hook = _git_path(checkout, "hooks/pre-push")
     _refuse_other_push_urls(checkout, workspace_url, _git_path(checkout, _REFUSED_DIR))
+    install_hook(checkout, workspace_url, workflows=workflows)
+
+
+def install_hook(checkout: Path, allowed_url: str, *, workflows: bool | None = None) -> None:
+    """Install only the `pre-push` hook: refuse a push to any URL but `allowed_url`, scan what it carries.
+
+    `install` is this plus the remote and the `pushInsteadOf` rewrites. A sealed clone (`_seal_session`)
+    needs the hook alone: it pushes through the seal's proxy route, whose URL its own `pushInsteadOf` sets,
+    and `install`'s rewrites would send that URL to the refused directory. git passes the hook the URL after
+    rewriting, so `allowed_url` is the route there.
+    """
+    hook = _git_path(checkout, "hooks/pre-push")
     hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text(
-        _HOOK.format(
-            url=shlex.quote(workspace_url),
-            scan=(f"{_NO_WORKFLOWS_ENV}=0 " if workflows is False else "")
-            + build_entry_command("flyte_agent_factory._push_guard", "scan_main"),
-        )
+    text = _HOOK.format(
+        url=shlex.quote(allowed_url),
+        scan=(f"{_NO_WORKFLOWS_ENV}=0 " if workflows is False else "")
+        + build_entry_command("flyte_agent_factory._push_guard", "scan_main"),
     )
+    if _seal_git.is_armed(checkout):
+        # The role owns `.git/hooks`: a symlink planted at `pre-push` must be replaced, not written through.
+        _seal_git.replace_file(hook, text.encode(), 0o755, strict_parent=True)
+        return
+    hook.write_text(text)
     hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
 
 
 def _git_path(checkout: Path, name: str) -> Path:
+    # Not `--git-path hooks/...`: a sealed project's harness git runs with `core.hooksPath=/dev/null`
+    # (`_seal_git`), which that would answer with. The hook goes where git looks without that setting.
+    if name.startswith("hooks/") and _seal_git.is_armed(checkout):
+        common = Path(run_git(checkout, "rev-parse", "--git-common-dir").strip())
+        return (common if common.is_absolute() else checkout / common) / name
     path = Path(run_git(checkout, "rev-parse", "--git-path", name).strip())
     return path if path.is_absolute() else checkout / path
 

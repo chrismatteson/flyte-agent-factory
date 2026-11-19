@@ -642,6 +642,7 @@ def test_every_package_module_loads_with_the_agent():
     # via include; `_lane_shards`, its planner, is the gate's too (`_gate_base` reads the CPU quota with it).
     # The `_factory_*` modules are `_factory`'s own and ship with it (the slot env's `include`).
     # `_bootstrap*` is the setup command (ops/bootstrap.py) run from an engine checkout on a person's machine.
+    # `_seal_launch` is `_factory`'s (the slot env's `include`); `_seal_report` is the operator's report tool.
     # `_grant_page` is `_factory_mcp`'s (the factory side); `_grants_cli` is the `credential-grant` command,
     # run by name in the session, so it is in the slot env's `include` too.
     # `_image_user` is the deploy children's root-image check, run from the engine checkout that deploys.
@@ -652,7 +653,7 @@ def test_every_package_module_loads_with_the_agent():
         "_factory,_factory_base,_factory_envs,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
         "_factory_status,_grant_page,_grants_cli,_image_user,_isolation_canary,_loop,_loop_flow,"
-        "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_slow_lane,_state_bucket,_state_volume,_tick_guard,"
+        "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_seal_launch,_seal_report,_slow_lane,_state_bucket,_state_volume,_tick_guard,"
         "_webhook,voice"
     )
 

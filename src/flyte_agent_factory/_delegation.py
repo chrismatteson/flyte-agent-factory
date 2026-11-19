@@ -18,7 +18,7 @@ from typing import Any, Protocol, TypedDict, cast
 
 import flyte
 
-from . import _pins, _policy, _secret_env, _session_config, _union_identity, _usage, child
+from . import _pins, _policy, _seal_git, _secret_env, _session_config, _union_identity, _usage, child
 from ._bridge import ANSWERS, REQUESTS, _write_atomic, redact_tokens
 from ._bridge import PARTIAL_PATCH as PARTIAL_PATCH  # re-exported: workers and agent read it here
 from ._bridge import PLAN as PLAN
@@ -153,13 +153,22 @@ def delegate_limit(emit: Emit) -> int:
         return 3
 
 
-def snapshot(workspace: Path, target: Path) -> str:
+def snapshot(workspace: Path, target: Path, task_dir: Path | None = None) -> str:
+    """Pack `workspace` into `target/repo.tar.gz` for a worker and return the commit the worker diffs against.
+
+    `task_dir` (relative to `workspace`) is a sealed project's task repo. It is git-excluded in the author's
+    workspace, so the copy below leaves it out; it is copied whole, with its own `.git` (which holds only
+    the base commit), and its own base commit is written to `target/task-base`: see `_snapshot_task_dir`.
+    """
+
     def git(root: Path, *args: str, input: bytes | None = None) -> bytes:
-        # The copied `.git` is the session's too, config and hooks included.
+        # The copied `.git` is the session's too, config and hooks included. For a sealed project
+        # (`_seal_git.arm`) the config is sanitised and no system or global config is read.
         result = subprocess.run(
             _secret_env.git_argv("-C", str(root), *args),
             input=input,
-            env=_secret_env.child_env(),
+            env=_seal_git.harness_env(workspace, _secret_env.child_env(), root=root)
+            or _secret_env.child_env(),
             capture_output=True,
             check=False,
             timeout=GIT_TIMEOUT_S,
@@ -177,7 +186,8 @@ def snapshot(workspace: Path, target: Path) -> str:
     common_dir = Path(os.fsdecode(git(workspace, "rev-parse", "--git-common-dir")).strip())
     if not common_dir.is_absolute():
         common_dir = workspace / common_dir
-    shutil.copytree(common_dir, repo / ".git", ignore=shutil.ignore_patterns("*.lock", "worktrees"))
+    shutil.copytree(common_dir, repo / ".git", ignore=_ignore_git_extras)
+    _seal_git.sanitize_copy(workspace, repo)  # what the role wrote into its config is not carried over
     if git_dir.resolve() != common_dir.resolve():
         for name in ("HEAD", "index"):
             shutil.copy2(git_dir / name, repo / ".git" / name)
@@ -201,10 +211,13 @@ def snapshot(workspace: Path, target: Path) -> str:
             "-c",
             "user.email=factory@localhost",
             "commit",
+            "--no-verify",  # no hook: the one in `.git/hooks` is the session's
             "-m",
             "Delegation base",
         )
     base = git(repo, "rev-parse", "HEAD").decode().strip()
+    if task_dir is not None:
+        (target / "task-base").write_text(_snapshot_task_dir(git, workspace, repo, task_dir) + "\n")
     # Dirty snapshot blobs must also exist in the author's object store for --3way.
     objects = git(
         repo, "rev-list", "--objects", base, "--not", git(workspace, "rev-parse", "HEAD").decode().strip()
@@ -214,6 +227,60 @@ def snapshot(workspace: Path, target: Path) -> str:
     with tarfile.open(target / "repo.tar.gz", "w:gz") as archive:
         archive.add(repo, arcname="repo")
     shutil.rmtree(repo)
+    return base
+
+
+def _ignore_git_extras(directory: str, names: list[str]) -> set[str]:
+    """Return what the snapshot's copy of `.git` leaves out: lock files, `worktrees`, and every symlink.
+
+    A link the role planted in `.git` would be followed by `copytree` and ship the harness-side file or
+    directory it points at.
+    """
+    skipped = set(shutil.ignore_patterns("*.lock", "worktrees")(directory, names))
+    return skipped | {name for name in names if os.path.islink(os.path.join(directory, name))}
+
+
+def _drop_links(git_dir: Path) -> None:
+    for directory, names, files in os.walk(git_dir):
+        for name in [*names, *files]:
+            if os.path.islink(path := os.path.join(directory, name)):
+                os.unlink(path)
+
+
+def _snapshot_task_dir(git: Callable[..., bytes], workspace: Path, repo: Path, task_dir: Path) -> str:
+    """Copy the task repo into the snapshot at the same path and return its base commit there.
+
+    The task repo is a nested repository, so the outer diff cannot carry a worker's edits to it. It gets a
+    base commit of its own, like the outer repo's "Delegation base": the author's uncommitted edits are
+    committed into the copy, so the worker's diff against it holds only the worker's work.
+    """
+    # Only `.git/index.lock` is skipped: a worktree file may well be called `*.lock`.
+    shutil.copytree(
+        workspace / task_dir, repo / task_dir, symlinks=True, ignore=shutil.ignore_patterns("index.lock")
+    )
+    nested = repo / task_dir
+    # `symlinks=True` copied the links of the task repo's `.git` as links; none of them is the harness's.
+    _drop_links(nested / ".git")
+    _seal_git.sanitize_copy(workspace / task_dir, nested)
+    git(nested, "add", "-A")
+    if git(nested, "status", "--porcelain"):
+        git(
+            nested,
+            "-c",
+            "user.name=Factory",
+            "-c",
+            "user.email=factory@localhost",
+            "commit",
+            "--no-verify",  # no hook: the one in `.git/hooks` is the session's
+            "-m",
+            "Delegation base",
+        )
+    base = git(nested, "rev-parse", "HEAD").decode().strip()
+    authors = git(workspace / task_dir, "rev-parse", "HEAD").decode().strip()
+    if base != authors:  # the committed edits must exist in the author's repo for `git apply --3way`
+        objects = git(nested, "rev-list", "--objects", base, "--not", authors)
+        packed = git(nested, "pack-objects", "--stdout", input=objects)
+        git(workspace / task_dir, "index-pack", "--stdin", input=packed)
     return base
 
 
@@ -249,12 +316,15 @@ class Delegations:
         max_jobs: int = 3,
         setting: Callable[[str], str] | None = None,
         reattach: Reattach | None = None,
+        task_dir: Path | None = None,
     ):
         if max_jobs < 1:
             raise ValueError("AGENT_FACTORY_DELEGATE_MAX must be positive")
         self.root, self.workspace = root, workspace
         self.worker, self.engine, self.emit = worker, engine, emit
         self.reattach_worker = reattach
+        #: A sealed project's task repo, relative to the workspace: workers get it and hand their edits back.
+        self.task_dir = task_dir
         #: Jobs whose worker action was still running when the last supervisor died; `resume` watches them.
         self.resuming: list[str] = []
         self.slots = asyncio.Semaphore(max_jobs)
@@ -482,8 +552,12 @@ class Delegations:
         try:
             with tempfile.TemporaryDirectory(prefix="delegate-") as tmp:
                 target = Path(tmp)
-                base = await asyncio.to_thread(snapshot, self.workspace, target)
+                # The task repo only for a sealed project: an ordinary one calls `snapshot` as it always has.
+                extra = (self.task_dir,) if self.task_dir is not None else ()
+                base = await asyncio.to_thread(snapshot, self.workspace, target, *extra)
                 (job / "base").write_text(base + "\n")
+                if self.task_dir is not None:
+                    shutil.copy2(target / "task-base", job / "task-base")
                 # The worker diffs against it if it runs out of turns.
                 (target / "base").write_text(base + "\n")
                 brief = (
@@ -583,6 +657,21 @@ class Delegations:
                 },
             ]
 
+    def _task_patch(self, job: Path, result_dir: Path) -> Path | None:
+        """Write the worker's edits to the task repo as `job/task.patch`; None when it made none.
+
+        The author applies it inside the task dir (`git -C <task dir> apply --3way`): the outer patch cannot
+        hold it, because the task repo is a nested repository the outer repo excludes.
+        """
+        nested = result_dir / "repo" / self.task_dir if self.task_dir is not None else None
+        if nested is None or not nested.is_dir():
+            return None
+        diff = work_diff(nested, (job / "task-base").read_text().strip())
+        if not diff:
+            return None
+        (job / "task.patch").write_bytes(diff)
+        return job / "task.patch"
+
     def hand_back(
         self, job_id: str, target: Path, summary: str, engine: str, answer_only: bool, started: float
     ) -> bool:
@@ -593,6 +682,8 @@ class Delegations:
         # A worker that ran out of turns leaves a partial patch; it wins over a
         # `factory.patch` the worker may have started, which was not finished either.
         partial = not answer_only and (result_dir / PARTIAL_PATCH).exists()
+        # Before the outer diff below: `work_diff` strips every nested `.git`, the task repo's included.
+        task_patch = None if answer_only else self._task_patch(job, result_dir)
         if not answer_only and not partial and not (result_dir / "factory.patch").exists():
             # A worker that ended its turn early still did its work: take the patch from its tree, as
             # a turn-limited one does. No tree at all is a real failure, and `copy2` below says so.
@@ -615,18 +706,21 @@ class Delegations:
         elif not answer_only:
             shutil.copy2(result_dir / "factory.patch", job / "factory.patch")
         patch = job / (PARTIAL_PATCH if partial else "factory.patch")
+        task_extra = {"task_patch": str(task_patch)} if task_patch else {}
         if partial:
             result = {
                 "state": "partial",
                 "summary": summary,
                 "partial_patch": str(patch),
                 "plan": str(job / PLAN),
+                **task_extra,
             }
         else:
             result = {
                 "state": "done",
                 "summary": summary,
                 **({} if answer_only else {"patch": str(patch)}),
+                **task_extra,
             }
         _write_atomic(self.root / ANSWERS / f"{job_id}.json", result)
         files = (

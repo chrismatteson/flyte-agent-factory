@@ -1,0 +1,12 @@
+diff --git a/src/markupsafe/__init__.py b/src/markupsafe/__init__.py
+index 0afddc0..7e2beb8 100644
+--- a/src/markupsafe/__init__.py
++++ b/src/markupsafe/__init__.py
+@@ -21,6 +21,7 @@ class _TPEscape(t.Protocol):
+     def __call__(self, s: t.Any, /) -> Markup: ...
+ 
+ 
++# checked in a sealed run
+ def escape(s: t.Any, /) -> Markup:
+     """Replace the characters ``&``, ``<``, ``>``, ``'``, and ``"`` in
+     the string with HTML-safe sequences. Use this if you need to display

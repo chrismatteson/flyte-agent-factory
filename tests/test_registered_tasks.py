@@ -14,7 +14,7 @@ import flyte_agent_factory
 
 EXPECTED = {
     "agent-factory": ["agent-factory.project"],
-    "agent-factory-subagent": ["agent-factory-subagent.subagent"],
+    "agent-factory-subagent": ["agent-factory-subagent.sealed_plain", "agent-factory-subagent.subagent"],
     "factory": [
         "factory.browser_link",
         "factory.clear_limit",

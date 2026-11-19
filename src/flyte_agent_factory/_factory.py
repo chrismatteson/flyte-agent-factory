@@ -45,6 +45,7 @@ from flyte_agent_factory import (
     _profile,
     _queue,
     _resources,
+    _seal_launch,
     _state_pod,
     _state_store,
     _tick_guard,
@@ -174,6 +175,7 @@ def run_project(
     branch: str = "",
     hard_pin: bool = False,
     identities: Sequence[str] = (),
+    seal: str = "",
 ) -> remote.Run:
     context: dict[str, Any] = {"mode": "remote", "project": PROJECT, "domain": DOMAIN}
     # The grant is set here and nowhere else; `normalize_policy` refuses the key, so policy cannot carry it.
@@ -199,6 +201,7 @@ def run_project(
         **({"workspace_in": workspace_in} if workspace_in is not None else {}),
         **({"branch": branch} if branch else {}),
         **({"hard_pin": True} if hard_pin else {}),
+        **({"seal": seal} if seal else {}),
     )
 
 
@@ -237,6 +240,12 @@ def launch_on_slot(
     On a shared environment other runs are the point, but the caps are not: the same second look keeps
     the oldest runs within them, for `engine`, the one this launch was admitted for.
     """
+    # Last line of defence, whichever path computed the workspace (resume, recreate, planner): a sealed
+    # run starts empty, so an earlier run's content can never reach it.
+    if run_kwargs.get("seal") and run_kwargs.get("workspace_in") is not None:
+        raise ValueError(
+            f"refusing to start sealed project {name} with a workspace_in: a sealed run inherits nothing"
+        )
     task = remote.Task.get(slot, auto_version="latest")
     run = run_project(task, brief, name, model, demo, repo, policy, **run_kwargs)
     if _factory_base.PROFILE.shared:
@@ -551,6 +560,7 @@ def _dispatch_pending(queue: str, waiting: list[_queue.Entry], exclude_run: str)
                 exclude_run=exclude_run,
                 policy=request.policy,
                 identities=request.browser,
+                seal=request.seal,
                 engine=_factory_policy.pick_launch_engine(request),
                 run_name=_queue.run_id(entry.name, entry.gen, entry.attempt),
                 labels={
@@ -650,6 +660,7 @@ def prepare_launch(
     issue: str = "",
     priority: str = "normal",
     browser: str = "",
+    seal: str = "",
 ) -> LaunchPlan:
     """Everything `launch_project` can refuse, checked without writing anything.
 
@@ -693,6 +704,15 @@ def prepare_launch(
         request = _new_request(queue, found, brief, name, model, repo, demo, policy, issue, priority, grant)
     if issue:
         request = dataclasses.replace(request, issue=issue)
+    if seal and request.kind == "resume":
+        raise ValueError(
+            f"refusing sealed launch of {name}: it already has earlier runs, and a sealed rerun is a fresh "
+            f"project under a new name that inherits nothing; pick one with `_seal_report.next_run_name` "
+            f"(e.g. {name}-r2)"
+        )
+    if seal:
+        seal, sealed_repo = _seal_launch.resolve(seal, _factory_base.PROFILE)
+        request = dataclasses.replace(request, seal=seal, repo=sealed_repo)
     if len(_queue.effective_brief(request)) > MAX_BRIEF:
         raise ValueError(f"the project's brief plus the new direction must be at most {MAX_BRIEF} characters")
     return LaunchPlan(request, bool(old), waiting if waiting and not old else None)
@@ -708,6 +728,7 @@ def launch_project(
     issue: str = "",
     priority: str = "normal",
     browser: str = "",
+    seal: str = "",
 ) -> dict[str, Any]:
     """Validate a launch, queue it and dispatch: the one way a project starts.
 
@@ -719,9 +740,12 @@ def launch_project(
 
     `browser` grants the project browser identities: names, "none" for no grant, or "" to leave the grant
     as it is (a new project has none; a resume or a replaced waiting request keeps its own).
+
+    `seal` is a sealed run's spec (`SealSpec.to_json()`); only operator callers pass it (the intake `launch`
+    task has no such parameter). The project then runs in the profile's `[seal] workspace_repo`.
     """
     request, old, unreadable = prepare_launch(
-        brief, name, model, repo, demo, policy, issue, priority, browser
+        brief, name, model, repo, demo, policy, issue, priority, browser, seal
     )
     queue = _factory_base.queue_root()
     if unreadable:  # close it so the new generation is the only open one

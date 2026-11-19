@@ -151,6 +151,16 @@ def _suite_profile_survives_every_test():
 
 
 @pytest.fixture(autouse=True)
+def _no_sealed_repo_outlives_its_test():
+    """A sealed setup arms its repositories (`_seal_git.arm`) until `_seal_session.end()`, which a test may
+    never reach. Left armed, every later test's harness git would run with hooks off."""
+    yield
+    from flyte_agent_factory import _seal_git
+
+    _seal_git.disarm_all()
+
+
+@pytest.fixture(autouse=True)
 def _not_inside_the_run_that_runs_the_tests(monkeypatch):
     """A factory pod is itself a Flyte run: its run id would send lookups (`_gate_tests._run_image`) to the
     real cluster. Tests run as CI does, outside a run; one that needs a run sets its own id."""
@@ -597,3 +607,22 @@ def _a_pod_with_its_tier_key(monkeypatch):
     _union_identity.current.cache_clear()
     yield
     _union_identity.current.cache_clear()
+
+
+@pytest.fixture
+def seal_namespaces():
+    """The seal tests launch through user namespaces, as a sealed run does: required, never skipped."""
+    from flyte_agent_factory import _seal_net
+
+    assert _seal_net.available(), (
+        f"these tests need unprivileged user, net and mount namespaces ({_seal_net.unavailable_reason()}); "
+        "on Ubuntu 24.04: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    )
+
+
+@pytest.fixture
+def git_http_backend():
+    """The upstream and push tests serve git through `git http-backend` (git ships it): never skipped."""
+    from tests.test_seal_proxy import GIT_BACKEND
+
+    assert GIT_BACKEND.exists(), f"git http-backend is missing at {GIT_BACKEND}"

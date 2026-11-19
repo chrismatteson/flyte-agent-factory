@@ -32,6 +32,8 @@ from flyte_agent_factory import (
     _pins,
     _policy,
     _router,
+    _seal_role,
+    _seal_session,
     _secret_env,
     _session_config,
     _session_log,
@@ -122,13 +124,16 @@ async def _start_session(
 ) -> ClaudeProcess:
     """Start Claude Code, stepping past a startup failure we know how to fix."""
     last: BaseException | None = None
+    sealed = _seal_session.role()
     for index, argv in enumerate(candidates):
         timeline.row("🚀", " ".join(shlex.quote(a) for a in argv))
         capture = _session_setup._log_session_line(timeline)
         proc = ClaudeProcess(
-            argv,
+            # Every candidate (plain, --continue, --resume) goes through the launcher; it passes the
+            # token's inherited descriptor on to `claude`.
+            sealed.wrap(argv) if sealed else argv,
             cwd=_session_config.WORKSPACE,
-            env=env,
+            env={**env, **sealed.env} if sealed else env,
             on_line=capture,
             inbox_messages=True,
             token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(),
@@ -1047,16 +1052,18 @@ def _start_codex_author(
         args += ["-c", f'model_reasoning_effort="{effort}"']
     if model:
         args += ["-m", model]
+    sealed = _seal_session.role()
     env = {
         **_session_setup._session_env(_session_setup._export_runtime_env()),
         **(extra_env or {}),
         "CODEX_HOME": str(home),
+        **(sealed.env if sealed else {}),
     }
     proc = CodexAuthor(
         cwd=_session_config.WORKSPACE,
         env=env,
-        command=_CODEX_COMMAND,
-        args=args,
+        command=sealed.wrap(_CODEX_COMMAND) if sealed else _CODEX_COMMAND,
+        args=[*args, *_seal_role.CODEX_TOOLS_OFF_ARGS] if sealed else args,
         thread_file=_CODEX_THREAD_FILE,
         on_line=_session_setup._log_session_line(timeline),
     )

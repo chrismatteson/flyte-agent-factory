@@ -10,10 +10,12 @@ process never reads a half-written token.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import _github
 from ._auth import write_private
@@ -61,6 +63,20 @@ def write_token(store: Path, token: str) -> None:
     partial = store.with_name(store.name + ".new")
     write_private(partial, f"https://x-access-token:{token}@github.com\n")
     partial.replace(store)
+
+
+def push_auth(store: Path) -> Callable[[], str]:
+    """Return a function giving the `Authorization` header value for the token currently in `store`.
+
+    For a sealed session's push route: the proxy outside the seal adds the header, so the session's clone
+    needs no credential to push. Read on every call, as `refresh_loop` replaces the file.
+    """
+
+    def header() -> str:
+        token = urlsplit(store.read_text().strip()).password or ""
+        return "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+    return header
 
 
 def mint(app: _github.GithubApp, repo: str, store: Path, scope: Mapping[str, str]) -> None:

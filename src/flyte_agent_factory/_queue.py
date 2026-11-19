@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
 
 from flyte_agent_factory import _errors, _state_store
+from flyte_agent_factory._seal_spec import SealSpec
 
 #: Suffixes that close a request, strongest first. `started` and `cancelled` can both exist (a cancel
 #: and a dispatch crossing); `_outcome` picks between them. A request can only be failed before a run exists.
@@ -89,6 +90,10 @@ class Request:
     reason: str = ""  # why the factory queued this itself, e.g. "token rotated"; shown wherever it waits
     #: Browser identities (sorted, unique names, never secrets) this project's run may use; none by default.
     browser: tuple[str, ...] = ()
+    #: A sealed run's spec (`SealSpec.to_json()`), "" for an ordinary project. It holds no secret -- task
+    #: repo URL, base sha, cutoff, hosts; the gold patch is never in it, the run gets the snapshot anyway --
+    #: so carrying it on a request anyone with the repository can read is acceptable.
+    seal: str = ""
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self), sort_keys=True).encode()
@@ -115,6 +120,7 @@ class Request:
             request.issue,
             request.priority,
             request.reason,
+            request.seal,
         )
         policy = request.policy
         if not (
@@ -129,6 +135,11 @@ class Request:
             and all(isinstance(b, str) for b in request.browser)
         ):
             raise ValueError("not a launch request: a field has the wrong type or value")
+        if request.seal:
+            try:
+                SealSpec.from_json(request.seal)
+            except ValueError as exc:  # a request is dispatched later; a bad spec must not wait until then
+                raise ValueError(f"not a launch request: {exc}") from exc
         return request
 
 

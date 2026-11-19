@@ -1,0 +1,30 @@
+{
+  "ended_at": "2026-11-17T05:22:23Z",
+  "exit_code": 0,
+  "files": {
+    "guard.jsonl": {
+      "lines": 17,
+      "sha256": "1d6d99cce807db141b62a0bf8f8b4504aa6f553a0eddc891fd73050b7d3bdfe2"
+    },
+    "proxy.jsonl": {
+      "lines": 20,
+      "sha256": "db8e53bb28852f20c3f2ed09b659779a5e5dffd7c09712d632c4d81d7c39903a"
+    },
+    "role.json": {
+      "lines": 15,
+      "sha256": "203d8114822d4542517902ea7aed0dd44978802455e8662407d907712e71ef7c"
+    },
+    "transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1.jsonl": {
+      "lines": 69,
+      "sha256": "05b947757ea9834941ef75fc2cad14cd5a7f1925cdbd9d0e107ecc79b8e09c4a"
+    },
+    "transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.jsonl": {
+      "lines": 17,
+      "sha256": "9c299ff03acae4413d6f9638faadc46117ce0ff2215103911bf390b03d19d461"
+    },
+    "transcript/projects/-tmp-plain-9uvw0cye-workspace/ab4312c7-005c-4920-ae9e-6180c25e78e1/subagents/agent-af11a8fb6b629a983.meta.json": {
+      "lines": 1,
+      "sha256": "93b3bc6698851fb23fd6116b610f24d2278dee20a66bbd7044c39cf05b4e3d55"
+    }
+  }
+}

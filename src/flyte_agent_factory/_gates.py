@@ -1419,7 +1419,11 @@ def _parent_tree(project: Path, into: Path) -> Path | None:
     # Run from a subdirectory of the repository (a workspace's projects/<name>/), git archive writes only that
     # directory, with paths relative to it: `into` is then the project's tree, with no prefix to add.
     archive = subprocess.run(
-        ["git", "archive", "--format=tar", "HEAD~1", "--", "."], cwd=project, capture_output=True, check=False
+        _secret_env.git_argv("archive", "--format=tar", "HEAD~1", "--", "."),
+        cwd=project,
+        env=_secret_env.child_env(),
+        capture_output=True,
+        check=False,
     )
     if archive.returncode:
         return None

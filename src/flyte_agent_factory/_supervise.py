@@ -20,6 +20,7 @@ from flyte_agent_factory import (
     _review,
     _review_wait,
     _reviewer,
+    _seal_session,
     _session_config,
     _supervise_support,
     _timeline,
@@ -591,6 +592,10 @@ async def _pump(
                     _inbox._clear_pass_keep_history()
                     # Mechanical readiness before the expensive judgement.
                     if workspace and qa_task is None and not _supervise_support._escalated:
+                        if _session_config._seal is not None:
+                            # The author's transcripts as they are at DONE, then the audit of the record.
+                            await asyncio.to_thread(_seal_session.close_record)
+                            timeline.row("🔒", await asyncio.to_thread(_seal_session.audit_record))
                         checked = await _pre_review.begin(workspace, demo_package)
                         capacity.note = note
                         try:

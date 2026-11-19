@@ -504,6 +504,7 @@ class _DelegationResult(TypedDict):
     patch: NotRequired[str]
     partial_patch: NotRequired[str]
     plan: NotRequired[str]
+    task_patch: NotRequired[str]  # a sealed project's worker edits to the task repo; apply inside it
     engine: NotRequired[str]
     until: NotRequired[float]  # Unix seconds, UTC (the same clock as factory.status's paused.until)
     probe_at: NotRequired[float]  # when the wait ends early to re-check a remembered limit, before `until`
@@ -556,11 +557,11 @@ def delegate_cli(argv: list[str] | None = None) -> int:
         if (job / "answer-only").exists() and (job / "summary.md").exists():
             return {"state": "done", "summary": (job / "summary.md").read_text()}
         if (job / "summary.md").exists() and (job / "factory.patch").exists():
-            return {
-                "state": "done",
-                "summary": (job / "summary.md").read_text(),
-                "patch": str(job / "factory.patch"),
-            }
+            summary, patch = (job / "summary.md").read_text(), str(job / "factory.patch")
+            done: _DelegationResult = {"state": "done", "summary": summary, "patch": patch}
+            if (job / "task.patch").exists():
+                done["task_patch"] = str(job / "task.patch")
+            return done
         if all((job / name).exists() for name in ("summary.md", PARTIAL_PATCH, PLAN)):
             return {
                 "state": "partial",
@@ -591,7 +592,7 @@ def delegate_cli(argv: list[str] | None = None) -> int:
                     return 1
                 if result["state"] in ("done", "partial"):
                     print(result["summary"])
-                    for key in ("patch", "partial_patch", "plan"):
+                    for key in ("patch", "partial_patch", "plan", "task_patch"):
                         if key in result:
                             print(result[key])
                     return 0

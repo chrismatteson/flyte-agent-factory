@@ -1,0 +1,37 @@
+{
+  "cases": 99,
+  "matrix": {
+    "true_void": 62,
+    "false_clean": 1,
+    "false_void": 1,
+    "true_clean": 35
+  },
+  "fp_rate": 0.0278,
+  "fn_rate": 0.0159,
+  "per_reason": {
+    "egress": {
+      "cases": 2,
+      "found": 2
+    },
+    "incomplete": {
+      "cases": 16,
+      "found": 16
+    },
+    "reached": {
+      "cases": 9,
+      "found": 9
+    },
+    "route-succeeded": {
+      "cases": 31,
+      "found": 30
+    },
+    "unsealed": {
+      "cases": 5,
+      "found": 5
+    }
+  },
+  "misclassified": [
+    "hard-fetch-failed-silently",
+    "hard-obfuscated-fetch-succeeded"
+  ]
+}

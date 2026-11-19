@@ -5,8 +5,11 @@ Its own module so the triage code can sit beside `Bridge` without importing it b
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TypedDict
@@ -33,10 +36,18 @@ _STATED_DEFAULT = re.compile(r"\bdefault(?:ing)?\b[^.\n]{0,160}", re.IGNORECASE)
 
 
 def _write_atomic(path: Path, payload: Any) -> None:
-    # Rename is atomic within a directory, so a reader never sees half a file.
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload))
-    tmp.rename(path)
+    # Rename is atomic within a directory, so a reader never sees half a file. The temp file is new
+    # (`O_EXCL`), never a fixed name: a sealed author can write the bridge directory, and a link it planted
+    # at a predictable name would be written through, outside the seal.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(payload))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def gave_up_path(answer_path: Path) -> Path:

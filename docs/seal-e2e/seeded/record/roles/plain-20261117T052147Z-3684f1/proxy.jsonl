@@ -1,0 +1,3 @@
+{"ts":"2026-11-17T05:21:47.529513Z","method":"CONNECT","target":"api.anthropic.com:443","route":"model","decision":"allow","rule":"model-host","status":200}
+{"ts":"2026-11-17T05:21:47.532838Z","method":"CONNECT","target":"api.anthropic.com:443","route":"model","decision":"allow","rule":"model-host","status":200}
+{"ts":"2026-11-17T05:21:47.868015Z","method":"CONNECT","target":"api.anthropic.com:443","route":"model","decision":"allow","rule":"model-host","status":200}
