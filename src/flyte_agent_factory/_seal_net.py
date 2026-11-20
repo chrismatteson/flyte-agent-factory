@@ -34,14 +34,22 @@ _MS_NOSUID = 0x2
 _MS_NODEV = 0x4
 _MS_REC = 0x4000
 _MS_PRIVATE = 0x40000
+# Linux statvfs flags, spelled out: `os` defines ST_NODEV and the rest only on Linux, and this module is
+# imported on the machine running a hand deploy (macOS has no ST_NODEV), where none of the sealing code runs.
+_ST_NOSUID = 0x2
+_ST_NODEV = 0x4
+_ST_NOEXEC = 0x8
+_ST_NOATIME = 0x400
+_ST_NODIRATIME = 0x800
+_ST_RELATIME = 0x1000
 #: (statvfs flag, mount flag) pairs an unprivileged remount must keep: a user namespace locks them.
 _LOCKED_MOUNT_FLAGS = (
-    (os.ST_NOSUID, 0x2),
-    (os.ST_NODEV, 0x4),
-    (os.ST_NOEXEC, 0x8),
-    (os.ST_NOATIME, 0x400),
-    (os.ST_NODIRATIME, 0x800),
-    (os.ST_RELATIME, 0x200000),
+    (_ST_NOSUID, 0x2),
+    (_ST_NODEV, 0x4),
+    (_ST_NOEXEC, 0x8),
+    (_ST_NOATIME, 0x400),
+    (_ST_NODIRATIME, 0x800),
+    (_ST_RELATIME, 0x200000),
 )
 #: Mounts the filesystem lock leaves alone: the kernel's own trees, and the terminals the command needs.
 #: `/dev` itself is locked (a device node still opens for writing on a read-only mount).
