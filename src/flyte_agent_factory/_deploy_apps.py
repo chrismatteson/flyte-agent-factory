@@ -8,6 +8,15 @@ updated, and puts the previous spec back if the new one does not come up.
 
 `_deploy.APPS_CHILD` calls it from the engine tree. It is a normal module, so it is tested with a fake
 `flyte.remote.App`.
+
+Every app of the factory stage (`factory-mcp`, and `factory-webhook` when the profile configures it) is
+deployed by `_deploy.FACTORY_CHILD` with Flyte's own rolling update; a restart of `factory-mcp` drops the chat
+connector. Its container command carries the code bundle's `--tgz` and `--version` and the deploy's
+`--image-cache`, which change on every deploy, so Flyte's own "spec unchanged, skip" never fires.
+`is_unchanged` compares the specs without those three, and each spec carries a digest of the code the app can
+run (`_code_closure`, `CODE_DIGEST_ENV`), so a change to a slot's code leaves the apps running and a change to
+an app's own code restarts it. `drop_unchanged_apps` leaves the unchanged ones out of the deploy;
+`RESTART_APPS_ENV` (`ops/deploy_factory.py --restart-mcp --restart-webhook`) restarts the ones named anyway.
 """
 
 from __future__ import annotations
@@ -16,6 +25,7 @@ import asyncio
 import copy
 import time
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 import flyte
@@ -23,8 +33,9 @@ from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from flyte import remote
 from flyteidl2.app import app_definition_pb2  # type: ignore[import-untyped]  # no py.typed marker
+from google.protobuf.json_format import MessageToDict  # type: ignore[import-untyped]  # no stubs installed
 
-from . import _deploy
+from . import _code_closure, _deploy
 from ._errors import REMOTE_ERRORS
 
 #: Seconds between looks at an app that is starting, and how long it may take: an image pull and a lease wait
@@ -33,6 +44,19 @@ POLL_SECONDS = 10
 ACTIVE_TIMEOUT_SECONDS = 15 * 60
 #: How long the old app may take to stop before a replacement: generous against the pod's 90 s grace.
 STOP_TIMEOUT_SECONDS = 5 * 60
+
+#: The env var of each factory-stage app that carries `_code_closure.hash_import_closure`: code it runs
+#: changing changes its spec. One name for every app; the value differs because the module does.
+CODE_DIGEST_ENV = "FACTORY_CODE_DIGEST"
+MCP_NAME = "factory-mcp"
+WEBHOOK_NAME = "factory-webhook"
+#: Comma-separated names of factory-stage apps to restart even when unchanged (a secret's value rotated, say,
+#: which the spec does not show): `ops/deploy_factory.py --restart-mcp --restart-webhook`.
+RESTART_APPS_ENV = "AGENT_FACTORY_RESTART_APPS"
+#: Flags in an app's container command that differ on every deploy, whatever changed: the code bundle's,
+#: and the image cache (every environment of the deploy, with build runs; the app's own image is
+#: `container.image`).
+_PER_DEPLOY_FLAGS = frozenset({"--tgz", "--version", "--image-cache"})
 
 _FAILED = app_definition_pb2.Status.DeploymentStatus.DEPLOYMENT_STATUS_FAILED
 #: What a key that may not read the app gets: no poll will get further, so a wait stops on the first.
@@ -204,6 +228,94 @@ def deploy_app(
             f"{name} {_describe_failure(exc)}; {_roll_back(name, old_spec, app_cls)}"
         ) from None
     return list(deployments)
+
+
+def _strip_flags(words: Iterable[str]) -> list[str]:
+    kept: list[str] = []
+    it = iter(words)
+    for word in it:
+        if word in _PER_DEPLOY_FLAGS:
+            next(it, None)  # its value
+        else:
+            kept.append(word)
+    return kept
+
+
+def _strip_per_deploy_flags(spec: Any) -> Any:
+    """Return a copy of `spec` whose command and args lack the `_PER_DEPLOY_FLAGS` pairs.
+
+    The app runs from `container`, or, with a pod template (the volume state backend), from the containers
+    of `pod.pod_spec`. Only the one that is set is touched: writing to the other would clear it (a oneof).
+    """
+    spec = copy.deepcopy(spec)
+    if spec.HasField("container"):
+        for field in (spec.container.command, spec.container.args):
+            field[:] = _strip_flags(field)
+    elif spec.HasField("pod"):
+        pod_spec = MessageToDict(spec.pod.pod_spec)
+        for container in pod_spec.get("containers", []):
+            for key in ("command", "args"):
+                if key in container:
+                    container[key] = _strip_flags(container[key])
+        spec.pod.pod_spec.Clear()
+        spec.pod.pod_spec.update(pod_spec)
+    return spec
+
+
+def is_unchanged(env: Any, *, deploy: Callable[..., Any] = flyte.deploy, app_cls: Any = remote.App) -> bool:
+    """Return whether the app `env` is deployed, active, and equal to what deploying it now would make.
+
+    Equal as `App.replace` compares (the creator is the deployed one's), except for `--tgz`, `--version` and
+    `--image-cache`, which are new on every deploy (the app's own image, `container.image`, is compared). A
+    missing app is not unchanged, silently; any other lookup or control-plane error is printed and also
+    means "not known to be unchanged": the caller deploys as it always did. Only the errors in
+    `REMOTE_ERRORS` are caught, so a build failure in the dry run escapes and deploying would fail the same.
+    """
+    name = env.name
+    try:
+        old = app_cls.get(name=name)
+        if not old.is_active():
+            return False
+        planned = deploy(env, dry_run=True)
+        new_spec = next(
+            e.deployed_app.pb2.spec for d in planned for e in d.envs.values() if e.get_name() == name
+        )
+        comparable = copy.deepcopy(new_spec)
+        comparable.creator.CopyFrom(old.pb2.spec.creator)
+        return bool(
+            asyncio.run(
+                app_cls._app_specs_are_equal(
+                    _strip_per_deploy_flags(old.pb2.spec), _strip_per_deploy_flags(comparable)
+                )
+            )
+        )
+    except REMOTE_ERRORS as exc:
+        if not (isinstance(exc, ConnectError) and exc.code == Code.NOT_FOUND):
+            print(
+                f"{name}: could not compare with the deployed app, deploying it: {_deploy.redact(str(exc))}"
+            )
+        return False
+
+
+def stamp_code_digest(app: Any, package_dir: Path, module: str) -> None:
+    """Put the digest of the code `module` can run into `app`'s env vars: a change to it is a spec change."""
+    app.env_vars[CODE_DIGEST_ENV] = _code_closure.hash_import_closure(package_dir, module)
+
+
+def drop_unchanged_apps(
+    envs: tuple[Any, ...],
+    apps: Iterable[Any],
+    *,
+    deploy: Callable[..., Any] = flyte.deploy,
+    app_cls: Any = remote.App,
+) -> tuple[tuple[Any, ...], list[str]]:
+    """Return `envs` for a real deploy without the unchanged `apps`, and the names of the ones left out."""
+    kept = [app for app in apps if is_unchanged(app, deploy=deploy, app_cls=app_cls)]
+    kept_ids = {id(app) for app in kept}
+    for app in kept:
+        suffix = ", the connector keeps running" if app.name == MCP_NAME else ""
+        print(f"{app.name} unchanged: not redeployed{suffix}", flush=True)
+    return tuple(env for env in envs if id(env) not in kept_ids), [app.name for app in kept]
 
 
 def stop_app(name: str, *, app_cls: Any = remote.App) -> bool:

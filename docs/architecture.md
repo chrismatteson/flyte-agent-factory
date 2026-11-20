@@ -132,6 +132,39 @@ plus the benchmark and the Codex sign-in); running a slot task directly is unsup
 started directly it skips validation and the queue. After a failed deploy, chat can start
 `factory-deployer.deploy_if_changed` (no inputs) instead of waiting for the next tick.
 
+The deployer does not redeploy for a direction repository commit that changes nothing the deploy reads. With the
+engine sha unchanged, it proves that by comparing the git object sha and mode of every read path (the
+`[direction] profile` file, the standards directory in both places it is resolved, `[standards] dir` beside the
+profile and root-relative (`standards/` when unset), and the `[standards] brand` file) at the deployed direction sha
+and at the new head, through GitHub's non-recursive trees API (`_deploy_reads.list_read_paths`,
+`_deploy_reads.explain_skip`, `_deployer._explain_unread_only_skip`). Equal objects mean equal content, so any
+number of changed files elsewhere (`operator/STATE.md`, `projects/**` and the like) is skipped, saying so; the cost
+is the size of the read set, not of the diff or of the repository. Any doubt deploys: the read set is unknown (an absolute, `~` or `..`
+path) or is the whole repository (`.`), the compare call errors or the head is not strictly ahead of the deployed sha (not a plain fast-forward),
+any read path's object differs (a path appearing or disappearing counts), or at the head a read path is, or lies
+under, a symlink, or is a directory whose own tree (listed recursively, that subtree only, never the whole
+repository) is truncated or holds a symlink (the deploy follows it to files the object comparison would not see). An engine change always deploys. To deploy anyway, run
+`factory-deployer.deploy_if_changed` with `force=True`, or the manual `ops/deploy_factory.py` /
+`ops/deploy_work.py`, which do not look. The read set is `_deploy_reads.py`; a test fails if a new direction read
+escapes it.
+
+A factory deploy leaves every app of the factory stage (`factory-mcp`, and `factory-webhook` when the profile sets
+`[github] webhook_secret`) running when what it would run did not change; a restart of `factory-mcp` drops the chat
+connector. An app's command (the container's, or the app container's in the pod template the volume state backend
+adds) carries the code bundle's `--tgz` and `--version` and the deploy's `--image-cache` (every environment's image
+of that deploy, and their build runs), new on every deploy, so the stage compares each app's deployed spec with the
+new one without those three (`_deploy_apps.is_unchanged`); its own image is still compared. Each spec carries
+`FACTORY_CODE_DIGEST`, a hash of the modules the app statically imports within the package (`_code_closure`), so a
+deploy that changes only slot code (`agent.py`, `_supervise.py`, `_review.py`) keeps the apps running and a change to
+code an app imports restarts it. Any doubt (not found, a lookup error, not active) deploys the app as usual. A kept
+app counts as deployed in the deploy's report, and its URLs are printed as usual. To restart one anyway (a secret's
+value rotated, which its spec does not show), run `ops/deploy_factory.py --restart-mcp` or `--restart-webhook`.
+
+When the newest finished attempt at the same deploy and direction commits ended `waiting_for_secrets`, the deployer
+checks whether those secrets exist now (`remote.Secret.get`). While any is still missing it does not submit a deploy
+and says which; a moved commit or a created secret lets it submit. A lookup error other than not found counts the
+secret as present.
+
 | Task | What it does |
 |---|---|
 | `factory.launch` | validates a launch (name slug, brief size, repository allowlist, model, `priority`, optional `issue`, optional `browser` grant) and queues it; starts at once if a slot is free |
@@ -627,8 +660,10 @@ the session role definitions, the browser image files and the workspace template
 | `__init__.py` | the package entry |
 | `_deploy.py` | deploying the factory's own code, shared by `ops/deploy_*.py` and the deployer |
 | `_deploy_child.py` | the auto-deployer's steps, run from the fetched engine tree: check (imports, secrets), deploy |
-| `_deploy_apps.py` | replacing the personal browser app stop-then-start, restoring the old spec on failure |
+| `_deploy_apps.py` | replacing the personal browser app stop-then-start, restoring the old spec on failure; leaving every unchanged factory-stage app (`factory-mcp`, `factory-webhook`) running |
+| `_code_closure.py` | the digest of the modules a module statically imports within the package |
 | `_deployer.py` | `factory-deployer`: merged changes deploy themselves |
+| `_deploy_reads.py` | what a deploy reads from the direction repository, and whether the object of every read path is the same at two commits |
 | `_gcp.py` | `gcp_bootstrap`: a service-account key from a sign-in link |
 | `voice.py` | the voice-model factory app |
 

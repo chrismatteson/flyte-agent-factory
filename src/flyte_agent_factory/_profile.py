@@ -1323,8 +1323,8 @@ def _with_tree(profile: Profile, where: str, tree: Path, *, workspace: bool = Fa
     standards = profile.standards
     # A workspace's own `standards/` is its default; an engine checkout's is never one (docs/standards.md):
     # there only an explicit `[standards] dir` names standards.
-    if workspace and not standards.dir and (tree / "standards").is_dir():
-        standards = replace(standards, dir=str(tree / "standards"))
+    if workspace and not standards.dir and (tree / _standards.DEFAULT_DIR).is_dir():
+        standards = replace(standards, dir=str(tree / _standards.DEFAULT_DIR))
     try:
         captured = _standards.capture(standards, profile.source_dir, root=tree)
         payload = _standards.encode(captured)

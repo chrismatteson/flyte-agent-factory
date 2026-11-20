@@ -611,6 +611,23 @@ class GithubApp(_GithubReader):
             raise GithubError(f"git tree of {repo} {branch} is truncated; too many files to list")
         return {entry["path"] for entry in tree["tree"] if entry["type"] == "blob"}
 
+    def compare_commits(self, repo: str, base: str, head: str) -> Json:
+        """Compare `base...head`: its `status` and the first page (at most `PER_PAGE`) of its `files`."""
+        return self._get(
+            repo, f"/repos/{repo}/compare/{base}...{head}", params={"per_page": PER_PAGE, "page": 1}
+        )
+
+    def list_tree_entries(self, repo: str, sha: str) -> list[Json]:
+        """Entries (`path`, `mode`, `type`, `sha`) of one directory of a tree or commit, not its subtrees."""
+        body = self._get(repo, f"/repos/{repo}/git/trees/{sha}")
+        if body.get("truncated") or not isinstance(body.get("tree"), list):
+            raise GithubError(f"git tree {sha} of {repo} is incomplete")
+        return list(body["tree"])
+
+    def get_recursive_tree(self, repo: str, sha: str) -> Json:
+        """Return a commit's or tree's whole git tree; `truncated` is set when GitHub cut it short."""
+        return self._get(repo, f"/repos/{repo}/git/trees/{sha}", params={"recursive": "1"})
+
     def create_pull(self, repo: str, head: str, base: str, title: str, body: str, *, draft: bool) -> Json:
         payload = {"head": head, "base": base, "title": title, "body": body, "draft": draft}
         return self._send(repo, "POST", f"/repos/{repo}/pulls", json=payload)

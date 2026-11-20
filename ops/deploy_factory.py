@@ -6,7 +6,11 @@ and factory-reconcile when it has `[board]` or the GitHub App.
 
 Set [mcp] public_url before deploying.
 
-    python ops/deploy_factory.py --ref origin/main [--dry-run]
+An app whose spec is unchanged (factory-mcp, factory-webhook) is left running: a restart drops the chat
+connector. `--restart-mcp` and `--restart-webhook` restart the named one anyway, after a secret's value
+rotated, say, which the spec does not show.
+
+    python ops/deploy_factory.py --ref origin/main [--dry-run] [--restart-mcp] [--restart-webhook]
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from pathlib import Path
 # below fails with ModuleNotFoundError (as in ops/bootstrap.py).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from flyte_agent_factory import _deploy, _profile
+from flyte_agent_factory import _deploy, _deploy_apps, _profile
 
 _profile.select_from_argv()  # before the profile is read below
 
@@ -41,6 +45,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ref", default="origin/main")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--allow-localhost", action="store_true")
+    ap.add_argument(
+        "--restart-mcp", action="store_true", help="restart factory-mcp even when it is unchanged"
+    )
+    ap.add_argument(
+        "--restart-webhook", action="store_true", help="restart factory-webhook even when it is unchanged"
+    )
     args = ap.parse_args(argv)
     if os.environ.get("FACTORY_MCP_ALLOW_LOCALHOST") and not args.allow_localhost:
         ap.error("FACTORY_MCP_ALLOW_LOCALHOST requires --allow-localhost")
@@ -52,6 +62,18 @@ def main(argv: list[str] | None = None) -> int:
         text=True,
     ).stdout.strip()
     env = _deploy.factory_env(_deploy.strip_hand_deploy_keys(os.environ), PROJECT, DOMAIN)
+    # Only the flag asks: a value left exported in the shell does not.
+    env.pop(_deploy_apps.RESTART_APPS_ENV, None)
+    restart = [
+        name
+        for flag, name in (
+            (args.restart_mcp, _deploy_apps.MCP_NAME),
+            (args.restart_webhook, _deploy_apps.WEBHOOK_NAME),
+        )
+        if flag
+    ]
+    if restart:
+        env[_deploy_apps.RESTART_APPS_ENV] = ",".join(restart)
     with _deploy.worktree(REPO, sha, "deploy-factory-") as tree:
         print(
             f"deploying {', '.join(sorted(ALLOWED))} from {args.ref} ({sha})"
