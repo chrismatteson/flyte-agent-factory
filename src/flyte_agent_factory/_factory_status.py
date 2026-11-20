@@ -140,15 +140,58 @@ def _standards(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _no_verdict_rate(no_verdict: Any, judge_calls: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    """Return `{by_judge|by_engine: {name: {calls, no_verdict, rate}}}`; {} when a snapshot has neither count.
+
+    A snapshot with `no_verdict` but no `judge_calls` (from before the denominator) gives each judge `calls` 0
+    and `rate` None.
+
+    Counts cover the project run so far (the timeline's counters), so they are "recent" in the sense of the
+    rounds this run has done. `rate` is None where nothing was called (an old snapshot has no denominator).
+    """
+    rates: dict[str, dict[str, dict[str, Any]]] = {}
+    if not isinstance(no_verdict, dict) and not isinstance(judge_calls, dict):
+        return rates
+    for key in ("by_judge", "by_engine"):
+        bad = no_verdict.get(key) if isinstance(no_verdict, dict) else None
+        calls_by = judge_calls.get(key) if isinstance(judge_calls, dict) else None
+        bad = bad if isinstance(bad, dict) else {}
+        calls_by = calls_by if isinstance(calls_by, dict) else {}
+        rates[key] = {}
+        for name in sorted({*bad, *calls_by}):
+            calls, missing = _count(calls_by.get(name)), _count(bad.get(name))
+            rates[key][name] = {
+                "calls": calls,
+                "no_verdict": missing,
+                "rate": round(min(missing / calls, 1.0), 4) if calls else None,
+            }
+    return rates
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _review(data: dict[str, Any]) -> dict[str, Any]:
     """Return the supervisor's review state: findings per round, the open ones, whether it converges."""
     phase = data.get("phase") or {}
     snapshot = data.get("review") or {}
     review = {
         key: snapshot[key]
-        for key in ("scores", "converging", "rulings", "judges", "no_verdict")
+        for key in (
+            "scores",
+            "converging",
+            "rulings",
+            "judges",
+            "no_verdict",
+            "judge_calls",
+            "followups",
+            "reruns",
+        )
         if key in snapshot
     }
+    if rate := _no_verdict_rate(snapshot.get("no_verdict"), snapshot.get("judge_calls")):
+        review["no_verdict_rate"] = rate
     if "open" in snapshot:
         review["open"] = list(snapshot["open"])[:10]
     for key in ("round", "max_rounds"):

@@ -35,6 +35,7 @@ async def _call_reviewer(
     timeline: _timeline._Timeline | None = None,
     on_engine: Callable[[str, str], object] | None = None,
     on_setting: Callable[[str, str, str], object] | None = None,
+    on_followup: Callable[[str], object] | None = None,
     **kwargs: Any,
 ) -> tuple[str, Dir]:
     """Return a sub-agent call, metered under `purpose` (judge name, planner, arbiter, contract).
@@ -45,6 +46,8 @@ async def _call_reviewer(
 
     `on_engine(engine, label)` and `on_setting(engine, model, effort)` are told what each call is about to
     run on, the second as separate values; a call that moves to the other engine reports again.
+    `on_followup(result)` is told what a `verdict_followup=True` call's same-session follow-up did
+    (`recovered` or `failed: <why>`); it is not called when none ran.
     """
     engine = kwargs.pop("engine", None)
     # A pre-routed Codex delegation passes Codex settings, which cannot run on Claude.
@@ -144,6 +147,8 @@ async def _call_reviewer(
             raise
     if suffix:
         purpose = f"{purpose or 'subagent'}{suffix}"
+    if on_followup and (followup := _usage._split_usage(text)[1].get("verdict_followup")):
+        on_followup(str(followup))
     clean = _usage._ingest_subagent_usage(
         text,
         purpose or kwargs.get("role") or "subagent",

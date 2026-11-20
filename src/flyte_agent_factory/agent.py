@@ -1058,6 +1058,7 @@ async def subagent(
     partial_base: str = "",
     seal: str = "",
     seal_role: str = "",
+    verdict_followup: bool = False,
 ) -> tuple[str, Dir]:
     """Return a nested Claude Code or Codex session in its own container, as a child action.
 
@@ -1096,6 +1097,8 @@ async def subagent(
             back in the returned `Dir` under `.seal-record/`. A call without one from a sealed project is
             refused.
         seal_role: The role id the caller registered for this call (`_seal_role.register_subagent`).
+        verdict_followup: A judge's call: when a reply has findings but no `VERDICT:` line, ask the
+            same session for the verdict only (`_verdict_recovery`) before the caller re-runs the review.
         role: One of the roles in `_assets/agents` -- `scope`, `discover`, `prototype`, `shape`,
             `build`, `verify`, or an old name (`product`, `designer`, `dev`, `qa`). Passed to Claude
             Code as `--agent`, which is its own mechanism for this; empty runs a general-purpose session.
@@ -1158,6 +1161,7 @@ async def subagent(
                     model=model,
                     effort=effort,
                     answer_only=answer_only,
+                    verdict_followup=verdict_followup,
                 )
                 return await _subagent_run._subagent_result(
                     summary, route_blob, routes=routes, refusals=refusals, unusable=unusable
@@ -1257,6 +1261,7 @@ async def subagent(
                 answer_only=answer_only,
                 partial_base=partial_base,
                 jail=jail,
+                verdict_followup=verdict_followup,
             )
             return await _subagent_run._subagent_result(
                 summary, route_blob, routes=routes, refusals=refusals, unusable=unusable
