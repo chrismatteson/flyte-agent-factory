@@ -254,7 +254,7 @@ def test_the_sdk_re_execs_the_task_under_the_wrapper(monkeypatch):
 
     runtime._maybe_reexec_under_wrapper()
 
-    # The SDK execs the init script, which execs `tini -s --` with the same arguments (keeping the PID).
+    # The SDK execs tini with the same arguments (keeping the PID); TINI_SUBREAPER stands in for `-s`.
     assert calls == [(_images.INIT_WRAPPER, [_images.INIT_WRAPPER, *sys.argv])]
     assert os.environ["_F_EXEC_WRAPPED"] == "1"
 
@@ -293,11 +293,14 @@ def test_every_image_env_value_is_one_word_for_the_local_docker_builder():
             assert not any(ch.isspace() for ch in value), (key, value)
 
 
-def test_the_init_script_execs_tini_as_a_subreaper(tmp_path):
-    """The one-word wrapper is a script that execs the same tini command the apps run."""
-    import subprocess
+def test_the_wrapper_is_the_apt_tini_binary_running_as_a_subreaper():
+    """No build command writes the wrapper: it is the apt-installed binary, so every builder has it."""
+    import flyte
+    from flyte._image import Commands, Env
 
-    script = tmp_path / "factory-init"
-    subprocess.run(["sh", "-c", f"printf '{_images._INIT_SCRIPT}' > {script}"], check=True)
-    assert script.read_text() == '#!/bin/sh\nexec tini -s -- "$@"\n'
+    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)))
+    env = dict(kv for layer in image._layers if isinstance(layer, Env) for kv in layer.env_vars)
+    assert env["_F_EXEC_WRAPPER"] == "/usr/bin/tini"
+    assert env["TINI_SUBREAPER"]
+    assert not [layer for layer in image._layers if isinstance(layer, Commands)]
     assert _images.INIT_COMMAND == ["tini", "-s", "--"]
