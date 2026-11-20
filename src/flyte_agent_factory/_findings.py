@@ -21,11 +21,40 @@ from dataclasses import dataclass, field
 # (`**VERDICT:** PASS`, `**VERDICT: PASS**`, backticks, a quote or heading prefix), a `-` or dash for the
 # colon, trailing punctuation and one short parenthetical. A line that merely mentions both words is not
 # a verdict: the word must follow the separator directly, and nothing else may trail it.
+# This is also what ends a finding (`_is_section`): keep it exactly this narrow, or a per-finding
+# `Verdict: FAIL - reproduced` line would cut a finding off from its evidence.
 VERDICT = re.compile(
     r"^[ \t>#*_`]*VERDICT[*_`]*[ \t]*[:\-–—][*_`]*[ \t]*[*_`]*(PASS|FAIL)[*_`]*[ \t]*[.!]?"
     r"[ \t]*(?:\([^()\n]{0,80}\))?[ \t]*[.!]?[*_`]*[ \t\r]*$",
     re.MULTILINE | re.IGNORECASE,
 )
+# The extra forms a judge writes for the same line: `Final verdict: PASS`, `Overall verdict = FAIL`, `=` as
+# the separator. No free-text reason tail: a reason can hedge ("PASS - but it fails on X"), and the
+# same-session follow-up recovers those replies. Read through `verdict_words`, never for a section boundary.
+VERDICT_VARIANT = re.compile(
+    r"^[ \t>#*_`]*(?:(?:FINAL|OVERALL)[ \t*_`]+)?VERDICT[*_`]*[ \t]*[:=\-–—][*_`]*[ \t]*[*_`]*(PASS|FAIL)"
+    r"[*_`]*[ \t]*[.!]?[ \t]*(?:\([^()\n]{0,80}\))?[ \t]*[.!]?[*_`]*[ \t\r]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def verdict_words(text: str) -> list[str]:
+    """Return the verdict words in `text`, in order: the strict lines if there are any, else a variant.
+
+    A variant never overrides a strict line, so a reply with a strict `VERDICT:` line reads exactly as it
+    did before the variants existed. A variant counts only as the reply's last non-blank line, outside a
+    code fence and not `>`-quoted: the judge's own closing line, never one it quoted from the author.
+    """
+    strict = VERDICT.findall(text or "")
+    if strict:
+        return strict
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    if not lines or lines[-1].lstrip().startswith(">"):
+        return []
+    if sum(1 for line in lines if _FENCE.match(line)) % 2:
+        return []
+    return VERDICT_VARIANT.findall(lines[-1])
+
 
 REPRODUCED, NOT_REPRODUCED = "REPRODUCED", "NOT_REPRODUCED"
 CANNOT_CHECK = "CANNOT_CHECK"
@@ -250,7 +279,7 @@ def select_blocking(findings: list[Finding]) -> list[Finding]:
 
 
 def _last_verdict_is_fail(text: str) -> bool:
-    verdicts = VERDICT.findall(text or "")
+    verdicts = verdict_words(text)
     return bool(verdicts) and verdicts[-1].upper() == "FAIL"
 
 

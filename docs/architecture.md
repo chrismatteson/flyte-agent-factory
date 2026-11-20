@@ -283,8 +283,16 @@ limit or the router put the call off) or `NOT_RUN` (it could not run; a timeout 
 A missing verdict is never a `FAIL` and never a pass:
 
 - **Verdict line.** The last `VERDICT: PASS|FAIL` line wins. Markdown around it (`**VERDICT:** PASS`, backticks, a
-  `>` quote, a heading, a `-` for the colon, trailing punctuation or a short parenthetical) is accepted; a line that
-  only mentions the words is not.
+  `>` quote, a heading, a `-` or dash for the colon, trailing punctuation, one short parenthetical) is accepted; a
+  line that only mentions the words is not (`the verdict is not PASS`, `VERDICT: PASS or FAIL`, a verdict word that
+  is not directly after the label, any ` - reason` after the word). `_findings.VERDICT` is exactly this pattern and
+  also ends a finding, so it must stay narrow. `_findings.VERDICT_VARIANT` additionally accepts `Final verdict:` /
+  `Overall verdict:` and `=` for the separator, with no reason tail (a reason can hedge: `PASS - but it fails on X`;
+  the follow-up recovers those replies). The variant is read only through `_findings.verdict_words`, which returns
+  the strict matches when there are any and otherwise a variant only when it is the reply's last non-blank line,
+  outside a code fence and not `>`-quoted (the judge's own closing line, never one it quoted). A variant never
+  overrides a strict line, and a reply with a strict line parses as it always did. Only the places that read the verdict or decide
+  whether a reply is usable use it, never a section boundary.
 - **No verdict.** The reason is recorded: `no output` (empty, or the sub-agent had no final message), `turn limit`,
   `tool or limit error`, or `unparseable`. The judge is asked again, up to two more times, on the other engine when
   there is one that is not exhausted and nothing is hard-pinned, otherwise on the same routing. Judges that did return
@@ -340,6 +348,59 @@ A missing verdict is never a `FAIL` and never a pass:
 
 `factory.status` shows the latest round's `review.judges` (outcome, reason, engine, attempts, carried) and the
 cumulative `review.no_verdict` counts by judge and by engine.
+
+##### Replies with no verdict: evidence, measurement and recovery
+
+*Evidence.* Every reply classified as no verdict, on every attempt, is appended as one JSON line to
+`<state root>/metrics/no_verdict.jsonl` (`_no_verdict.py`): the private state store that is checkpointed with the
+rest of the state, never the workspace, the project folder or a public repo. A record has `ts` (seconds since the Unix epoch, UTC), `round`, `judge`,
+`engine`, `model`, `effort`, `prompt_sha256`, `attempt`, `classification` (the reason above), `shape` (below),
+`reply_chars`, `reply`, `recovery` (`followup-recovered`, `followup-failed: <why>`,
+`not-attempted (skipped: no session id)`, `not-attempted (skipped: unclosed code fence)`, `not-attempted`) and
+`rerun` (a full judge re-run followed). **Retention**, enforced on each write: at most 500 records, none older than 30 days, and a reply is credential-redacted (`_bridge.redact_tokens`) and cut to 20 000
+characters (the first 15 000 and the last 5 000). A write that fails logs once and the review goes on.
+
+*Measurement.* The timeline counts, per judge and per engine, every judge call that returned a reply
+(`review.judge_calls`, the denominator), the no-verdict replies (`review.no_verdict`), the same-session follow-ups
+asked and recovered (`review.followups.attempted|recovered`) and the full re-runs (`review.reruns`). They are saved
+with the metrics state and restored after a restart (a state file from before them still loads). They count the
+project run so far, not a window of rounds. `factory.status` returns them under `review` with
+`review.no_verdict_rate`: `{by_judge|by_engine: {name: {calls, no_verdict, rate}}}` (`rate` is `null` without calls,
+so a snapshot with `no_verdict` but no `judge_calls` shows `calls` 0 and `rate` `null`; a snapshot with neither
+has no `no_verdict_rate`).
+
+*Report.* `PYTHONPATH=src python -m flyte_agent_factory._no_verdict report [--json] [--path P]` reads the
+evidence store and prints the counts by failure shape, by judge, by engine and by judge and shape, the follow-ups
+attempted and recovered (`followup` in total; `followups.attempted|recovered.by_judge|by_engine`) and the full
+re-runs (`full_reruns` in total; `reruns.by_judge|by_engine`), the same field names as `factory.status`. Shapes: `empty`, `error`, `turn-limit`, `near-miss-verdict` (a line that looks like a verdict and
+was rejected: the one to teach the parser), `findings-no-verdict` (`FINDING`/`BLOCKING`/`NON-BLOCKING` sections, no
+verdict), `truncated` (ends mid-sentence or inside a code block) and `prose-only`.
+
+*Recovery.* A judge call is made with `verdict_followup`. When a judge's reply is `unparseable` (it has
+content but no verdict line), the sub-agent asks the same session for the verdict only, before anything is re-run
+(`_verdict_recovery.py`): `claude -p --resume <session_id> --json-schema {verdict: PASS|FAIL} --max-turns 2 --tools ""`,
+"Your review above ended without its verdict. Do not re-review and do not change any finding." Only a structured
+`PASS` or `FAIL` counts (without the structured field, a result that is one verdict line). The reply then gets
+one line, `VERDICT: <X>`, after the original text, which is not touched (`_no_verdict.original_reply` strips it back
+exactly): the recovered reply is exactly what the judge would have written with its verdict line, so it parses to
+the same findings as that reply. Nothing else is added to the text; the recovery is reported in the usage trailer
+and as a timeline row. A reply cut off inside an open code fence is skipped (`skipped: unclosed code fence`), since
+a verdict line inside a fence is not a section break. Any failure, timeout or other answer returns the original text, and the full
+re-run above happens as before. `no output`, `turn limit` and `tool or limit error` are never followed up, and a
+reply that already has a verdict never costs a call. A recovered verdict changes no finding: correctness and
+completeness still decide from their findings (`_findings.decide`), so a recovered `PASS` beside an evidenced blocking
+finding is a `FAIL`, and a missing verdict is never a pass. Codex judges are followed up the same way: `_run_codex` keeps the
+`thread_id` of the `thread.started` event and the follow-up is one `codex exec resume --output-schema <verdict schema>
+-o <file> -- <thread_id> <prompt>` in the same `CODEX_HOME` and jail (a run with no thread id, or a Claude
+result without a `session_id`, is `skipped: no session id`). A skipped follow-up made no call and is not counted as
+attempted; only `recovered` and `failed: ...` are. The usage of the follow-up is added to the judge's own.
+
+*Live bar.* The goals (under 1% of judge calls unparseable, at least 80% less retry cost over 30 new rounds) are
+not tested offline. They are read from these fields after delivery: the rate is `review.no_verdict_rate`, and the
+retry cost is the follow-ups (`review.followups.attempted`, a two-turn call) against the full re-runs
+(`review.reruns`, a whole review each) per judge and engine, also in the report (`followups`, `reruns`). The
+re-run share is `reruns / (followups.attempted + reruns)`; before this change every no-verdict reply was a full
+re-run, so the at-least-80% drop is that share falling to 0.2 or less.
 
 A round that could not finish is not a round. When a judge is deferred by a usage limit, the review waits for
 the router's retry time (its `retry_at`, or the `retry at HH:MM UTC` in its text, else the reset the account

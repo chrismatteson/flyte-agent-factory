@@ -42,6 +42,7 @@ from flyte_agent_factory import (
     _timeline,
     _unprivileged,
     _usage,
+    _verdict_recovery,
 )
 from flyte_agent_factory._bridge import (
     Bridge,
@@ -383,7 +384,9 @@ def _final_text(stdout: str) -> str:
     """Pull the final message out of `claude -p --output-format json`.
 
     Falls back to raw stdout: a sub-agent that produced a useful answer in an
-    unexpected shape should not be reported as having produced nothing.
+    unexpected shape should not be reported as having produced nothing. A
+    successful result payload whose message is empty is the CLI saying the agent
+    wrote nothing, so it gives "" rather than the payload itself.
     """
     try:
         payload = json.loads(stdout)
@@ -394,6 +397,12 @@ def _final_text(stdout: str) -> str:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        if (
+            payload.get("type") == "result"
+            and payload.get("subtype") == "success"
+            and not payload.get("is_error")
+        ):
+            return ""
     return stdout.strip()
 
 
@@ -414,6 +423,17 @@ def _codex_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(v, (int, float)):
                 total[k] = total.get(k, 0) + int(v)
     return total
+
+
+def _codex_tokens(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Return `_codex_usage` under the usage-record field names (`_session_config._USAGE_FIELDS`)."""
+    usage = _codex_usage(events)
+    return {
+        "input_tokens": int(usage.get("input_tokens") or 0) - int(usage.get("cached_input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "cache_read_input_tokens": int(usage.get("cached_input_tokens") or 0),
+        "cache_creation_input_tokens": int(usage.get("cache_write_input_tokens") or 0),
+    }
 
 
 async def _codex_home(base: Path) -> Path:
@@ -456,6 +476,7 @@ async def _run_codex(
     effort: str = "medium",
     extra_env: dict[str, str] | None = None,
     sealed: _seal_subagent.SubagentSeal | None = None,
+    verdict_followup: bool = False,
 ) -> str:
     """Run one Codex sub-agent in `work`; its final message, plus the usage trailer.
 
@@ -571,12 +592,8 @@ async def _run_codex(
         if _CODEX_LIMIT.search(detail):
             raise RuntimeError(f"{_usage.USAGE_LIMIT_MARK} codex: {detail[-200:]}")
         raise RuntimeError(f"codex sub-agent exited {proc.returncode}: {detail}")
-    usage = _codex_usage(events)
     rec = {
-        "input_tokens": int(usage.get("input_tokens") or 0) - int(usage.get("cached_input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "cache_read_input_tokens": int(usage.get("cached_input_tokens") or 0),
-        "cache_creation_input_tokens": int(usage.get("cache_write_input_tokens") or 0),
+        **_codex_tokens(events),
         "cost_usd": 0.0,
         "models": [model or "codex:default"],
         "engine": "codex",
@@ -584,7 +601,26 @@ async def _run_codex(
         "turns": 0,
         **({"rate_limits": observed.to_dict()} if observed else {}),
     }
-    return answer + f"{_usage._USAGE_MARK}{json.dumps(rec)}-->"
+    trailer = f"{_usage._USAGE_MARK}{json.dumps(rec)}-->"
+    if verdict_followup:
+        thread_id = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
+        followup = await _verdict_recovery.recover(
+            answer,
+            {"session_id": thread_id if isinstance(thread_id, str) else ""},
+            functools.partial(
+                _verdict_recovery.run_codex,
+                work,
+                env,
+                model=model,
+                effort=effort,
+                tokens=_codex_tokens,
+                wrap=jail.wrap if jail else list,
+                tools_off=_seal_role.CODEX_TOOLS_OFF_ARGS if jail else (),
+                scratch=base,
+            ),
+        )
+        answer, trailer = followup.text, _verdict_recovery.with_followup(trailer, followup)
+    return answer + trailer
 
 
 def _subagent_memory(answer_only: bool = False) -> str:
@@ -622,6 +658,7 @@ async def _run_codex_session(
     model: str,
     effort: str,
     answer_only: bool,
+    verdict_followup: bool = False,
 ) -> str:
     """Run one Codex sub-agent session, with the brief written, the harness excluded and the bridge up.
 
@@ -644,6 +681,7 @@ async def _run_codex_session(
             model=model,
             effort=effort,
             sealed=sealed,
+            verdict_followup=verdict_followup,
             extra_env={
                 **_session_setup._session_env(_session_setup._export_runtime_env()),
                 "AGENT_FACTORY_WORKSPACE": str(work),
@@ -685,6 +723,7 @@ async def _claude_summary(
     answer_only: bool,
     partial_base: str,
     jail: Any,
+    verdict_followup: bool = False,
 ) -> str:
     """Return the text a finished `claude -p` sub-agent leaves, or raise the error its exit stands for."""
     out = raw.decode(errors="replace")
@@ -727,13 +766,29 @@ async def _claude_summary(
 
     _raise_on_cli_error(out)
     summary = _final_text(out) or _reviewer._NO_FINAL_MESSAGE
+    trailer = _usage._usage_trailer(out)
+    if verdict_followup and isinstance(payload, dict):
+        followup = await _verdict_recovery.recover(
+            summary,
+            payload,
+            functools.partial(
+                _verdict_recovery.run_claude,
+                argv[0],
+                work,
+                env,
+                model,
+                effort,
+                launcher=jail.argv_prefix if jail else (),
+            ),
+        )
+        summary, trailer = followup.text, _verdict_recovery.with_followup(trailer, followup)
     await flyte.report.log.aio(
         f"<h3>Sub-agent{f' · {html.escape(role)}' if role else ''}</h3>"
         f"<pre>{html.escape(brief[:1000])}</pre><hr><pre>{html.escape(summary[:4000])}</pre>",
         do_flush=True,
     )
     # Added after the report log so the log stays clean; `_call_reviewer` strips it.
-    return summary + _usage._usage_trailer(out)
+    return summary + trailer
 
 
 async def _subagent_workspace(workdir: Dir | None, repo: str, branch: str) -> tuple[Path, Path]:

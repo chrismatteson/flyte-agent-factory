@@ -24,6 +24,7 @@ from flyte_agent_factory import (
     _inbox,
     _issues,
     _judge_inputs,
+    _no_verdict,
     _policy,
     _reviewer,
     _roles,
@@ -42,35 +43,11 @@ PASS, FAIL, ADVISORY = "PASS", "FAIL", "ADVISORY"
 NO_VERDICT, DEFERRED, NOT_RUN = "NO_VERDICT", "DEFERRED", "NOT_RUN"
 #: Attempts at one judge that returned no verdict: the first and two retries.
 _NO_VERDICT_ATTEMPTS = 3
-#: A reply shorter than this whose first line starts the way a CLI or API error does is that error.
-_ERROR_ONLY_CHARS = 400
-#: How a CLI or API error begins. Only a reply whose first non-empty line starts this way is the error
-#: itself; a review that mentions a rate limit or an error, even at the start of a later line, is a review.
-_ERROR_START = re.compile(r"\[?(?:API Error|HTTP 429|You'?ve hit)", re.IGNORECASE)
-
-
-def _is_only_an_error(flat: str) -> bool:
-    """Return whether a stripped, non-empty reply is a tool or limit error rather than a review."""
-    first = flat.splitlines()[0]
-    if first.startswith(_usage.USAGE_LIMIT_MARK):
-        return True
-    return len(flat) < _ERROR_ONLY_CHARS and bool(_ERROR_START.match(first))
 
 
 def _classify_no_verdict(text: str) -> str:
-    """Return why a judge's text holds no verdict: no output, turn limit, tool or limit error, or unparseable.
-
-    A call that raised a timeout never gets here: that is NOT_RUN with reason `timeout` (see `_one_judge`).
-    """
-    flat = (text or "").strip()
-    if not flat or flat == _reviewer._NO_FINAL_MESSAGE:
-        return "no output"
-    # On a turn limit the CLI may exit 0 and the "text" is its raw result JSON.
-    if "error_max_turns" in flat:
-        return "turn limit"
-    if _is_only_an_error(flat):
-        return "tool or limit error"
-    return "unparseable"
+    """Return why a judge's text holds no verdict: no output, turn limit, tool or limit error, unparseable."""
+    return _no_verdict.classify(text)
 
 
 @dataclass
@@ -769,7 +746,7 @@ def _find_usable_result_gap(text: str, advisory_craft: bool) -> str:
     an empty one, the raw result of a turn limit, or a short reply that is only a tool or limit error
     means craft did not run.
     """
-    if _VERDICT.search(text):
+    if _findings.verdict_words(text):
         return ""
     reason = _classify_no_verdict(text)
     if advisory_craft:
@@ -825,6 +802,7 @@ async def _one_judge(
     for tries in range(1, _NO_VERDICT_ATTEMPTS + 1):
         text: str | None = None
         error: Exception | None = None
+        followup: list[str] = []  # what the sub-agent's verdict follow-up did, if it ran
         limit_text, retry_at, probe_at = "", None, None
         for attempt in (1, 2):
             try:
@@ -854,6 +832,8 @@ async def _one_judge(
                     model=setting.model,
                     effort=setting.effort,
                     max_turns=120,
+                    verdict_followup=not advisory_craft,  # an advisory craft needs no verdict
+                    on_followup=followup.append,
                     on_engine=lambda name, _label: used.append(name),
                     on_setting=lambda _engine, model, effort: seen.update({"model": model, "effort": effort}),
                     **({"engine": engine} if engine else {}),
@@ -895,10 +875,23 @@ async def _one_judge(
                 timeline.row("⚠️", f"{display}: NOT RUN ({reason})")
             return judge, False, ""
         reason = _find_usable_result_gap(text, advisory_craft)
+        last = tries == _NO_VERDICT_ATTEMPTS
+        recovered = _no_verdict.note_reply(
+            timeline,
+            judge=judge,
+            engine=ran_on,
+            round_=round_,
+            attempt=tries,
+            text=text,
+            reason=reason,
+            followup=followup[-1] if followup else "",
+            seen=seen,
+            last=last,
+        )
+        if recovered:
+            timeline.row("🩹", f"{display}: verdict recovered by a follow-up on the same session")
         if not reason:
             break
-        timeline.count_no_verdict(judge, ran_on)
-        last = tries == _NO_VERDICT_ATTEMPTS
         engine = None if last else _pick_other_engine(ran_on)
         timeline.row(
             "⚠️",
@@ -993,7 +986,7 @@ async def _one_judge(
             return judge, True, _review_report(text)
     # The *last* verdict line: the prompt puts it last, and a reviewer quoting the
     # author (whose notes it now sees) must not have a quoted "VERDICT: PASS" win.
-    verdict = verdict or list(_VERDICT.finditer(text or ""))[-1].group(1).upper()
+    verdict = verdict or _findings.verdict_words(text)[-1].upper()
     passed = verdict == PASS
     if blocking is not None:
         blocking.append(_blocking_count(text, passed))

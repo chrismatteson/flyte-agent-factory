@@ -722,6 +722,7 @@ def _ingest_subagent_usage(
     reattached delegate), is when it ran: that tells a stale refusal from a new one.
     """
     clean, rec = _split_usage(text)
+    rec.pop("verdict_followup", None)  # read by `_call_reviewer`; not a usage field
     route = rec.pop("route", None)
     for decision in rec.pop("routes", None) or [route]:
         _ingest_route(decision, timeline)

@@ -64,6 +64,20 @@ def _bounded_history(history: list[list[Any]]) -> list[list[Any]]:
     return [history[0], *history[-(PHASE_HISTORY_MAX - 1) :]]
 
 
+def _empty_counts() -> dict[str, dict[str, int]]:
+    return {"by_judge": {}, "by_engine": {}}
+
+
+def _bump(counts: dict[str, dict[str, int]], judge: str, engine: str) -> None:
+    for key, name in (("by_judge", judge), ("by_engine", engine or "unknown")):
+        counts[key][name] = counts[key].get(name, 0) + 1
+
+
+def _read_counts(saved: Any) -> dict[str, dict[str, int]]:
+    """Return counts as saved by `_metrics_state`; raises on any other shape, so the caller keeps zeros."""
+    return {key: {str(k): int(n) for k, n in saved[key].items()} for key in ("by_judge", "by_engine")}
+
+
 def _log_line(text: str, *, err: bool = False) -> None:
     print(text, file=sys.stderr if err else sys.stdout, flush=True)
 
@@ -218,7 +232,16 @@ class _Timeline:
         #: The latest review round's judges: judge -> {outcome, reason, engine, attempts, carried}.
         self.judges: dict[str, dict[str, Any]] = {}
         #: Every time a judge returned no verdict (retries included), by judge and by engine.
-        self.no_verdict: dict[str, dict[str, int]] = {"by_judge": {}, "by_engine": {}}
+        self.no_verdict: dict[str, dict[str, int]] = _empty_counts()
+        #: Every judge call that returned a reply (the no-verdict rate's denominator), by judge and engine.
+        #: Like `no_verdict` these count one project run, not a window of rounds; a restart keeps them.
+        self.judge_calls: dict[str, dict[str, int]] = _empty_counts()
+        #: Same-session verdict follow-ups asked, and how many returned a verdict; full judge re-runs started.
+        self.followups: dict[str, dict[str, dict[str, int]]] = {
+            "attempted": _empty_counts(),
+            "recovered": _empty_counts(),
+        }
+        self.reruns: dict[str, dict[str, int]] = _empty_counts()
         #: judge -> its PASS/ADVISORY on a commit whose review round ended undecided (`_review._Carried`
         #: fields), so the re-run asks only the judges still missing, across a restart too.
         self.carried: dict[str, dict[str, Any]] = {}
@@ -263,8 +286,24 @@ class _Timeline:
 
     def count_no_verdict(self, judge: str, engine: str) -> None:
         """Count one judge call that returned no verdict, under the judge and the engine it ran on."""
-        for key, name in (("by_judge", judge), ("by_engine", engine or "unknown")):
-            self.no_verdict[key][name] = self.no_verdict[key].get(name, 0) + 1
+        _bump(self.no_verdict, judge, engine)
+        self._dirty = True
+
+    def count_judge_call(self, judge: str, engine: str) -> None:
+        """Count one judge call that returned a reply, whatever the reply held."""
+        _bump(self.judge_calls, judge, engine)
+        self._dirty = True
+
+    def count_followup(self, judge: str, engine: str, *, recovered: bool) -> None:
+        """Count one same-session verdict follow-up, and whether it returned a verdict."""
+        _bump(self.followups["attempted"], judge, engine)
+        if recovered:
+            _bump(self.followups["recovered"], judge, engine)
+        self._dirty = True
+
+    def count_rerun(self, judge: str, engine: str) -> None:
+        """Count one full judge re-run started because the reply had no verdict."""
+        _bump(self.reruns, judge, engine)
         self._dirty = True
 
     def _metrics_path(self) -> Path:
@@ -285,6 +324,9 @@ class _Timeline:
             "last_round_head": self.last_round_head,
             "judges": self.judges,
             "no_verdict": self.no_verdict,
+            "judge_calls": self.judge_calls,
+            "followups": self.followups,
+            "reruns": self.reruns,
             "carried": self.carried,
         }
 
@@ -338,6 +380,24 @@ class _Timeline:
             self.no_verdict = {
                 key: {str(k): int(n) for k, n in saved["no_verdict"][key].items()}
                 for key in ("by_judge", "by_engine")
+            }
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+        if "judge_calls" not in saved:
+            # A file from before the call counts: every no-verdict reply was a call, so seeding the calls
+            # from them keeps the rate at most 1 instead of dividing by the calls made since the restart.
+            self.judge_calls = {key: dict(counts) for key, counts in self.no_verdict.items()}
+        try:
+            self.judge_calls = _read_counts(saved["judge_calls"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+        try:
+            self.reruns = _read_counts(saved["reruns"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            pass
+        try:
+            self.followups = {
+                key: _read_counts(saved["followups"][key]) for key in ("attempted", "recovered")
             }
         except (ValueError, TypeError, KeyError, AttributeError):
             pass
@@ -725,6 +785,12 @@ class _Timeline:
                 "open": list(self.open_findings),
                 "judges": {j: dict(v) for j, v in self.judges.items()},
                 "no_verdict": {key: dict(counts) for key, counts in self.no_verdict.items()},
+                "judge_calls": {key: dict(counts) for key, counts in self.judge_calls.items()},
+                "followups": {
+                    kind: {key: dict(counts) for key, counts in by.items()}
+                    for kind, by in self.followups.items()
+                },
+                "reruns": {key: dict(counts) for key, counts in self.reruns.items()},
                 "converging": self.converging,
                 "rulings": len(_session_config._rulings),
             },
