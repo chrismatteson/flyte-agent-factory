@@ -69,13 +69,22 @@ TAILSCALE_SHA256 = "41a8931fa52055bd7ea4b51df9acff2ba2d4e9000c2380b667539b5b9999
 # (`flyte/_bin/runtime.py::_maybe_reexec_under_wrapper`, flyte 2.13.5 pinned in uv.lock) re-execs `a0` under
 # the command in env `_F_EXEC_WRAPPER`; exec keeps the PID, so tini becomes PID 1 and `a0` its child. tini
 # reaps every orphan and forwards signals; `-s` makes it a subreaper so it still reaps when not PID 1.
-INIT_WRAPPER = "tini -s --"
-INIT_COMMAND: list[str] = shlex.split(INIT_WRAPPER)
+INIT_COMMAND: list[str] = ["tini", "-s", "--"]
+# The env value is one word, a script that execs INIT_COMMAND: the SDK's local (docker) builder writes env
+# vars as `ENV key=value` unquoted, and a value with spaces ("tini -s --") is a Dockerfile syntax error, so
+# a hand deploy with `image_builder = "local"` (OSS) failed to build every image. The script keeps the PID:
+# sh execs tini.
+INIT_WRAPPER = "/usr/local/bin/factory-init"
+_INIT_SCRIPT = f'#!/bin/sh\\nexec {shlex.join(INIT_COMMAND)} "$@"\\n'
 
 
 def with_init(image: flyte.Image) -> flyte.Image:
     """Return `image` with tini installed and the SDK told to run the task under it."""
-    return image.with_apt_packages("tini").with_env_vars({"_F_EXEC_WRAPPER": INIT_WRAPPER})
+    return (
+        image.with_apt_packages("tini")
+        .with_commands([f"printf '{_INIT_SCRIPT}' > {INIT_WRAPPER} && chmod 0755 {INIT_WRAPPER}"])
+        .with_env_vars({"_F_EXEC_WRAPPER": INIT_WRAPPER})
+    )
 
 
 def run_as_flyte(image: flyte.Image) -> flyte.Image:
