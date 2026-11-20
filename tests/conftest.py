@@ -189,6 +189,16 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 @pytest.fixture(autouse=True)
+def _no_engine_input_pin_left_by_another_test(monkeypatch):
+    """`project` pins its `engine` input in a module global (`_author._engine_input_pin`); a test that runs
+    it would otherwise pin the next test on that worker (seen: a COORDINATOR_ENGINE=claude test routed to
+    codex)."""
+    from flyte_agent_factory import _pins
+
+    monkeypatch.setattr(_pins, "engine_input", "")
+
+
+@pytest.fixture(autouse=True)
 def _fixture_project_runs_from_its_root(request, monkeypatch):
     """A fixture project's own tests run from that project's root, as they do from a copy.
 

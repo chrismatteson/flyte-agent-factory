@@ -6,7 +6,9 @@ Fakes sit at GitHub HTTP, Flyte run submission/listing, and the final subprocess
 import base64
 import contextlib
 import dataclasses
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,12 +22,15 @@ from typing import Any, cast
 import flyte
 import httpx
 import pytest
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
 from flyte import remote
 from flyteidl2.workflow.run_definition_pb2 import ActionStatus  # type: ignore[import-untyped]  # no py.typed marker
 from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyped]  # no stubs installed
 
 from flyte_agent_factory import (
     _deploy,
+    _deploy_apps,
     _deploy_child,
     _deployer,
     _factory,
@@ -151,6 +156,9 @@ class World:
         self.live_runs: list[str] = []
         self.runs: list[SimpleNamespace] = []
         self.submissions: list[Any] = []
+        # Flyte secrets that exist; `Secret.get` of any other name is NOT_FOUND, unless `secret_error` is set.
+        self.secrets: set[str] = set()
+        self.secret_error: Code | None = None
         self.fetched: list[tuple[str, str]] = []
         self.slot_calls: list[dict[str, Any]] = []
         self.factory_calls: list[dict[str, Any]] = []
@@ -162,6 +170,21 @@ class World:
         self.direction_tree.mkdir()
         self.direction_fetch_error: str | None = None
         self.direction_reads: list[tuple[str, Any]] = []
+        # The compare endpoint: a body per (base, head), else `compare_default`, else 404; an int is a status.
+        self.compares: dict[tuple[str, str], Any] = {}
+        self.compare_default: Any = None
+        self.compare_calls: list[tuple[str, str]] = []
+        # The recursive tree at a head: `direction_tree` as it is on disk (links as links), unless this is set
+        # (a body, or an int status). `subtree_answer` is the same for a tree sha served before, which is
+        # otherwise that tree listed whole; `recursive_calls` is every recursive request.
+        self.tree_answer: Any = None
+        self.subtree_answer: Any = None
+        self.recursive_calls: list[str] = []
+        # The non-recursive trees (what `_deploy_reads` compares): the tree each sha asked for was served as,
+        # and every request. Paths here are absent from the deployed direction commit's tree.
+        self.subtrees: dict[str, list[dict[str, str]]] = {}
+        self.tree_calls: list[str] = []
+        self.added_since_deployed: set[str] = set()
         self.moved_tree = tmp_path / "moved-tree"
         self.moved_tree.mkdir()
         self.moved_fetch_error: str | None = None
@@ -256,6 +279,15 @@ class World:
         monkeypatch.setattr(_deployer, "RUN_LISTING_CONSISTENT", consistent)
         monkeypatch.setattr(_deployer, "_say", say)
         monkeypatch.setattr(remote.Run, "get", get)
+
+        def get_secret(name, *args, **kw):
+            if self.secret_error is not None:
+                raise ConnectError(self.secret_error, "lookup failed")
+            if name not in self.secrets:
+                raise ConnectError(Code.NOT_FOUND, f"secret {name} not found")
+            return SimpleNamespace(name=name)
+
+        monkeypatch.setattr(remote.Secret, "get", get_secret)
         monkeypatch.setattr(_deployer, "_submit", submit)
         monkeypatch.setattr(_deploy, "fetched_tree", fetched_tree)
         monkeypatch.setattr(_deploy, "check_in_tree", check_in_tree)
@@ -267,6 +299,8 @@ class World:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path.startswith("/repos/acme/direction/git/trees/"):
+            return self.git_tree(request)
         if "/git/" in path:
             body = json.loads(request.content) if request.content else None
             try:
@@ -283,6 +317,8 @@ class World:
             )
         if not path.startswith("/repos/acme/direction"):
             return self.gh.handler(request)
+        if path.startswith("/repos/acme/direction/compare/"):
+            return self.compare(request)
         if path.startswith("/repos/acme/direction/contents/"):
             # The tick reads the direction profile at the head it judges, to find a move (`_move_head`).
             self.direction_reads.append(
@@ -301,6 +337,133 @@ class World:
                 request.method, request.url.copy_with(path=path.replace("acme/direction", "acme/factory"))
             )
         )
+
+    def compare(self, request: httpx.Request) -> httpx.Response:
+        base, head = request.url.path.removeprefix("/repos/acme/direction/compare/").split("...")
+        self.compare_calls.append((base, head))
+        answer = self.compares.get((base, head), self.compare_default)
+        if answer is None:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if isinstance(answer, int):
+            return httpx.Response(answer, json={"message": "failed"})
+        # GitHub pages the file list (at most 300 files in all).
+        page, per_page = int(request.url.params["page"]), int(request.url.params["per_page"])
+        if not isinstance(answer.get("files"), list):
+            return httpx.Response(200, json=answer)
+        files = answer["files"][(page - 1) * per_page : page * per_page]
+        return httpx.Response(200, json={**answer, "files": files})
+
+    def git_tree(self, request: httpx.Request) -> httpx.Response:
+        sha = request.url.path.removeprefix("/repos/acme/direction/git/trees/")
+        if "recursive" not in request.url.params:
+            return self.git_subtree(sha)
+        self.recursive_calls.append(sha)
+        answer = self.subtree_answer if sha in self.subtrees else self.tree_answer
+        if isinstance(answer, int):
+            return httpx.Response(answer, json={"message": "failed"})
+        if answer is not None:
+            return httpx.Response(200, json=answer)
+        if sha in self.subtrees:
+            return httpx.Response(200, json={"sha": sha, "tree": self.flatten(sha, ""), "truncated": False})
+        entries = []
+        for item in sorted(self.direction_tree.rglob("*")):
+            rel_path = item.relative_to(self.direction_tree)
+            if any((self.direction_tree / up).is_symlink() for up in rel_path.parents if up.name):
+                continue  # git does not descend into a linked directory
+            rel = rel_path.as_posix()
+            mode = "120000" if item.is_symlink() else "040000" if item.is_dir() else "100644"
+            entries.append({"path": rel, "mode": mode, "type": "tree" if mode == "040000" else "blob"})
+        return httpx.Response(200, json={"sha": "t", "tree": entries, "truncated": False})
+
+    def git_subtree(self, sha: str) -> httpx.Response:
+        """One directory of the direction tree, for a commit sha (its root) or a tree sha served before.
+
+        Shas come from content: a blob's from its bytes, a tree's from its entries. For the deployed commit
+        (the base of the latest compare) every path `compare_default` names, and each ancestor, differs, so
+        "these files changed between the two commits" means just that to a comparison of objects.
+        """
+        self.tree_calls.append(sha)
+        # A sha not served before is a commit: its root is the tree on disk.
+        if sha not in self.subtrees:
+            base, head = self.compare_calls[-1] if self.compare_calls else ("", "")
+            if sha not in (base, head):
+                return httpx.Response(404, json={"message": "Not Found"})
+            answer = self.compares.get((base, head), self.compare_default)
+            files = answer.get("files") if isinstance(answer, dict) else None
+            names = {
+                name
+                for f in files or []
+                if isinstance(f, dict)
+                for name in (f.get("filename"), f.get("previous_filename"))
+                if name
+            }
+            return httpx.Response(
+                200, json={"sha": sha, "tree": self.serve_tree(deployed=sha == base, changed=names)}
+            )
+        return httpx.Response(200, json={"sha": sha, "tree": self.subtrees[sha], "truncated": False})
+
+    def flatten(self, sha: str, prefix: str) -> list[dict[str, str]]:
+        """A tree served before, with every subtree below it, as a recursive request lists it."""
+        entries = []
+        for entry in self.subtrees[sha]:
+            entries.append({**entry, "path": prefix + entry["path"]})
+            if entry["type"] == "tree":
+                entries += self.flatten(entry["sha"], f"{prefix}{entry['path']}/")
+        return entries
+
+    def serve_tree(self, *, deployed: bool, changed: set[str]) -> list[dict[str, str]]:
+        """The root of the on-disk tree, as the deployed commit saw it (with `changed`), or the head."""
+        files: dict[str, tuple[str, bytes]] = {}  # path -> (mode, bytes)
+        for item in sorted(self.direction_tree.rglob("*")):
+            rel_path = item.relative_to(self.direction_tree)
+            if any((self.direction_tree / up).is_symlink() for up in rel_path.parents if up.name):
+                continue  # git does not descend into a linked directory
+            if item.is_symlink():
+                files[rel_path.as_posix()] = ("120000", os.readlink(item).encode())
+            elif item.is_file():
+                files[rel_path.as_posix()] = ("100644", item.read_bytes())
+        if deployed:
+            for name in changed:
+                mode, content = files.get(name, ("100644", b""))
+                files[name] = (mode, content + b"|before")
+            for name in self.added_since_deployed:
+                files.pop(name, None)
+        return self.record_tree(files, "")
+
+    def record_tree(self, files: dict[str, tuple[str, bytes]], prefix: str) -> list[dict[str, str]]:
+        entries: dict[str, dict[str, str]] = {}
+        for path, (mode, content) in files.items():
+            name, _, rest = path.removeprefix(prefix).partition("/")
+            if rest:
+                continue
+            blob = hashlib.sha1(content).hexdigest()
+            entries[name] = {"path": name, "mode": mode, "type": "blob", "sha": blob}
+        for path in files:
+            name, _, rest = path.removeprefix(prefix).partition("/")
+            if rest and name not in entries:
+                entries[name] = {"path": name, "mode": "040000", "type": "tree", "sha": ""}
+        for name, entry in entries.items():
+            if entry["type"] == "tree":
+                inside = {p: v for p, v in files.items() if p.startswith(f"{prefix}{name}/")}
+                below = self.record_tree(inside, f"{prefix}{name}/")
+                entry["sha"] = self.tree_sha(below)
+        listing = sorted(entries.values(), key=lambda e: e["path"])
+        self.subtrees[self.tree_sha(listing)] = listing
+        return listing
+
+    @staticmethod
+    def tree_sha(entries: list[dict[str, str]]) -> str:
+        return hashlib.sha1(json.dumps(entries).encode()).hexdigest()
+
+    def changed(self, *names: str | tuple[str, str], status: str = "ahead") -> dict[str, Any]:
+        """A compare body for these files; a (previous, new) pair is a rename."""
+        files = [
+            {"filename": n[1], "previous_filename": n[0], "status": "renamed"}
+            if isinstance(n, tuple)
+            else {"filename": n, "status": "modified"}
+            for n in names
+        ]
+        return {"status": status, "files": files}
 
     def add_run(self, phase, *, labels=None, inputs=None, output=None, record=None, name=None, started=True):
         async def outputs():
@@ -1779,12 +1942,14 @@ SLOTS_CHILD, FACTORY_CHILD, APPS_CHILD = (
 """
 _FLYTE_STUB_BODY = r'''
 _FLYTE_STUB = """
-import json as _json
+import asyncio as _asyncio, json as _json, types
+from flyteidl2.app import app_definition_pb2 as _pb
 flyte.init_from_config = lambda *args, **kw: None
 
 
 class _App:
     endpoint = "https://factory.example"
+    pb2 = types.SimpleNamespace(spec=_pb.Spec())
 
     def is_active(self):
         return True
@@ -1812,6 +1977,8 @@ class _Deployment:
 
 def _stub_deploy(*envs, dry_run):
     deployment = _Deployment(envs)
+    if dry_run and not dry:  # an app's "unchanged?" probe in a real deploy: not a deploy
+        return [deployment]
     with open(os.environ["TEST_DEPLOY_LOG"], "a") as log:
         entry = {"envs": sorted(deployment.envs), "widget": os.environ.get("CLAUDE_WIDGET")}
         log.write(_json.dumps(entry) + "\\n")
@@ -1833,12 +2000,17 @@ class _NoApps:
         from connectrpc.code import Code
         from connectrpc.errors import ConnectError
 
-        if name == "factory-mcp":  # the factory stage polls it until it is active
+        if name in ("factory-mcp", "factory-webhook"):  # polled until active; the webhook's URL is read
             return _App()
         raise ConnectError(Code.NOT_FOUND, name)
 
 
 import flyte.remote as _remote
+# The deployed factory-mcp equals the planned one only when a test says so: else it is deployed, as before the
+# unchanged check.
+_NoApps._app_specs_are_equal = staticmethod(
+    lambda old, new: _asyncio.sleep(0, os.environ.get("TEST_MCP_UNCHANGED") == "1")
+)
 _remote.App = _NoApps
 """
 '''
@@ -1900,6 +2072,58 @@ async def test_a_new_key_that_adds_an_env_and_a_slot_variable_deploys_both(direc
     assert "widget" in capsys.readouterr().err  # the running deployer says what it did not read
     assert (await directed.tick()).startswith("up to date")
     assert len(deploys(directed)) == 4
+
+
+async def test_a_deploy_that_leaves_an_unchanged_factory_mcp_running_succeeds(world, monkeypatch, capfd):
+    # The engine moved (slot code, say) but factory-mcp would run what it runs: everything else deploys, it
+    # is not restarted, and the deploy is a success that counts it as live, URL and all.
+    real_engine(world, monkeypatch)
+    monkeypatch.setenv("TEST_MCP_UNCHANGED", "1")
+    world.record(OLD_SHA)
+    assert (await world.tick()).startswith(f"deployed {SHA}")
+    *slots, factory, last = deploys(world)
+    assert "factory-mcp" not in factory["envs"] and "factory" in factory["envs"]
+    assert last["envs"] == ["factory-deployer"]
+    assert "factory-mcp" in world.last["envs"] and world.last["sha"] == SHA and world.failed is None
+    out = capfd.readouterr()  # the deploy child's output: its own process
+    shown = out.out + out.err
+    assert "factory-mcp unchanged: not redeployed" in shown and "factory-mcp public URL:" in shown
+
+
+async def test_a_deploy_that_leaves_an_unchanged_factory_webhook_running_succeeds(world, monkeypatch, capfd):
+    # The second app of the factory stage: with a webhook secret in the profile it is left running like
+    # factory-mcp, and the release counts it as live with its URL printed.
+    real_engine(world, monkeypatch)
+    monkeypatch.setenv("TEST_MCP_UNCHANGED", "1")
+    world.ship_profile(
+        world.profile.text.replace(
+            'private_key_secret = "github_key_x"\n',
+            'private_key_secret = "github_key_x"\nwebhook_secret = "hook"\n',
+        )
+    )
+    world.record(OLD_SHA)
+    assert (await world.tick()).startswith(f"deployed {SHA}")
+    *slots, factory, last = deploys(world)
+    assert "factory-webhook" not in factory["envs"] and "factory" in factory["envs"]
+    assert "factory-webhook" in world.last["envs"] and world.last["sha"] == SHA and world.failed is None
+    out = capfd.readouterr()
+    shown = out.out + out.err
+    assert "factory-webhook unchanged: not redeployed" in shown
+    assert "factory-webhook public URL: https://factory.example" in shown
+    assert "GitHub webhook URL: https://factory.example/github" in shown
+
+
+async def test_a_restart_asked_for_deploys_an_unchanged_factory_mcp(world, monkeypatch, capfd):
+    real_engine(world, monkeypatch)
+    monkeypatch.setenv("TEST_MCP_UNCHANGED", "1")
+    # What `ops/deploy_factory.py --restart-mcp` sets.
+    monkeypatch.setenv(_deploy_apps.RESTART_APPS_ENV, "factory-mcp")
+    world.record(OLD_SHA)
+    assert (await world.tick()).startswith(f"deployed {SHA}")
+    *slots, factory, last = deploys(world)
+    assert "factory-mcp" in factory["envs"]
+    out = capfd.readouterr()
+    assert "restarting as asked" in out.out + out.err and "factory-mcp unchanged" not in out.out + out.err
 
 
 async def test_a_new_key_in_the_engine_trees_own_profile_deploys_with_that_engine(world, monkeypatch):
@@ -2136,11 +2360,40 @@ async def test_missing_secrets_end_the_attempt_without_a_release_or_a_failure(wo
     assert release is not None and release[1] == (OLD_SHA, "")
 
 
+async def test_the_next_tick_waits_for_the_secrets_instead_of_submitting(world, monkeypatch):
+    _missing(world, monkeypatch, {"browser_personal_token": ["claude-browser-personal"]})
+    await world.tick()
+    submitted = len(world.submissions)
+    message = await _deployer.run_once(world.profile, "run-2", world.app, world.clock())
+    assert message.startswith(f"waiting for secrets at {SHA}")
+    assert "browser_personal_token" in message
+    assert len(world.submissions) == submitted
+
+
+async def test_a_created_secret_lets_the_next_tick_submit(world, monkeypatch):
+    _missing(world, monkeypatch, {"browser_personal_token": ["claude-browser-personal"]})
+    await world.tick()
+    world.secrets.add("browser_personal_token")
+    message = await _deployer.run_once(world.profile, "run-2", world.app, world.clock())
+    assert message.startswith(f"submitted {SHA}")
+
+
+async def test_a_moved_head_submits_despite_missing_secrets(world, monkeypatch):
+    _missing(world, monkeypatch, {"browser_personal_token": ["claude-browser-personal"]})
+    await world.tick()
+    world.gh.head_sha = NEW_SHA
+    message = await _deployer.run_once(world.profile, "run-2", world.app, world.clock())
+    assert message.startswith(f"submitted {NEW_SHA}")
+
+
+# A tick that cannot tell whether the secrets exist falls back to an attempt naming what the last waited for.
 async def test_the_next_tick_names_the_secrets_and_still_submits_an_attempt(world, monkeypatch):
     _missing(world, monkeypatch, {"browser_personal_token": ["claude-browser-personal"]})
     await world.tick()
+    world.secret_error = Code.UNAVAILABLE
     message = await _deployer.run_once(world.profile, "run-2", world.app, world.clock())
     assert message.startswith(f"submitted {SHA}") and "waiting for secrets: browser_personal_token" in message
+    assert any("could not check secret browser_personal_token" in line for line in world.said)
 
 
 def test_the_pair_report_names_the_secrets_it_waits_for():

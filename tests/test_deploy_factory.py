@@ -208,6 +208,30 @@ def test_only_known_factory_settings_forwarded(monkeypatch):
     assert env["FACTORY_MCP_ALLOW_LOCALHOST"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("flags", "asked"),
+    [
+        ([], None),
+        (["--restart-mcp"], "factory-mcp"),
+        (["--restart-webhook"], "factory-webhook"),
+        (["--restart-mcp", "--restart-webhook"], "factory-mcp,factory-webhook"),
+    ],
+)
+def test_the_restart_flags_ask_the_child_to_restart_those_apps(monkeypatch, flags, asked):
+    calls = []
+    # Left exported in the shell: only the flags count.
+    monkeypatch.setenv("AGENT_FACTORY_RESTART_APPS", "factory-mcp,factory-webhook")
+
+    def run(argv, **kw):
+        calls.append((argv, kw))
+        return SimpleNamespace(stdout="abc123\n", returncode=0)
+
+    monkeypatch.setattr(deploy.subprocess, "run", run)
+    assert deploy.main(["--dry-run", *flags]) == 0
+    env = next(kw["env"] for argv, kw in calls if "-c" in argv)
+    assert env.get("AGENT_FACTORY_RESTART_APPS") == asked
+
+
 def test_setup_connects_with_a_project_scoped_union_api_key():
     setup = (Path(__file__).resolve().parents[1] / "docs/factory-mcp-setup.md").read_text()
     assert "--value" not in setup

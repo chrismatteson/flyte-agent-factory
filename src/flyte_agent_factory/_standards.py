@@ -15,6 +15,8 @@ from typing import Literal, TypedDict, cast
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_PAYLOAD = 48_000
+#: A workspace's own standards directory when `[standards] dir` is unset (`_profile._with_tree`).
+DEFAULT_DIR = "standards"
 MAX_FILES = 512_000
 TEXT_EXTENSIONS = {
     ".md",

@@ -10,6 +10,12 @@ It holds no deploy key. Status and source come through the profile's GitHub App
 a shallow fetch of exactly the SHA over HTTPS. Projects that are running keep the version they started with,
 so a deploy never interrupts one.
 
+A commit to the direction repo that changes nothing the deploy reads (`_deploy_reads`: the profile file and
+the standards it captures; everything else there, such as `operator/STATE.md` and `projects/**`, is not read)
+is not deployed, when the engine sha is the deployed one. The tick says so and why. To deploy anyway, run
+`deploy_if_changed(force=True)`, or the manual `ops/deploy_factory.py` / `ops/deploy_work.py`, which never
+skip.
+
 Release history and attempt counts live in labelled Flyte runs.
 """
 
@@ -36,6 +42,7 @@ from flyte import remote
 if TYPE_CHECKING:
     from . import (
         _deploy,
+        _deploy_reads,
         _factory_base,
         _github,
         _github_mode,
@@ -53,6 +60,7 @@ if TYPE_CHECKING:
 else:
     from flyte_agent_factory import (
         _deploy,
+        _deploy_reads,
         _factory_base,
         _github,
         _github_mode,
@@ -477,6 +485,25 @@ async def _read_secrets_last_waited_for(
         except (*REMOTE_ERRORS, TypeError, AttributeError):
             _say(f"ignoring unreadable outputs of {run.name}")
     return {}
+
+
+def _list_missing_secrets(waiting: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+    # A tick that cannot look falls back to submitting an attempt, never to a silent hold: those names come
+    # back second, so the attempt can say what it may wait for again.
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+
+    missing, unchecked = [], []
+    for name in waiting:
+        try:
+            remote.Secret.get(name)
+        except (ConnectError, *REMOTE_ERRORS) as exc:
+            if isinstance(exc, ConnectError) and exc.code == Code.NOT_FOUND:
+                missing.append(name)
+            else:
+                unchecked.append(name)
+                _say(f"could not check secret {name}; submitting anyway, and the attempt may wait for it")
+    return missing, unchecked
 
 
 async def _submit(task_name: str, *, labels: dict[str, str] | None = None, **inputs: str) -> remote.Run:
@@ -952,8 +979,30 @@ async def _wake_dispatch(profile: _profile.Profile) -> None:
         _say(f"dispatch wake failed ({type(exc).__name__}); the safety net will retry")
 
 
+def _explain_unread_only_skip(
+    profile: _profile.Profile, app: _github.GithubApp, deployed: tuple[str, str], sha: str, direction_sha: str
+) -> str | None:
+    """Why `direction_sha` needs no deploy over the deployed pair (engine unchanged), or None to deploy."""
+    deployed_sha, deployed_direction = deployed
+    if sha != deployed_sha or not deployed_direction or deployed_direction == direction_sha:
+        return None
+    assert profile.direction is not None  # a direction sha is only ever set with [direction]
+    return _deploy_reads.explain_skip(
+        app.scoped(_github.CONTENTS_READ),
+        _github.parse_repo(profile.direction.repo),
+        deployed_direction,
+        direction_sha,
+        profile,
+    )
+
+
 async def run_once(
-    profile: _profile.Profile, run_name: str, app: _github.GithubApp | None, now: float | None = None
+    profile: _profile.Profile,
+    run_name: str,
+    app: _github.GithubApp | None,
+    now: float | None = None,
+    *,
+    force: bool = False,
 ) -> str:
     """Resolve current heads, check CI and submit one labelled attempt."""
     if not profile.deploy.auto:
@@ -967,6 +1016,12 @@ async def run_once(
         release = await deployed_pair(profile)
         if release and release[1] == (sha, direction_sha):
             return _say(f"up to date at {shown}")
+        if release and not force:
+            unread = await asyncio.to_thread(
+                _explain_unread_only_skip, profile, app, release[1], sha, direction_sha
+            )
+            if unread:
+                return _say(unread)
         _lock_repo(profile, app)  # refuse here, where the owner reads it, rather than in the deploy run
         refused, labels = await _not_deployable(profile, app, heads, release and release[0])
         if refused:
@@ -974,9 +1029,16 @@ async def run_once(
         if await _runs(profile, in_phase=_LIVE, limit=1):
             return _say("deploy in flight")
         waiting = await _read_secrets_last_waited_for(profile, labels)
+        still_missing, unchecked = await asyncio.to_thread(_list_missing_secrets, waiting)
+        if still_missing:
+            # The labels are per-heads, so a moved head finds no waiting attempt and submits.
+            return _say(
+                f"waiting for secrets at {shown}: {', '.join(sorted(still_missing))} "
+                "(create them with `flyte create secret <name>`); "
+                "not submitting until they exist or a head moves"
+            )
         run = await _submit(_deploy.DEPLOY_PAIR, labels=labels, sha=sha, direction_sha=direction_sha)
-        # Still an attempt: it deploys as soon as the owner has created what the last one named.
-        note = f"; waiting for secrets: {', '.join(sorted(waiting))}" if waiting else ""
+        note = f"; may still be waiting for secrets: {', '.join(sorted(unchecked))}" if unchecked else ""
         return _say(f"submitted {shown}: {run.name}{note}")
     except _DEPLOY_ERRORS as exc:  # task boundary redacts remote errors
         raise _deploy.DeployError(_deploy.redact(str(exc))) from None
@@ -1027,12 +1089,20 @@ async def run_pair(
         output: DeployOutput = {"deployed": False}
         # Before any slot is deployed, and once per run: it launches a pod.
         push, isolation = await asyncio.to_thread(_push_mode, profile)
+        # What a follow-up is judged on: the read set of the profile its predecessor deployed.
+        deployed_profile = profile
         for deploy in range(MAX_DEPLOYS_PER_RUN):
             # Every deploy, the first included, is judged on CI as it is now: the tick that queued this
             # run may have seen green minutes ago (lock wait, queue time).
             heads = _heads(profile, app)
             if deploy:
                 if (heads[1], heads[3]) == (sha, direction_sha):
+                    break
+                unread = await asyncio.to_thread(
+                    _explain_unread_only_skip, deployed_profile, app, (sha, direction_sha), heads[1], heads[3]
+                )
+                if unread:
+                    _say(unread)
                     break
                 sha, direction_sha = heads[1], heads[3]
                 shown = _shown(sha, direction_sha)
@@ -1153,8 +1223,11 @@ async def deploy_pair(sha: str, direction_sha: str) -> dict[str, Any]:
     triggers=cast(tuple[flyte.Trigger, ...], _triggers(PROFILE)),
     timeout=flyte.Timeout(max_runtime=MAX_RUNTIME, max_queued_time=timedelta(minutes=5)),
 )
-async def deploy_if_changed() -> str:
-    """Deploy the factory repo's default branch if it moved since the last deploy."""
+async def deploy_if_changed(force: bool = False) -> str:
+    """Deploy the factory repo's default branch if it moved since the last deploy.
+
+    `force` deploys a direction repo change that touches nothing the deploy reads (`_deploy_reads`).
+    """
     # This task only runs within a named remote action.
     run_name = cast(str, flyte.ctx().action.run_name)
     try:
@@ -1166,7 +1239,7 @@ async def deploy_if_changed() -> str:
         app = None
         if PROFILE.deploy.auto:
             app = _app()
-        message = await run_once(PROFILE, run_name, app)
+        message = await run_once(PROFILE, run_name, app, force=force)
     except Exception as exc:
         await flyte.report.replace.aio(_report_html(f"failed: {_deploy.redact(str(exc))}"), do_flush=True)
         raise

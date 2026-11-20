@@ -153,6 +153,13 @@ def record(deployments):
         with open(report, "a") as out:
             for deployment in deployments:
                 out.writelines(f"{{deployed.get_name()}}\\n" for deployed in deployment.envs.values())
+
+
+def record_kept(name):
+    # Left running because it already is what this deploy would make: the release has it all the same.
+    if report and not dry:
+        with open(report, "a") as out:
+            out.write(f"{{name}}\\n")
 """
 
 #: Names the variable a deploy child reads its key from (`_union_identity.init_for_script`'s `key_env`). The
@@ -268,31 +275,63 @@ others = tuple(env for env in envs if env is not _deployer.env)
 for plan in plan_deploy(*others):
     if _deployer.env.name in plan.envs:
         raise SystemExit(f"{_deployer.env.name} is a dependency of another environment; it must deploy last")
+from flyte import remote
+from flyte_agent_factory import _deploy_apps
+from_root(_deploy_apps)
+# Apps of this stage may be left out of the deploy below (unchanged), which is only safe if nothing else pulls
+# them in.
+apps = [(_factory_mcp.app, _factory_mcp)]
+if _deployer.PROFILE.github.webhook_secret:
+    apps.append((_webhook.env, _webhook))
+for app, module in apps:
+    for plan in plan_deploy(*(env for env in others if env is not app)):
+        if app.name in plan.envs:
+            raise SystemExit(f"{app.name} is a dependency of another environment; it must deploy alone")
+    # In the spec, so a change to code it runs is a spec change, and `is_unchanged` compares it.
+    _deploy_apps.stamp_code_digest(app, Path(module.__file__).parent, module.__name__.rsplit(".", 1)[-1])
+kept = []
+if not dry:
+    asked = set(os.environ.get(_deploy_apps.RESTART_APPS_ENV, "").split(","))
+    for app, _ in apps:
+        if app.name in asked:
+            print(f"{app.name}: restarting as asked, whether or not it changed", flush=True)
+    # A restart drops the chat connector: leave an app running when what it would run is unchanged.
+    others, kept = _deploy_apps.drop_unchanged_apps(
+        others, [app for app, _ in apps if app.name not in asked]
+    )
+def show_mcp(app):
+    print(f"factory-mcp public URL: {app.endpoint}")
+    print(f"Connector URL: {app.endpoint.rstrip('/')}/flyte-mcp/mcp")
+    if _profile_oss.mcp_auth(_profile.require()) == "proxy":
+        print("Connect through your authenticating proxy; the app itself checks no token.")
+    else:
+        print("Connect with header Authorization: Bearer <Union API key or access token>.")
+def show_webhook(endpoint):
+    print(f"factory-webhook public URL: {endpoint}")
+    print(f"GitHub webhook URL: {endpoint.rstrip('/')}/github")
 # flyte.deploy returns what it deployed only when it succeeds, so each call is recorded as soon as it does:
 # the report then says what a later failure left deployed.
 deployments = flyte.deploy(*others, dry_run=dry)
 record(deployments)
+for name in kept:
+    record_kept(name)
+if _deploy_apps.MCP_NAME in kept:
+    show_mcp(_deploy_apps.wait_until_active(_deploy_apps.MCP_NAME))
+if _deploy_apps.WEBHOOK_NAME in kept:
+    # Active, so the endpoint exists; not waited for, as below.
+    show_webhook(remote.App.get(name=_deploy_apps.WEBHOOK_NAME).endpoint)
 for deployment in deployments:
     print(deployment.summary_repr())
     for deployed in deployment.envs.values():
         if deployed.get_name() == "factory-mcp" and not dry:
             # Polled, not `watch`ed: the watch stream is refused to a key bound to one project and domain.
-            from flyte_agent_factory import _deploy_apps
-            from_root(_deploy_apps)
-            app = _deploy_apps.wait_until_active("factory-mcp")
-            print(f"factory-mcp public URL: {app.endpoint}")
-            print(f"Connector URL: {app.endpoint.rstrip('/')}/flyte-mcp/mcp")
-            if _profile_oss.mcp_auth(_profile.require()) == "proxy":
-                print("Connect through your authenticating proxy; the app itself checks no token.")
-            else:
-                print("Connect with header Authorization: Bearer <Union API key or access token>.")
+            show_mcp(_deploy_apps.wait_until_active("factory-mcp"))
         # Not waited for like factory-mcp: an app whose secret does not exist yet never activates, and the
         # deploy must not hang or fail on it. The create response may not carry the URL yet.
         if deployed.get_name() == "factory-webhook" and not dry:
             endpoint = deployed.deployed_app.endpoint
             if endpoint:
-                print(f"factory-webhook public URL: {endpoint}")
-                print(f"GitHub webhook URL: {endpoint.rstrip('/')}/github")
+                show_webhook(endpoint)
             else:
                 print("factory-webhook has no public URL yet; see the console's Apps page.")
 last = flyte.deploy(_deployer.env, dry_run=dry)
