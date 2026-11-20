@@ -577,7 +577,7 @@ _POD_MODULES = (
 
 # Run in a fresh interpreter: these modules read the profile once, at import, and the suite's own profile is
 # already imported here.
-_IMPORT_UNDER_OSS = """
+_IMPORT_UNDER_PROFILE = """
 import importlib, json, sys
 import flyte
 found = {}
@@ -593,22 +593,29 @@ print(json.dumps(found))
 """
 
 
-def test_every_pod_module_imports_under_the_oss_example_and_its_environments_reach_flyte():
+def environments_under(profile: Path) -> dict[str, dict[str, Any]]:
+    """Import `_POD_MODULES` afresh under `profile`; return their environments' env and secrets."""
     import json
     import subprocess
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_FACTORY_PROFILE")}
-    env.update(AGENT_FACTORY_PROFILE=str(EXAMPLE_OSS), PYTHONPATH=str(ROOT / "src"))
+    env.update(AGENT_FACTORY_PROFILE=str(profile), PYTHONPATH=str(ROOT / "src"))
     done = subprocess.run(
-        [sys.executable, "-c", _IMPORT_UNDER_OSS, *_POD_MODULES],
+        [sys.executable, "-c", _IMPORT_UNDER_PROFILE, *_POD_MODULES],
         cwd=ROOT,
         env=env,
         capture_output=True,
         text=True,
         check=False,
+        timeout=180,
     )
     assert done.returncode == 0, done.stderr[-2000:]
-    found = json.loads(done.stdout.strip().splitlines()[-1])
+    found: dict[str, dict[str, Any]] = json.loads(done.stdout.strip().splitlines()[-1])
+    return found
+
+
+def test_every_pod_module_imports_under_the_oss_example_and_its_environments_reach_flyte():
+    found = environments_under(EXAMPLE_OSS)
     assert {name.split(".")[0] for name in found} == set(_POD_MODULES)  # each defines one at least
     profile = _profile.load(str(EXAMPLE_OSS))
     for name, seen in found.items():

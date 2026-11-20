@@ -15,6 +15,11 @@ On an OSS backend (`[backend] kind = "oss"`) whose profile lists no `[union]` ke
 OSS Flyte has no API-key service and its API is unauthenticated: the network is the trust boundary (tailnet,
 network policy, an OAuth proxy in front of the MCP). Pods mount no key and set no auth variables, and
 `establish` returns `OSS_IDENTITY`. Anything that can reach the internal endpoint can act as the factory.
+
+A pod learns its backend from the profile text (`_profile.pod_env`) or, where it gets none (a sub-agent: the
+judges, reviewers and delegates; a browser app), from `AGENT_FACTORY_BACKEND_KIND`, which the deploy sets on
+every pod (`_profile_oss.backend_env`). A pod that can read neither, and holds no key, cannot tell an OSS
+backend from a Union pod whose key is missing: it refuses, and says that, rather than asking for a Union key.
 """
 
 from __future__ import annotations
@@ -53,6 +58,22 @@ _MISSING = (
     "no Union identity for tier {tier}: secret {secret} is not mounted as AGENT_FACTORY_UNION_KEY. Create "
     "the key and store it with `python ops/bootstrap.py --union-keys` (or docs/setup.md#union-keys). The "
     "factory never falls back to the pod's injected key."
+)
+#: No profile, no backend kind and no key: OSS needs none, Union does, and the pod cannot tell which.
+_UNDETERMINED = (
+    "cannot determine this pod's identity: it has no deployment profile ({toml_env}), no backend kind "
+    "({backend_env}) and no key in AGENT_FACTORY_UNION_KEY (tier {tier}, secret {secret}), so it cannot "
+    "tell an OSS backend (which needs no key) from a Union one whose key is missing. The environment that "
+    "started it was deployed by an engine that does not set the backend kind on every pod: redeploy the "
+    "factory with this engine (docs/setup.md#deploying). The factory never falls back to the pod's "
+    "injected key."
+)
+#: An OSS profile that lists `[union]` keys acts as them; OSS issues none, so `--union-keys` makes none.
+_MISSING_ON_OSS = (
+    "no key on an OSS backend: the profile lists [union] keys, so this pod (tier {tier}) expects secret "
+    "{secret} mounted as AGENT_FACTORY_UNION_KEY. OSS Flyte issues no API keys: to run keyless (the network "
+    "is the credential) remove the [union] table from the profile and redeploy, or store a key the backend "
+    "accepts in that secret. The factory never falls back to the pod's injected key."
 )
 
 
@@ -112,6 +133,12 @@ def pod_for(profile: Profile | None, tier: str) -> tuple[list[flyte.Secret], dic
     return pod_spec(profile, tier)
 
 
+#: What `_decode` raises for a value that is not an API key, and how `establish` reports a mounted one
+#: (`_review_advice` matches on it).
+_NOT_A_KEY = "not a Union API key"
+BAD_KEY = f"{KEY_ENV} is {_NOT_A_KEY}"
+
+
 def _decode(key: str) -> str:
     """Return the client id in an API key. Raises ValueError, never quoting any part of the key."""
     from flyte.remote._client.auth._auth_utils import decode_api_key
@@ -119,7 +146,7 @@ def _decode(key: str) -> str:
     try:
         return decode_api_key(key)[1]
     except ValueError:  # binascii and unicode errors are ValueErrors; the SDK's message can quote the key
-        raise ValueError("not a Union API key") from None
+        raise ValueError(_NOT_A_KEY) from None
 
 
 def client_id_of(key: str) -> str:
@@ -138,6 +165,29 @@ def _load_profile_or_none() -> Profile | None:
         return None
 
 
+def backend_kind(profile: Profile | None) -> str:
+    """Return the backend kind: the profile's, else the pod's `BACKEND_ENV`; "" when neither says."""
+    if profile is not None:
+        return profile.backend.kind
+    return os.environ.get(_profile_oss.BACKEND_ENV, "").strip()
+
+
+def missing_message(kind: str, tier: str, secret: str) -> str:
+    """Return why a pod with no key has no identity, with advice that fits its backend `kind`.
+
+    Union keeps the message it always had; OSS and an unknown backend never send anyone to `--union-keys`.
+    """
+    from . import _profile
+
+    if kind == "union":
+        return _MISSING.format(tier=tier, secret=secret)
+    if kind == "oss":
+        return _MISSING_ON_OSS.format(tier=tier, secret=secret)
+    return _UNDETERMINED.format(
+        toml_env=_profile.TOML_ENV, backend_env=_profile_oss.BACKEND_ENV, tier=tier, secret=secret
+    )
+
+
 def _probe() -> None:
     """One cheap call that needs read access in our own project and domain."""
     import flyte.remote
@@ -148,24 +198,33 @@ def _probe() -> None:
 def establish(probe: bool = True) -> Identity:
     """Take the pod's tier key as its identity or raise `IdentityMissing`; `probe` checks Union accepts it.
 
-    On an OSS backend there is no key: the result is `OSS_IDENTITY` and nothing is probed.
+    On an OSS backend there is no key: the result is `OSS_IDENTITY` and nothing is probed. A pod without the
+    profile text knows it is on OSS from `BACKEND_ENV`, unless its environment names a tier (`pod_spec` for
+    an OSS profile that lists keys), which it then needs the key for. The profile, when there is one, wins.
     """
     for var in INJECTED_VARS:  # children inherit the scrubbed environment
         os.environ.pop(var, None)
     profile = _load_profile_or_none()
     if profile is not None and _profile_oss.keyless(profile):
         return OSS_IDENTITY
+    kind = backend_kind(profile)
+    key = os.environ.get(KEY_ENV, "")
+    if profile is None and kind == "oss" and not key and not os.environ.get(TIER_ENV):
+        return OSS_IDENTITY
     tier = os.environ.get(TIER_ENV, "unknown")
     secret = os.environ.get(SECRET_ENV, "unknown")
-    key = os.environ.get(KEY_ENV, "")
     if not key:
-        raise IdentityMissing(_MISSING.format(tier=tier, secret=secret))
+        raise IdentityMissing(missing_message(kind, tier, secret))
     try:
         client_id = _decode(key)
-    except ValueError as exc:
+    except ValueError:
+        advice = (
+            "store a fresh one with `python ops/bootstrap.py --union-keys` (docs/setup.md#union-keys)"
+            if kind == "union"
+            else "store the key the backend issued in that secret"
+        )
         raise IdentityMissing(
-            f"the Union key for tier {tier} (secret {secret}) in AGENT_FACTORY_UNION_KEY is {exc}: store a "
-            "fresh one with `python ops/bootstrap.py --union-keys` (docs/setup.md#union-keys)"
+            f"{BAD_KEY}: the Union key for tier {tier} (secret {secret}) does not decode; {advice}"
         ) from None
     identity = Identity(tier=tier, secret=secret, client_id=client_id)
     if probe:
@@ -338,6 +397,7 @@ def controller_kwargs() -> dict[str, Any]:
         return flyte.init_in_cluster(
             endpoint=_profile_oss.endpoint_for_pods(profile.backend), insecure=profile.backend.insecure
         )
+    # An OSS pod without the profile text (a sub-agent) has only the endpoint variables, which the SDK reads.
     return flyte.init_in_cluster()
 
 

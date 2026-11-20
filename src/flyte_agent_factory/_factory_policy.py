@@ -10,7 +10,17 @@ from typing import Any, cast
 
 from flyte import remote
 
-from flyte_agent_factory import _errors, _factory_base, _factory_meters, _gardening, _names, _profile, _queue
+from flyte_agent_factory import (
+    _errors,
+    _factory_base,
+    _factory_meters,
+    _gardening,
+    _names,
+    _profile,
+    _profile_oss,
+    _queue,
+    _union_identity,
+)
 
 
 def substitute_name(brief: str, name: str) -> str:
@@ -78,6 +88,10 @@ def normalize_policy(policy: Mapping[str, str]) -> dict[str, str]:
             raise ValueError(f"policy key {key!r} must not start with CLAUDE_; use the key without a prefix")
         if key in _BROWSER_KEYS:
             raise ValueError("a browser grant comes from the launch's browser input, not from policy")
+        if _names.PREFIX + key in _IDENTITY_KEYS:
+            raise ValueError(
+                f"policy key {key!r} is the pod's identity or backend, which only the deploy sets"
+            )
         if not re.fullmatch(r"[A-Z0-9_]+", key):
             raise ValueError(f"policy key {key!r} is not an uppercase policy key (A-Z, 0-9 and _)")
         keys[key] = value
@@ -91,6 +105,8 @@ def normalize_policy(policy: Mapping[str, str]) -> dict[str, str]:
 BROWSER_ENV = "AGENT_FACTORY_BROWSER_IDENTITIES"
 #: What the slot pod reads about browsers; set by the factory and the supervisor, never by a launch's policy.
 _BROWSER_KEYS = frozenset({"BROWSER_IDENTITIES", "BROWSER_GATE", "BROWSER_IDENTITY_NAMES"})
+#: Who a pod acts as and on which backend (#183, #53): set by the deploy from the profile, never by a launch.
+_IDENTITY_KEYS = _union_identity.OWN_IDENTITY_ENV | {_profile_oss.BACKEND_ENV}
 _IDENTITY = re.compile(r"[a-z][a-z0-9-]{0,19}")
 
 

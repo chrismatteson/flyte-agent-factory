@@ -404,6 +404,7 @@ factory's and are not listed.
 | `AGENT_FACTORY_CLAUDE_TOKEN_SECRET`, `AGENT_FACTORY_CODEX_TOKEN_SECRET` | the secrets holding the Claude and Codex tokens, from `[secrets]` |
 | `AGENT_FACTORY_TOKEN_IN_ENV` | `1` hands the Claude token to the session as `CLAUDE_CODE_OAUTH_TOKEN` instead of through a pipe, for a Claude Code build that ignores the descriptor |
 | `AGENT_FACTORY_REPO_KEYS`, `AGENT_FACTORY_SECRETS` | which deploy key belongs to which repository; the optional extra secrets a deploy mounts |
+| `AGENT_FACTORY_BACKEND_KIND` | the profile's `[backend] kind` (`union` or `oss`), set by the deploy on every pod, so a pod without the profile text (a sub-agent, a browser app) knows whether it needs a Union key ([oss-flyte-compat.md](oss-flyte-compat.md)) |
 | `AGENT_FACTORY_ENV_NAME`, `AGENT_FACTORY_SUBAGENT_ENV_NAME` | the Flyte environment a slot runs as, and its sub-agent environment |
 | `AGENT_FACTORY_STATE_REMOTE`, `AGENT_FACTORY_STATE_BRANCH` | the repository and branch of the factory's state store; when set they override the profile ([state-store.md](state-store.md)) |
 | `AGENT_FACTORY_BASE`, `AGENT_FACTORY_WORKSPACE`, `AGENT_FACTORY_BRIDGE_DIR` | where the supervisor and session keep their state, the session's workspace, and the bridge files (default `$HOME`); set by the supervisor itself |

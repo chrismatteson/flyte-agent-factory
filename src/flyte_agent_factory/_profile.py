@@ -1440,7 +1440,7 @@ def pod_env() -> dict[str, str]:
     # AGENT_FACTORY_GITHUB_PUSH=app would bake App pushes into the slots without the isolation canary (#179).
     # Only the deployer's deploy children set these, explicitly (`_deploy._run_child`'s `deployer_env`).
     env.update(_deployer_env)
-    env.update(_profile_oss.endpoint_env(profile))
+    env.update(_profile_oss.endpoint_env_and_kind(profile))
     return env
 
 
