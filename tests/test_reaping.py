@@ -283,9 +283,10 @@ def test_a_command_is_judged_even_when_the_first_scan_outlasts_it(tmp_path, monk
 def test_every_image_env_value_is_one_word_for_the_local_docker_builder():
     """The SDK's local builder writes `ENV key=value` unquoted: a value with a space breaks the Dockerfile."""
     import flyte
+    from flyte._image import Env
 
     image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)))
-    env = [layer for layer in image._layers if type(layer).__name__ == "Env"]
+    env = [layer for layer in image._layers if isinstance(layer, Env)]
     assert env, "with_init sets the exec wrapper"
     for layer in env:
         for key, value in layer.env_vars:
