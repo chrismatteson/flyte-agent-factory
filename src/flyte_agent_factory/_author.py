@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -54,6 +55,7 @@ from flyte_agent_factory._bridge import (
 from flyte_agent_factory._codex_process import CodexAuthor
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._process import ClaudeProcess
+from flyte_agent_factory._stream_process import STREAM_FLAGS, StreamClaudeProcess
 
 
 def has_conversation(config_dir: Path) -> bool:
@@ -91,26 +93,51 @@ _RECOVERABLE_START = re.compile(r"no conversation found|could not find conversat
 #: How long a headless resume is watched for an immediate "no conversation" exit.
 _HEADLESS_START_CHECK_S = 5.0
 
+#: The same for the stream-json session, which says nothing until its first message, so a resume that will
+#: work cannot be told apart from one still loading: the live CLI took up to 4.9s to refuse a resume. It
+#: reports the refusal as a `result` before any `init`, which ends the wait at once.
+_STREAM_START_CHECK_S = 20.0
 
-async def _check_headless_start(proc: ClaudeProcess) -> None:
+
+async def _check_headless_start(proc: ClaudeProcess | StreamClaudeProcess) -> None:
     """Raise if a headless session exits at once, so `_start_session` can try the next argv.
 
     A headless session has nothing to wait for, so this is the only place an immediate exit is seen.
     Only called when a fallback argv exists, and a session that stays up is left alone.
     """
-    deadline = time.monotonic() + _HEADLESS_START_CHECK_S
+    stream = isinstance(proc, StreamClaudeProcess)
+    deadline = time.monotonic() + (_STREAM_START_CHECK_S if stream else _HEADLESS_START_CHECK_S)
     while proc.returncode is None and time.monotonic() < deadline:
+        if isinstance(proc, StreamClaudeProcess) and proc.results and not proc.reached_prompt:
+            # A turn ended before the session started: the refusal. Its exit follows.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            break
         await asyncio.sleep(0.2)
     if proc.returncode is not None:
+        # The exit status can arrive before the last of stderr ("No conversation found"), which the resume
+        # fallback matches: read the output to its end first.
+        await proc.wait()
         # Before any prompt this is not retried, unless the resume fallback below takes it.
         tail = "Claude Code exited at startup:\n" + "\n".join(list(proc.tail)[-40:])
         raise _unprivileged.exit_error("claude", proc.returncode, tail, proc)
+
+
+#: Set to 1 to run the author on the interactive TUI on a pty again (`ClaudeProcess`), should a Claude
+#: Code build break the stream-json session. The structured session is the default (issue #219).
+TUI_FALLBACK_VAR = "AGENT_FACTORY_CLAUDE_TUI"
+
+
+def is_tui_fallback() -> bool:
+    """Whether the author runs on the TUI fallback rather than the structured stream-json session."""
+    return os.environ.get(TUI_FALLBACK_VAR, "").strip() == "1"
 
 
 def _author_argv(project_name: str, mode: str, model: str, effort: str) -> list[str]:
     """Return the author session's argv before the browser, resume and session-id flags are added."""
     return [
         "claude",
+        *(() if is_tui_fallback() else STREAM_FLAGS),
         "--name",
         project_name,
         "--permission-mode",
@@ -121,23 +148,39 @@ def _author_argv(project_name: str, mode: str, model: str, effort: str) -> list[
 
 async def _start_session(
     candidates: list[list[str]], *, env: dict[str, str], timeline: _timeline._Timeline
-) -> ClaudeProcess:
+) -> ClaudeProcess | StreamClaudeProcess:
     """Start Claude Code, stepping past a startup failure we know how to fix."""
     last: BaseException | None = None
     sealed = _seal_session.role()
     for index, argv in enumerate(candidates):
         timeline.row("🚀", " ".join(shlex.quote(a) for a in argv))
         capture = _session_setup._log_session_line(timeline)
-        proc = ClaudeProcess(
-            # Every candidate (plain, --continue, --resume) goes through the launcher; it passes the
-            # token's inherited descriptor on to `claude`.
-            sealed.wrap(argv) if sealed else argv,
-            cwd=_session_config.WORKSPACE,
-            env={**env, **sealed.env} if sealed else env,
-            on_line=capture,
-            inbox_messages=True,
-            token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(),
-        )
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        # Every candidate (plain, --continue, --resume) goes through the launcher; it passes the
+        # token's inherited descriptor on to `claude`.
+        run_argv = sealed.wrap(argv) if sealed else argv
+        run_env = {**env, **sealed.env} if sealed else env
+        proc: ClaudeProcess | StreamClaudeProcess
+        if "--input-format" in argv:
+            proc = StreamClaudeProcess(
+                run_argv,
+                cwd=_session_config.WORKSPACE,
+                env=run_env,
+                on_line=capture,
+                on_notice=timeline.row,
+                # Its turns as it reported them, for the usage report (`_usage.read_author_ledger`).
+                ledger=_session_config.STATE_ROOT / _usage.AUTHOR_LEDGER_NAME,
+                token=token,
+            )
+        else:
+            proc = ClaudeProcess(
+                run_argv,
+                cwd=_session_config.WORKSPACE,
+                env=run_env,
+                on_line=capture,
+                inbox_messages=True,
+                token=token,
+            )
         try:
             await proc.start()
         except BaseException:
@@ -171,8 +214,8 @@ class _NoSession:
     returncode = None
     tail: tuple[str, ...] = ()
 
-    async def submit(self, text: str, **kwargs: object) -> None:
-        pass
+    async def submit(self, text: str, **kwargs: object) -> bool:
+        return False  # nothing processed it; a stopped run keeps its inbox marker
 
     async def wait(self) -> int:
         await asyncio.Event().wait()  # never exits by itself; the stop that made this ends the run
@@ -1151,7 +1194,7 @@ _LOGIN_EXPIRED_HELP = (
 )
 
 
-def _assert_logged_in(proc: ClaudeProcess) -> None:
+def _assert_logged_in(proc: ClaudeProcess | StreamClaudeProcess) -> None:
     """Fail the run if Claude Code says the credential has expired.
 
     An expired credential does not crash Claude Code. The TUI answers the first

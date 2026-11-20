@@ -14,7 +14,7 @@ from ._bridge import _write_atomic
 class AuthorProcess(Protocol):
     @property
     def returncode(self) -> int | None: ...
-    async def submit(self, text: str, *, label: str = "") -> None: ...
+    async def submit(self, text: str, *, label: str = "") -> bool: ...
     async def stop(self, *, grace: float = 20.0) -> None: ...
 
 
@@ -77,15 +77,16 @@ class AuthorSession:
             self._drained = []
             self._save()
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
+        """Return whether the message was taken: sent on, or queued in `author-pending.json`."""
         async with self._lock:
             hit = getattr(self.current, "limit_hit_at", None)
             if self._paused or (hit is not None and hit != self._resumed_hit):
                 self.pause()
                 self.pending.append(text)
                 self._save()
-            else:
-                await self.current.submit(text, label=label)
+                return True
+            return await self.current.submit(text, label=label)
 
     async def replace(self, current: AuthorProcess, handoff: str) -> None:
         async with self._lock:

@@ -425,7 +425,7 @@ class ClaudeProcess:
         else:
             self._limit_scan, self._limit_raw = stripped[-160:], raw[-400:]
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
         """Submit a message, or hold it while a permission menu is open (see `deliver_held`).
 
         Nothing is ever typed into an open menu: text or Enter landing there can approve the
@@ -436,6 +436,7 @@ class ClaudeProcess:
             self._held = []
         self._held.append((text, label))
         await self.deliver_held()
+        return self.returncode is None
 
     async def deliver_held(self) -> None:
         """Type the held messages, oldest first, while no menu is open. The pump calls it each pass."""

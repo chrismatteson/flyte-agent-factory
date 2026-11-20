@@ -64,18 +64,22 @@ or slot that sets `COORDINATOR_ENGINE` (for example `profiles/example-codex-pers
 
 | | Claude Code | Codex CLI |
 | --- | --- | --- |
+| Session interface | `claude -p` with stream-json in and out, one long-lived process on pipes (`_stream_process.py`); the TUI on a pty only with `AGENT_FACTORY_CLAUDE_TUI=1` ([headless-author-session.md](headless-author-session.md)) | `codex exec --json`, one process per turn (`_codex_process.py`) |
 | Standing instructions | `CLAUDE.md` managed block in the workspace | `AGENTS.md` managed block in `$CODEX_HOME` (not in the project's diff) |
 | MCP servers (the browser) | `.mcp.json`, passed with `--mcp-config` | `$CODEX_HOME/config.toml` |
 | Sub-agent roles (`scope`, `discover`, `prototype`, `shape`, `build`, `verify`) | yes, `.claude/agents/`, run in parallel inside the session | **no.** The instructions say to use `delegate` instead (one worker per chunk, `delegate --answer` for read-only review). The role files are still written to the workspace for workers; a timeline row says so |
 | Browser MCP | yes | yes, through `config.toml` |
 | `delegate`, `ask-human`, `flyte-note` | yes | yes (the same commands on `PATH`) |
 | `PushNotification` (phone push on DONE) | yes | **no.** The instructions and the supervisor's nudges say to open the `ask-human` message with the line instead |
-| Direction from the inbox | typed into the running TUI at any time | **partial.** `codex exec` takes one prompt per process: a message sent during a turn is queued, journaled, and delivered as the next turn |
+| Direction from the inbox | a `user` message, whole (any length, newlines kept), at any time: one sent during a turn is queued by Claude Code and answered next | **partial.** `codex exec` takes one prompt per process: a message sent during a turn is queued, journaled, and delivered as the next turn |
 | Interrupt (`/stop`, a new direction) | yes | yes, ends the running turn; no mid-turn steering |
-| Permission prompts | bypassed (`bypassPermissions`) | bypassed (`--dangerously-bypass-approvals-and-sandbox`); there are no dialogs |
+| Permission prompts | bypassed (`bypassPermissions`); a call that still needs approval arrives as a `can_use_tool` control request and `_permission_policy` denies it with guidance, interrupting the turn on a repeat | bypassed (`--dangerously-bypass-approvals-and-sandbox`); there are no dialogs |
 | Compaction between rounds (`COMPACT_BETWEEN_ROUNDS`) | yes, `/compact` | **no.** Skipped, with a timeline row; `codex exec` takes no slash commands |
 | Resume after a restart | the conversation in the checkpointed config dir (`--resume`) | the thread id saved in the checkpoint, plus queued messages |
-| Usage metering | the setup-token's meter feeds routing, and the author's token totals are summed from its transcript | **partial.** The meter comes from the usage Codex reports in `exec` events and feeds routing; per-round author token totals are read from Claude transcripts only, so none are reported for Codex |
+| Usage metering | the setup-token's meter feeds routing; the author's turns, tokens and cost estimate come from its `result` events (`state/author-turns.jsonl`), and a conversation without them (a TUI one) from its transcript | **partial.** The meter comes from the usage Codex reports in `exec` events and feeds routing; per-round author token totals are read from Claude transcripts only, so none are reported for Codex |
+| Usage limits | a `rate_limit_event` with status `rejected` and `resetsAt` in Unix seconds; the TUI fallback reads the notice's text | the usage-limit error in `exec` events, its reset time parsed from the message text (Codex reports no structured reset) |
+| Liveness | a turn is in flight from our message until its `result`, and counts as working (up to an hour of silence); idle is the time of the last event after that | the running `exec` process |
+| Claude app (Remote Control, human turns typed into the session) | **not in the stream session**: Remote Control is interactive-only, so direction comes through the inbox, `ask-human` answers and the Union console; the report's `[session]` lines remain the live view. The TUI fallback keeps it | no |
 | Handoff on a usage limit | to Codex, when the profile has both a `claude_token` and a `codex_token` and the coordinator is unpinned or `ENGINE_FALLBACK = "allow"`; a pinned coordinator waits for the reset. The checkpoint is taken first, and the new engine is told what happened and to commit and push first | to Claude, likewise, resuming the earlier Claude thread when there is one. An unusable Codex token is handed over or ends the run |
 
 A Codex coordinator is told in its instructions what it lacks.

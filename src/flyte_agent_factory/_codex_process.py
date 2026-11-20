@@ -132,7 +132,7 @@ class CodexProcess:
         # After `--`: a prompt starting with "-" would otherwise be read as an option.
         return [*argv, "--", text]
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
         """Start a turn with `text`; returns once the process is spawned. `wait()` ends with the turn.
 
         `label` is accepted for `ClaudeProcess.submit` callers and unused: it names the message in
@@ -160,6 +160,7 @@ class CodexProcess:
                 limit=_LINE_LIMIT,
             )
             self._turn = asyncio.create_task(self._read_turn(self._proc), name="codex-turn")
+        return True
 
     async def _read_turn(self, proc: asyncio.subprocess.Process) -> None:
         assert proc.stdout is not None
@@ -398,13 +399,15 @@ class CodexAuthor(CodexProcess):
         finally:
             os.close(directory)
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
         async with self._queue_lock:
             self._queued.append(text)
             self._save_pending()
             self._stopping = False
             if not self.running:
                 await self._start_pending(label=label)
+        # Saved to the pending file above, so it is accepted even when no turn could start yet.
+        return True
 
     async def _start_pending(self, *, label: str = "") -> None:
         self._delivering = len(self._queued)

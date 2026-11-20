@@ -41,6 +41,7 @@ from flyte_agent_factory import (
 )
 from flyte_agent_factory._bridge import Bridge
 from flyte_agent_factory._codex_process import CodexAuthor
+from flyte_agent_factory._stream_process import STREAM_FLAGS
 from tests._wait import wait_for
 
 FAKE = Path(__file__).parent / "fake_codex.py"
@@ -672,6 +673,14 @@ async def test_an_unpinned_or_claude_pinned_coordinator_stays_on_claude(choose, 
     monkeypatch.setenv("AGENT_FACTORY_COORDINATOR_ENGINE", "claude")
     assert (await choose(available=("claude", "codex")))[0] == "claude"
     monkeypatch.delenv("AGENT_FACTORY_COORDINATOR_ENGINE")
+    expected = ["--name", "p", "--permission-mode", "bypassPermissions", "--model", "sonnet"]
+    # The default author is the stream-json session (`STREAM_FLAGS`); the pty TUI is the fallback.
+    assert _author_module._author_argv("p", "bypassPermissions", "sonnet", "") == [
+        "claude",
+        *STREAM_FLAGS,
+        *expected,
+    ]
+    monkeypatch.setenv(_author_module.TUI_FALLBACK_VAR, "1")
     assert _author_module._author_argv("p", "bypassPermissions", "sonnet", "") == [
         "claude",
         "--name",

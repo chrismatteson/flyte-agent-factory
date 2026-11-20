@@ -50,8 +50,9 @@ class Engine:
         self.submitted: list[str] = []
         self.stopped = False
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
         self.submitted.append(text)
+        return True
 
     async def stop(self, **kwargs: float) -> None:
         self.stopped = True

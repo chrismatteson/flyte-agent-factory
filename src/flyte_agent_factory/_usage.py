@@ -83,7 +83,7 @@ def read_limit_times(engine: str) -> tuple[float | None, float | None]:
 def note_session_refusal(proc: Any, timeline: _timeline._Timeline) -> tuple[float | None, float | None]:
     """Record the refusal `proc` shows as a limit of the session's engine; return its `read_limit_times`."""
     text = getattr(proc, "limit_text", "")
-    fresh = _refusal_until(text, getattr(proc, "limit_seen_wall", None))
+    fresh = session_refusal_until(proc)
     _note_session_limit(fresh, timeline, getattr(proc, "meter", None), text)
     return read_limit_times(_author_engine)
 
@@ -350,32 +350,96 @@ def _usage_summary(round_: int | None = None) -> str:
     return "; ".join(parts)
 
 
+#: The structured author session's turn ledger, under `STATE_ROOT` (checkpointed with the run).
+AUTHOR_LEDGER_NAME = "author-turns.jsonl"
+
 #: What reading the author's transcript can raise: files, and JSON lines that are not the shape expected.
 _USAGE_READ_ERRORS = (OSError, ValueError, TypeError, AttributeError)
 
 
-def _author_usage_split(config_dir: Path, workspace: Path) -> dict[str, dict[str, Any]]:
+def read_author_ledger(path: Path) -> dict[str, Any]:
+    """Return what the structured author session reported about its turns (`StreamClaudeProcess._record`).
+
+    Tokens and turns are summed over the `result` events; `total_cost_usd` is the conversation's running
+    total (carried across `--resume`), so each session counts its latest figure once. `sessions` are the
+    conversations it covers, whose transcripts the token count then skips. An unreadable or missing
+    ledger is empty: the transcripts are read instead.
+
+    Each row's `at` is Unix seconds (UTC); `total_cost_usd` is Claude Code's USD list-price estimate and
+    the token fields are counts.
+    """
+    usage = {f: 0.0 for f in _session_config._USAGE_FIELDS}
+    models: dict[str, dict[str, Any]] = {}
+    cost: dict[str, float] = {}
+    turns = results = errors = 0
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            session = str(row["session_id"])
+            figures = row.get("usage") or {}
+            counts = {f: float(figures.get(f) or 0) for f in _session_config._USAGE_FIELDS}
+            spent = float(row.get("total_cost_usd") or 0)
+            row_turns = int(row.get("num_turns") or 0)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        results += 1
+        turns += row_turns
+        errors += bool(row.get("is_error"))
+        cost[session] = max(cost.get(session, 0.0), spent)
+        model = models.setdefault(str(row.get("model") or "unknown"), {})
+        for field, target in zip(
+            _session_config._USAGE_FIELDS,
+            ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"),
+            strict=True,
+        ):
+            usage[field] += counts[field]
+            model[target] = model.get(target, 0) + counts[field]
+    return {
+        "sessions": set(cost),
+        "usage": {**usage, "modelUsage": models},
+        "cost_usd": sum(cost.values()),
+        "turns": turns,
+        "results": results,
+        "errors": errors,
+    }
+
+
+def _author_usage_split(
+    config_dir: Path, workspace: Path, ledger: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
     """Tokens the author session has used so far, split into `coordinator` and `helpers`.
 
-    `coordinator` is the main conversation: the top-level `<session>.jsonl` transcripts. `helpers` are
-    the in-pod Agent-tool helpers, whose transcripts sit under `<session>/subagents/`.
+    `coordinator` is the main conversation. The structured session reports its tokens itself, in the
+    `ledger` (`read_author_ledger`); a conversation the ledger does not cover (one the TUI ran, or one from
+    before this ledger) is read from its top-level `<session>.jsonl` transcript. `helpers` are the in-pod
+    Agent-tool helpers, whose transcripts sit under `<session>/subagents/`.
 
     Claude Code writes one entry per content block of a reply, each carrying the reply's
-    usage, so entries are deduplicated by message id. No dollar figure: the interactive
-    session reports none.
+    usage, so entries are deduplicated by message id.
     """
     folder = config_dir / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(workspace))
     split: dict[str, dict[str, Any]] = {
         name: {**{f: 0.0 for f in _session_config._USAGE_FIELDS}, "modelUsage": {}}
         for name in ("coordinator", "helpers")
     }
+    covered: set[str] = set()
+    if ledger and ledger.get("results"):
+        covered = set(ledger["sessions"])
+        split["coordinator"] = _sum_usage(ledger["usage"])
     seen: set[str] = set()
     if not folder.is_dir():
         return split
     # Main transcripts first, so a reply id that appears in both counts for the main conversation.
     paths = sorted(folder.rglob("*.jsonl"), key=lambda p: "subagents" in p.relative_to(folder).parts)
     for path in paths:
-        part = split["helpers" if "subagents" in path.relative_to(folder).parts else "coordinator"]
+        helper = "subagents" in path.relative_to(folder).parts
+        if not helper and path.stem in covered:
+            continue
+        part = split["helpers" if helper else "coordinator"]
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:
@@ -439,8 +503,9 @@ def _report_usage(round_: int, timeline: _timeline._Timeline) -> None:
     """Return a round's spend by role, plus the run so far, so tuning starts from numbers."""
     _session_config._load_usage()
     author: dict[str, Any] = {}
+    ledger = read_author_ledger(_session_config.STATE_ROOT / AUTHOR_LEDGER_NAME)
     with contextlib.suppress(*_USAGE_READ_ERRORS):
-        split = _author_usage_split(_session_config.CONFIG_DIR, _session_config.WORKSPACE)
+        split = _author_usage_split(_session_config.CONFIG_DIR, _session_config.WORKSPACE, ledger)
         author = _sum_usage(split["coordinator"], split["helpers"])
         timeline.set_author_usage(split, author, measured=_is_coordinator_measured(split))
     line = _usage_summary(round_)
@@ -455,6 +520,14 @@ def _report_usage(round_: int, timeline: _timeline._Timeline) -> None:
             f"{author['output_tokens'] / 1e6:.2f}M out, {author['input_tokens'] / 1e6:.2f}M in, "
             f"{author['cache_creation_input_tokens'] / 1e6:.2f}M cache-write, "
             f"{author['cache_read_input_tokens'] / 1e6:.1f}M cache-read",
+        )
+    if ledger["results"]:
+        # The structured session's own figures. The dollars are Claude Code's list-price estimate, not a
+        # charge: the session runs on the subscription.
+        timeline.row(
+            "💰",
+            f"author session (reported): {ledger['turns']} turns over {ledger['results']} messages, "
+            f"{ledger['errors']} ended in error, ${ledger['cost_usd']:.2f} estimated at list price",
         )
 
 
@@ -779,6 +852,26 @@ def _reset_at(text: str, now: float | None = None) -> float | None:
     """
     reset = _limit_reset.parse_reset(text or "", time.time() if now is None else now)
     return reset.at if reset else None
+
+
+def session_reset_at(proc: Any) -> float | None:
+    """Unix time the refusal `proc` last hit reopens; None if it does not say.
+
+    The structured session reports it (`limit_reset_at`, from the `rate_limit_event`'s `resetsAt`); only the
+    TUI fallback has to read it out of the notice's text.
+    """
+    structured = getattr(proc, "limit_reset_at", None)
+    if structured is not None:
+        return float(structured)
+    return _reset_at(getattr(proc, "limit_text", ""))
+
+
+def session_refusal_until(proc: Any) -> float | None:
+    """`_refusal_until` for the refusal `proc` last hit: its reset if still ahead, else None."""
+    structured = getattr(proc, "limit_reset_at", None)
+    if structured is not None:
+        return float(structured) if structured > time.time() else None
+    return _refusal_until(getattr(proc, "limit_text", ""), getattr(proc, "limit_seen_wall", None))
 
 
 def _refusal_until(text: str, observed_at: float | None = None) -> float | None:

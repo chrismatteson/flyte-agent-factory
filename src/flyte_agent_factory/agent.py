@@ -97,7 +97,7 @@ from flyte_agent_factory._auth import (
     mark_trusted,
     write_settings,
 )
-from flyte_agent_factory._author_session import AuthorSession
+from flyte_agent_factory._author_session import AuthorProcess, AuthorSession
 from flyte_agent_factory._bridge import (
     BRIDGE_DIR,
     Bridge,
@@ -117,7 +117,6 @@ from flyte_agent_factory._delegation import (
 )
 from flyte_agent_factory._errors import REMOTE_ERRORS
 from flyte_agent_factory._images import VOICE_PACKAGES, agent_image
-from flyte_agent_factory._process import ClaudeProcess
 from flyte_agent_factory.child import write_context
 
 # Kept for ops/model_eval, which grades prompts with the verdict pattern; the review loop owns it now.
@@ -717,8 +716,9 @@ async def project(
     # The inbox listens before the session exists, so a `/stop` typed while the session is starting is
     # heard without an author turn. Its other messages wait for `session`, which is set below.
     fatal: list[BaseException] = []
-    session: asyncio.Future[ClaudeProcess] = asyncio.get_running_loop().create_future()
-    # Duck-typed: ClaudeProcess, CodexAuthor, _NoSession and AuthorSession share the surface used below.
+    session: asyncio.Future[AuthorProcess] = asyncio.get_running_loop().create_future()
+    # Duck-typed: ClaudeProcess, StreamClaudeProcess, CodexAuthor, _NoSession and AuthorSession share
+    # the surface used below.
     proc: Any
     on_engine = functools.partial(_author._direct_engine, session)
     inbox_loop = functools.partial(_inbox._inbox_loop, on_engine=on_engine, on_late_answer=bridge.late_answer)

@@ -52,6 +52,7 @@ async def test_stop_typed_in_the_claude_app_stops_the_run(supervisor, tmp_path, 
 
     async def submit(message, **kwargs):  # an exhausted session can take no turn
         submitted.append(message)
+        return True
 
     proc = SimpleNamespace(sent_texts=[], submit=submit)
     stop = asyncio.Event()
