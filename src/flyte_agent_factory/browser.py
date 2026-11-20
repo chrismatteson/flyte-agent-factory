@@ -96,7 +96,7 @@ browser_env = flyte.app.AppEnvironment(
     secrets=[*_QUEUE_SECRETS],
     env_vars={
         **_QUEUE_ENV,
-        **_profile_oss.endpoint_env(),
+        **_profile_oss.endpoint_env_and_kind(),
         "BROWSER_APP_PORT": str(APP_PORT),
         # Isolated profiles so several projects can drive the browser at once.
         # A persistent profile admits exactly one client and its lock can
@@ -155,7 +155,7 @@ def personal_app(
         scaling=flyte.app.Scaling(replicas=(1, 1)),
         env_vars={
             **queue_env,
-            **_profile_oss.endpoint_env(profile),
+            **_profile_oss.endpoint_env_and_kind(profile),
             "BROWSER_APP_PORT": str(APP_PORT),
             "BROWSER_ISOLATED": "0",
             "BROWSER_PERSONAL": "1",

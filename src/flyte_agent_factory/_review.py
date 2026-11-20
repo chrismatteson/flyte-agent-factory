@@ -26,6 +26,7 @@ from flyte_agent_factory import (
     _judge_inputs,
     _no_verdict,
     _policy,
+    _review_advice,
     _reviewer,
     _roles,
     _secret_env,
@@ -764,6 +765,14 @@ def _pick_other_engine(used: str) -> str | None:
     return next((e for e in _usage._author_engines() if e != used and not _usage._engine_exhausted(e)), None)
 
 
+def not_run_reason(error: BaseException | None) -> str:
+    """Name a judge's failure, cut, as the timeline and the supervisor's advice both read it."""
+    # A timeout is the one failure worth naming without its text: the text says nothing more.
+    if isinstance(error, (asyncio.TimeoutError, flyte.errors.TaskTimeoutError)):
+        return "timeout"
+    return f"{type(error).__name__}: {error}"[:160]
+
+
 async def _one_judge(
     judge: str,
     instruction: str,
@@ -868,9 +877,7 @@ async def _one_judge(
                 )
                 timeline.row("⏸️", f"{display}: DEFERRED ({_dashboard._short(limit_text, 160)})")
             else:
-                # A timeout is the one failure worth naming without its text: the text says nothing more.
-                timed_out = isinstance(error, (asyncio.TimeoutError, flyte.errors.TaskTimeoutError))
-                reason = "timeout" if timed_out else f"{type(error).__name__}: {error}"[:160]
+                reason = not_run_reason(error)
                 outcomes[judge] = _JudgeOutcome(NOT_RUN, reason, ran_on, tries, **seen)
                 timeline.row("⚠️", f"{display}: NOT RUN ({reason})")
             return judge, False, ""
@@ -1092,7 +1099,10 @@ def _raise_undecided(
         )
     if nobody_ran:
         # Nobody looked. Passing here would let a cluster blip approve every DONE.
-        raise _reviewer.ReviewUnavailable("none of the reviewers could run")
+        # With their reasons: the escalation reads the cause from them (`_review_advice`).
+        raise _reviewer.ReviewUnavailable(
+            f"none of the reviewers could run: {_review_advice.summarise(reasons)}"
+        )
     raise _reviewer.ReviewIncomplete(reasons)
 
 

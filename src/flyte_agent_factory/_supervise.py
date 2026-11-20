@@ -18,6 +18,7 @@ from flyte_agent_factory import (
     _inbox,
     _pre_review,
     _review,
+    _review_advice,
     _review_wait,
     _reviewer,
     _seal_session,
@@ -750,13 +751,14 @@ async def _pump(
                     review_wait.at = None
                     review_wait.save(qa_round, timeline)
                     timeline.activity("review unavailable -- nobody has reviewed this work; needs a human")
+                    # The owner decides a retry, but never without the cause and a recommendation (#53).
+                    diagnosis, ask = _review_advice.escalation(why)
+                    timeline.row("🩺", diagnosis)
                     await proc.submit(
                         f"Your DONE has NOT been reviewed: {why}. This is an infrastructure failure, not a "
-                        "finding, and it did not use a review round. "
+                        f"finding, and it did not use a review round. {diagnosis} "
                         + _supervise_support._tell_human_first("nobody has reviewed the work")
-                        + ' `ask-human "Review could not run (<reason>). Please retry it or review the '
-                        'branch yourself. Summary of what was delivered: <...>"` and wait. Once a human '
-                        "says to retry, declare DONE again.",
+                        + f' `ask-human "{ask}"` and wait. Once a human says to retry, declare DONE again.',
                         label="Review unavailable",
                     )
                     continue

@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
 #: What `flyte.init`'s `image_builder` accepts (`ImageBuildEngine.ImageBuilderType`).
 IMAGE_BUILDERS = ("local", "local-podman", "remote")
+#: The backend kind (`[backend] kind`), set on every pod the factory starts (`backend_env`). A pod that gets
+#: the profile text reads the kind from it; a pod that does not (a sub-agent: judges, reviewers, delegates; a
+#: browser app) reads it here, so on OSS it knows it needs no Union key (`_union_identity.establish`).
+BACKEND_ENV = "AGENT_FACTORY_BACKEND_KIND"
 #: "union": the MCP app checks the caller's Union token. "proxy": an authenticating proxy in front of it does.
 MCP_AUTH = ("union", "proxy")
 
@@ -90,3 +94,23 @@ def endpoint_env(profile: Profile | None = None) -> dict[str, str]:
     if profile.backend.insecure:
         env["_U_INSECURE"] = "true"
     return env
+
+
+def backend_env(profile: Profile | None = None) -> dict[str, str]:
+    """Return `BACKEND_ENV` for a pod's environment, with or without the profile text; {} with no profile.
+
+    On every backend, not only OSS: a pod that cannot read its kind cannot tell OSS (no key needed) from a
+    Union pod whose key is missing, and must refuse to act (`_union_identity.establish`).
+    """
+    from . import _profile
+
+    profile = profile or _profile.current()
+    return {BACKEND_ENV: profile.backend.kind} if profile else {}
+
+
+def endpoint_env_and_kind(profile: Profile | None = None) -> dict[str, str]:
+    """Return `endpoint_env` and `backend_env` together: what every pod environment carries of its backend.
+
+    Without the profile text (a judge's or reviewer's pod), the kind alone tells it OSS needs no key (#53).
+    """
+    return {**endpoint_env(profile), **backend_env(profile)}

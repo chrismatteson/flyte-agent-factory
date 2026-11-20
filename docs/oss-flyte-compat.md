@@ -102,6 +102,13 @@ names. `--dry-run` still initializes the backend and fetches code.
   falls back to the key Union injects into every pod (#183; `_union_identity.establish`).
 - An `oss`-kind profile that still lists `[union]` keys (a backend that issues them) keeps acting as them
   (`_profile_oss.keyless` is false), as it did before.
+- **Every pod knows its backend.** The deploy sets `AGENT_FACTORY_BACKEND_KIND` (the profile's `[backend] kind`) on
+  every environment (`_profile_oss.backend_env`), including those that get no profile text: the sub-agents (judges,
+  reviewers, delegates) and the browser apps. Such a pod on OSS acts as `OSS_IDENTITY` with no key (#53). A pod that
+  has neither the profile nor the kind, and no key, cannot tell OSS from a Union pod whose key is missing: it refuses
+  with "cannot determine this pod's identity" and asks for a redeploy ([setup.md](setup.md#deploying)), not for
+  `--union-keys`. Environments deployed by an engine older than this need that redeploy. When no reviewer can run, the
+  escalation to the owner carries the cause and a recommendation (`_review_advice`).
 
 **Minimum node:** one 4 CPU / 16 GiB node (a GKE `e2-standard-4` with its default 100 GB boot disk) runs the factory and
 one live project with the default resources ([small-nodes.md](small-nodes.md)). `ops/deploy_factory.py` deploys `--ref`

@@ -40,6 +40,10 @@ else:
     )
     from flyte_agent_factory._judgement import Judgement
 
+#: The recommendation an asker states ("My recommendation: ..."), up to the end of its sentence.
+_ASKER_RECOMMENDATION = re.compile(
+    r"\brecommendation:\s*(.{1,400}?)(?:\.(?:\s|$)|\n|$)", re.IGNORECASE | re.DOTALL
+)
 #: Bounds on what a decision record keeps: the dashboard page counts JSON bytes.
 _DECISION_TEXT_MAX = 2000
 _DECISION_ID = re.compile(r"\bdecision-(\d{3,})\b", re.IGNORECASE)
@@ -104,6 +108,12 @@ def _print_decided(decided: dict[str, Any], approve: bool) -> int:
     return 0
 
 
+def _asker_recommendation(question: str) -> str:
+    """Return what the question itself recommends, for a triage whose judge gave none (#53)."""
+    found = _ASKER_RECOMMENDATION.search(question)
+    return f"(the asker's) {found.group(1).strip()}" if found else "(none given)"
+
+
 class TriageMixin:
     """The `Bridge` methods that judge an ask and record what the factory decided."""
 
@@ -161,7 +171,7 @@ class TriageMixin:
                 return
             prompt = (
                 f"{question}\n\n**Factory triage:** owner-reserved \u2014 {judged.why_owner}. "
-                f"**Recommendation:** {judged.recommendation or '(none given)'}"
+                f"**Recommendation:** {judged.recommendation or _asker_recommendation(question)}"
             )
             self._emit("🙋", f"for the owner ({judged.why_owner})")
             entry = self._new_entry(request_id, kind, question, asked_at, timeout)

@@ -333,7 +333,7 @@ subagent_env = flyte.TaskEnvironment(
     env_vars={
         "PYTHONUNBUFFERED": "1",
         **_session_env_vars,
-        **_profile_oss.endpoint_env(),
+        **_profile_oss.endpoint_env_and_kind(),
         "AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE": _names.getenv("AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE", "claude"),
         **_token_secret_env(),
         **_codex_token_secret_env(),
