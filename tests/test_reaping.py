@@ -254,7 +254,8 @@ def test_the_sdk_re_execs_the_task_under_the_wrapper(monkeypatch):
 
     runtime._maybe_reexec_under_wrapper()
 
-    assert calls == [("tini", ["tini", "-s", "--", *sys.argv])]
+    # The SDK execs the init script, which execs `tini -s --` with the same arguments (keeping the PID).
+    assert calls == [(_images.INIT_WRAPPER, [_images.INIT_WRAPPER, *sys.argv])]
     assert os.environ["_F_EXEC_WRAPPED"] == "1"
 
 
@@ -277,3 +278,26 @@ def test_a_command_is_judged_even_when_the_first_scan_outlasts_it(tmp_path, monk
 
     assert _gate_base._run(command, tmp_path, timeout=30) == (0, "")
     assert limits and set(limits) == {30}
+
+
+def test_every_image_env_value_is_one_word_for_the_local_docker_builder():
+    """The SDK's local builder writes `ENV key=value` unquoted: a value with a space breaks the Dockerfile."""
+    import flyte
+    from flyte._image import Env
+
+    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)))
+    env = [layer for layer in image._layers if isinstance(layer, Env)]
+    assert env, "with_init sets the exec wrapper"
+    for layer in env:
+        for key, value in layer.env_vars:
+            assert not any(ch.isspace() for ch in value), (key, value)
+
+
+def test_the_init_script_execs_tini_as_a_subreaper(tmp_path):
+    """The one-word wrapper is a script that execs the same tini command the apps run."""
+    import subprocess
+
+    script = tmp_path / "factory-init"
+    subprocess.run(["sh", "-c", f"printf '{_images._INIT_SCRIPT}' > {script}"], check=True)
+    assert script.read_text() == '#!/bin/sh\nexec tini -s -- "$@"\n'
+    assert _images.INIT_COMMAND == ["tini", "-s", "--"]
