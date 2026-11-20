@@ -111,9 +111,10 @@ class _Proc:
         self.limit_text = ""
         self.last_submission: tuple[str, float, int] | None = None
 
-    async def submit(self, text: str, **kwargs: Any) -> None:
+    async def submit(self, text: str, **kwargs: Any) -> bool:
         self.last_submission = (text, _agent_time().monotonic(), getattr(self, "output_count", 0))
         self.submitted.append(text)
+        return True
 
 
 async def _run_pump(bridge, proc, *, ticks: int) -> _timeline._Timeline:

@@ -9,15 +9,17 @@ import sys
 def main(engine):
     with open(os.environ["MATRIX_LOG"], "a") as stream:
         stream.write(json.dumps({"engine": engine, "cwd": os.getcwd()}) + "\n")
-    if engine == "claude" and "-p" not in sys.argv:
+    # The author session: the TUI has no `-p`; the stream-json session has `-p` but also `--input-format`.
+    if engine == "claude" and ("-p" not in sys.argv or "--input-format" in sys.argv):
         from fake_claude import main as claude  # type: ignore[import-not-found]  # script: sibling module
 
         if os.environ.get("MATRIX_BROWSER"):
             assert "--strict-mcp-config" in sys.argv
             browser(sys.argv[sys.argv.index("--mcp-config") + 1])
-        if os.environ.get("MATRIX_AUTHOR_LIMIT"):
+        limited = bool(os.environ.get("MATRIX_AUTHOR_LIMIT"))
+        if limited and "--input-format" not in sys.argv:
             print("⎿ You've hit your usage limit. Try again later.", flush=True)
-        return claude()
+        return claude(limited=limited and "--input-format" in sys.argv)
     answer = os.environ.get("MATRIX_ANSWER", "finished")
     if os.environ.get("MATRIX_LIMIT") or os.environ.get("MATRIX_AUTHOR_LIMIT"):
         if engine == "claude":

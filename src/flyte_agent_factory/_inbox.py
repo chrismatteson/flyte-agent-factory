@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from flyte_agent_factory import _session_config, _session_log, _timeline, _usage
+from flyte_agent_factory._author_session import AuthorProcess
 from flyte_agent_factory._conditions import open_condition
-from flyte_agent_factory._process import ClaudeProcess
 
 if TYPE_CHECKING:
     from flyte_agent_factory._grants_supervisor import Credentials
@@ -82,7 +82,7 @@ async def _stop_author(proc: _Stoppable, timeline: _timeline._Timeline) -> None:
 
 
 async def _inbox_loop(
-    proc: ClaudeProcess | asyncio.Future[ClaudeProcess],
+    proc: AuthorProcess | asyncio.Future[AuthorProcess],
     timeline: _timeline._Timeline,
     stop: asyncio.Event,
     grant_round: Callable[..., Awaitable[None]],
@@ -120,7 +120,7 @@ async def _inbox_loop(
 
     # Messages go to the session in order by a task of their own, so that waiting for a session that is
     # still starting never keeps this loop from hearing the next condition -- a `/stop` among them.
-    deliveries: asyncio.Queue[Callable[[ClaudeProcess], Awaitable[None]]] = asyncio.Queue()
+    deliveries: asyncio.Queue[Callable[[AuthorProcess], Awaitable[None]]] = asyncio.Queue()
     # A message is pending from the moment it is written until it is submitted. A previous attempt that
     # died before its session started leaves the marker behind, and this one delivers it.
     for marker in sorted(inbox.glob("*.pending")):
@@ -178,8 +178,9 @@ async def _inbox_loop(
                     timeline.row("🔁", on_clear_limit(limited))
                     continue
 
-                # Written to a file for the same reason as the brief: the TUI submits on
-                # newline, so anything multi-line has to arrive as a pointer.
+                # Written to a file, which is also what a restart redelivers from (the `.pending` marker).
+                # The stream session is sent the text itself; the TUI submits on newline, so it is sent a
+                # pointer to the file.
                 rel = f"{_session_config._INBOX_DIR}/{seq:03d}.md"
                 (_session_config.WORKSPACE / rel).write_text(message + "\n")
                 marker = _session_config.WORKSPACE / f"{_session_config._INBOX_DIR}/{seq:03d}.pending"
@@ -190,20 +191,31 @@ async def _inbox_loop(
             delivery.cancel()
 
 
-def _deliver_direction(marker: Path) -> Callable[[ClaudeProcess], Awaitable[None]]:
+def _deliver_direction(marker: Path) -> Callable[[AuthorProcess], Awaitable[None]]:
     """Return the delivery of the inbox message `marker` stands for; the marker goes once it is submitted."""
 
-    async def deliver(session: ClaudeProcess) -> None:
+    async def deliver(session: AuthorProcess) -> None:
         rel = marker.relative_to(_session_config.WORKSPACE).with_suffix(".md")
-        await session.submit(f"New direction arrived from Flyte. Read {rel} and act on it.")
-        marker.unlink(missing_ok=True)
+        text = ""
+        if getattr(session, "accepts_whole_messages", False):
+            # A stream-json message arrives whole, however long or multi-line it is.
+            with contextlib.suppress(OSError):
+                text = (_session_config.WORKSPACE / rel).read_text().strip()
+        if text:
+            taken = await session.submit(f"New direction arrived from Flyte (kept in {rel}):\n\n{text}")
+        else:
+            taken = await session.submit(f"New direction arrived from Flyte. Read {rel} and act on it.")
+        # An untaken message keeps its marker; the restart path redelivers it. Not raised or requeued:
+        # this runs in the inbox's TaskGroup, and a dead session would make a requeue spin.
+        if taken:
+            marker.unlink(missing_ok=True)
 
     return deliver
 
 
 async def _deliver_in_order(
-    proc: ClaudeProcess | asyncio.Future[ClaudeProcess],
-    deliveries: asyncio.Queue[Callable[[ClaudeProcess], Awaitable[None]]],
+    proc: AuthorProcess | asyncio.Future[AuthorProcess],
+    deliveries: asyncio.Queue[Callable[[AuthorProcess], Awaitable[None]]],
 ) -> None:
     """Hand each queued message to the session, one at a time, once the session exists."""
     while True:
@@ -575,7 +587,7 @@ def _iso_ts(value: object) -> float:
 
 
 async def _watch_app_messages(
-    proc: ClaudeProcess,
+    proc: AuthorProcess,
     timeline: _timeline._Timeline,
     stop: asyncio.Event,
     credentials: Credentials | None = None,

@@ -12,6 +12,7 @@ import pytest
 
 from flyte_agent_factory import _author
 from flyte_agent_factory._process import ClaudeProcess, default_prompt_rules, strip_ansi
+from flyte_agent_factory._stream_process import STREAM_FLAGS
 
 FAKE_TUI = r"""
 import sys
@@ -82,8 +83,14 @@ async def test_session_lifecycle(fake_tui, tmp_path):
     assert code == 0
 
 
-def test_a_default_launch_never_passes_remote_control():
+def test_a_default_launch_never_passes_remote_control(monkeypatch):
 
+    for mode in ("bypassPermissions", "acceptEdits"):
+        # The default, structured session: its stream flags come before the name.
+        argv = _author._author_argv("demo", mode, "", "")
+        assert argv[: 3 + len(STREAM_FLAGS)] == ["claude", *STREAM_FLAGS, "--name", "demo"]
+        assert not any("remote" in arg for arg in argv), argv
+    monkeypatch.setenv(_author.TUI_FALLBACK_VAR, "1")
     for mode in ("bypassPermissions", "acceptEdits"):
         argv = _author._author_argv("demo", mode, "", "")
         assert argv[:3] == ["claude", "--name", "demo"]

@@ -57,12 +57,20 @@ class Process:
         self.messages: list[str] = []
         self.stopped = False
 
-    async def submit(self, text: str, *, label: str = "") -> None:
+    async def submit(self, text: str, *, label: str = "") -> bool:
         self.messages.append(text)
+        return True
 
     async def stop(self, *, grace: float = 20.0) -> None:
         self.stopped = True
         self.returncode = 0
+
+
+async def test_a_paused_author_session_accepts_the_direction(tmp_path):
+    session = AuthorSession(Process(), tmp_path / "pending.json")
+    session.pause()
+    assert await session.submit("x") is True
+    assert session.pending == ["x"]
 
 
 async def test_paused_messages_are_durable_and_transferred_once(tmp_path):

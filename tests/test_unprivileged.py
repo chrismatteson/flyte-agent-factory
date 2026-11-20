@@ -238,6 +238,10 @@ class _ExitsAtStartup:
         self.returncode = 1 if resuming else None
         self.tail = [_ExitsAtStartup.output] if resuming else []
 
+    async def wait(self):
+        # As `ClaudeProcess.wait`: the output is read to its end, then the exit status.
+        return self.returncode
+
     async def stop(self, grace=0.0):
         pass
 

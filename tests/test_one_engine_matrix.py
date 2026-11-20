@@ -53,6 +53,7 @@ from flyte_agent_factory import (
     agent,
 )
 from flyte_agent_factory._delegation import Delegations
+from flyte_agent_factory._stream_process import StreamClaudeProcess
 
 FAKES = Path(__file__).parent
 pytestmark = [pytest.mark.real_planner, pytest.mark.real_contract]
@@ -483,6 +484,9 @@ async def test_refusal_wait_crash_recovers_on_the_same_engine(single_engine, tmp
         await rig.until(lambda: "Read .claude-flyte/BRIEF.md" in rig.received())
         proc = rig.timeline.proc
         assert not hasattr(proc, "on_limit"), "single-engine startup must not install handoff"
+        if rig.engine == "claude":
+            # The default author is the stream-json session; the TUI only behind `AGENT_FACTORY_CLAUDE_TUI=1`.
+            assert isinstance(proc, StreamClaudeProcess) is not _author.is_tui_fallback()
         reset_at = meters().latest[rig.engine].limited_until
         assert reset_at is not None
         assert reset_at > time.time()
@@ -516,6 +520,23 @@ async def test_refusal_wait_crash_recovers_on_the_same_engine(single_engine, tmp
         assert any("resumed from checkpoint" in text for _, _, text in rig.timeline._rows)
         await rig.stop()
     assert (rig.work / "edited").read_text() == "recovered\n"
+
+
+@pytest.mark.parametrize("single_engine", ["claude"], indirect=True)  # the TUI fallback is Claude Code's
+async def test_tui_fallback_author_edit(single_engine, tmp_path, monkeypatch):
+    """The pty TUI (`AGENT_FACTORY_CLAUDE_TUI=1`) still authors: the matrix's other cells run stream-json."""
+    monkeypatch.setenv(_author.TUI_FALLBACK_VAR, "1")
+    await test_author_edit(single_engine, tmp_path, monkeypatch)
+    rows = [text for _, _, text in single_engine.timeline._rows]
+    assert any("claude --name" in text and "--input-format" not in text for text in rows)
+
+
+@pytest.mark.parametrize("single_engine", ["claude"], indirect=True)  # the TUI fallback is Claude Code's
+async def test_tui_fallback_refusal_wait_crash_recovers(single_engine, tmp_path, monkeypatch):
+    """The TUI's limit notice, read from the screen, still drives the same wait and crash recovery."""
+    monkeypatch.setenv(_author.TUI_FALLBACK_VAR, "1")
+    await test_refusal_wait_crash_recovers_on_the_same_engine(single_engine, tmp_path, monkeypatch)
+    assert type(single_engine.timeline.proc).__name__ == "ClaudeProcess"
 
 
 async def test_pull_request(single_engine, monkeypatch):
@@ -712,6 +733,9 @@ async def test_factory_mcp_launch_status_direction(single_engine, queue_state, m
             assert sent["signaled"]
             await rig.until(lambda: "New direction arrived from Flyte" in rig.received())
             assert (rig.work / ".claude-flyte/inbox/001.md").read_text() == "repair this finding\n"
+            if rig.engine == "claude" and not _author.is_tui_fallback():
+                # The stream session is sent the direction itself, not only a pointer to the file.
+                assert "(kept in .claude-flyte/inbox/001.md):\n\nrepair this finding" in rig.received()
             assert "Union: repair this finding" in _inbox._directions
             await rig.stop()
     finally:

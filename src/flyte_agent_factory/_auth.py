@@ -184,9 +184,9 @@ def mark_trusted(config_dir: Path, workspace: Path) -> None:
 
     Claude Code asks `Trust <directory>?` the first time, and exits with
     `Workspace not trusted` when stdin/stdout isn't a terminal. These config keys are Claude Code internals
-    rather than documented settings, so this is a best-effort head start only --
-    the reliable mechanism is that `_process` runs the CLI under a real pty and
-    answers the prompts. Both are in place because either alone is fragile.
+    rather than documented settings, so this is a best-effort head start only. The default author session
+    (`claude -p`, `_stream_process`) never shows these dialogs; the TUI fallback (`_process`, on a pty)
+    answers them if they appear, so either alone is enough for the session it covers.
     """
     for path in (config_dir / ".claude.json", Path.home() / ".claude.json"):
         try:
@@ -209,7 +209,7 @@ def mark_trusted(config_dir: Path, workspace: Path) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(current, indent=2))
         except OSError:
-            # Not fatal: the pty prompt-answering path still covers this.
+            # Not fatal: `-p` shows no dialogs, and the TUI fallback answers them on its pty.
             pass
 
 

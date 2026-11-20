@@ -162,6 +162,7 @@ NO_UNION = {
     ("ops/probes/reviewer_placement.py", "plain"): "returns a constant; the probe is where it is placed",
     ("ops/probes/reviewer_placement.py", "actor"): "returns a constant; the probe is where it is placed",
     ("ops/model_eval/mechanical.py", "env"): "runs a project's checks; deliberately declares no secrets",
+    ("ops/probes/run_live_author_session.py", "env"): "runs `claude` on the slot's setup-token, nothing else",
 }
 
 #: Functions that build an environment per call, and the test that checks what they build.

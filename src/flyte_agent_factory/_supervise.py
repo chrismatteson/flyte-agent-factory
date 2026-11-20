@@ -201,7 +201,7 @@ async def _pump(
                 seen_limit = hit
                 text_now = getattr(proc, "limit_text", "")
                 submission = getattr(proc, "last_submission", None)
-                notice_reset = _usage._reset_at(text_now)
+                notice_reset = _usage.session_reset_at(proc)
                 same_notice = _usage._same_limit_notice(text_now, ended_limit_text)
                 # A refusal inside the episode: a resume was refused.
                 refused_again = limited_since is not None
@@ -237,7 +237,7 @@ async def _pump(
                     reset_at = (
                         cast(tuple[float, float], restored)[1]
                         if from_restart
-                        else _usage._reset_at(getattr(proc, "limit_text", ""))
+                        else _usage.session_reset_at(proc)
                     )
                     timeline.phase("limited", limited_until=reset_at)
                     if not from_restart:
@@ -278,7 +278,7 @@ async def _pump(
                 # Once per distinct refusal: the handoff's answer does not change between ticks.
                 handled_hit = proc.limit_hit_at
                 limit_text = getattr(proc, "limit_text", "")
-                notice_reset = _usage._reset_at(limit_text)
+                notice_reset = _usage.session_reset_at(proc)
                 if (
                     resumed_notice is not None
                     and getattr(proc, "last_submission", None) == resume_submission
@@ -301,7 +301,7 @@ async def _pump(
                     proc.pause()
                     # This refusal's own reset, never `reset_at`: after a deferral that is the retry time,
                     # often already past, and it overwrote the engine's known reset (#125).
-                    fresh = _usage._refusal_until(limit_text, getattr(proc, "limit_seen_wall", None))
+                    fresh = _usage.session_refusal_until(proc)
                     if await proc.on_limit(fresh, interrupted_message):
                         limited_since = None
                         seen_limit = None
