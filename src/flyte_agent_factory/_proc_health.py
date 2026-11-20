@@ -1,7 +1,7 @@
 """What /proc says about the pod's process table: how many processes, how many zombies, who is PID 1.
 
 A zombie is a finished process nobody has waited for. PID 1 reaps the orphans re-parented to it; the flyte
-`a0` process does not, so the pods run under tini (`_images.INIT_WRAPPER`). This is how a pod shows whether
+`a0` process does not, so the pods run under tini (`_images.with_init`). This is how a pod shows whether
 that is in place, and when it is not, why every walk of /proc (`_load_clock.sample_group`) got slow.
 """
 

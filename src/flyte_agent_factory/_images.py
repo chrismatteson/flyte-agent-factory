@@ -33,6 +33,7 @@ shared app stays deployed for that.
 from __future__ import annotations
 
 import base64
+import shlex
 from pathlib import Path
 
 import flyte
@@ -69,18 +70,37 @@ TAILSCALE_SHA256 = "41a8931fa52055bd7ea4b51df9acff2ba2d4e9000c2380b667539b5b9999
 # the command in env `_F_EXEC_WRAPPER`; exec keeps the PID, so tini becomes PID 1 and `a0` its child. tini
 # reaps every orphan and forwards signals; `-s` makes it a subreaper so it still reaps when not PID 1.
 INIT_COMMAND: list[str] = ["tini", "-s", "--"]
-# The env value is one word: the SDK's local (docker) builder writes env vars as `ENV key=value`
-# unquoted, so a value with spaces ("tini -s --") is a Dockerfile syntax error (#77). The value is tini
-# itself, the binary the apt layer installs, not a script made by a build command: on the remote builder
-# the #77 script was absent at run time, so every factory pod failed to exec its wrapper. `TINI_SUBREAPER`
-# in tini's environment is its `-s`; `--` is only needed for a program starting with `-`, and `a0` never does.
-INIT_WRAPPER = "/usr/bin/tini"
-INIT_ENV: dict[str, str] = {"_F_EXEC_WRAPPER": INIT_WRAPPER, "TINI_SUBREAPER": "1"}
+# The SDK tokenizes `_F_EXEC_WRAPPER` with shlex and execs `<tokens> <argv>`. A remote (Union) build gets the
+# init command itself, `tini -s --`: the `--` stops tini's option parsing before the task's own `--flags`
+# (tini is GNU getopt and would read them). The SDK's local (docker) builder writes `ENV key=value` unquoted,
+# where a value with spaces is a Dockerfile syntax error (#77), so a local build gets a one-word value: a
+# script, made by a build command, that execs the same command. Remote builds do not use that script: there
+# it was absent at run time and every factory pod failed to exec its wrapper (#84 then dropped `--`).
+INIT_WRAPPER_SCRIPT = "/usr/local/bin/factory-init"
+_INIT_SCRIPT = f'#!/bin/sh\\nexec {shlex.join(INIT_COMMAND)} "$@"\\n'
 
 
-def with_init(image: flyte.Image) -> flyte.Image:
+def builds_locally() -> bool:
+    """Return whether the selected profile builds images with the SDK's local (docker or podman) builder."""
+    from . import _profile, _profile_oss
+
+    profile = _profile.current()
+    return profile is not None and _profile_oss.builder(profile.backend).startswith("local")
+
+
+def init_wrapper(local: bool) -> str:
+    """Return the `_F_EXEC_WRAPPER` value: the init command, or on a local build the one-word script."""
+    return INIT_WRAPPER_SCRIPT if local else shlex.join(INIT_COMMAND)
+
+
+def with_init(image: flyte.Image, local: bool | None = None) -> flyte.Image:
     """Return `image` with tini installed and the SDK told to run the task under it."""
-    return image.with_apt_packages("tini").with_env_vars(INIT_ENV)
+    local = builds_locally() if local is None else local
+    image = image.with_apt_packages("tini")
+    if local:
+        script = f"printf '{_INIT_SCRIPT}' > {INIT_WRAPPER_SCRIPT} && chmod 0755 {INIT_WRAPPER_SCRIPT}"
+        image = image.with_commands([script])
+    return image.with_env_vars({"_F_EXEC_WRAPPER": init_wrapper(local)})
 
 
 def run_as_flyte(image: flyte.Image) -> flyte.Image:
