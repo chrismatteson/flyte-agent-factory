@@ -561,3 +561,37 @@ print('writable:', writable)
     done = _run(code, writable=[str(work)], private_tmp="/tmp", cwd=work)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "writable: []"
+
+
+def test_the_module_imports_where_os_has_no_linux_statvfs_flags(monkeypatch):
+    """A hand deploy imports this module on macOS, whose `os` has no ST_NODEV, ST_RELATIME and friends."""
+    import importlib
+    import os
+
+    from flyte_agent_factory import _seal_net
+
+    for name in ("ST_NOSUID", "ST_NODEV", "ST_NOEXEC", "ST_NOATIME", "ST_NODIRATIME", "ST_RELATIME"):
+        monkeypatch.delattr(os, name, raising=False)
+    try:
+        reloaded = importlib.reload(_seal_net)
+        assert reloaded._LOCKED_MOUNT_FLAGS[1] == (0x4, 0x4)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(_seal_net)
+
+
+def test_the_spelled_out_statvfs_flags_match_linux():
+    import os
+
+    if not hasattr(os, "ST_RELATIME"):
+        pytest.skip("not Linux")
+    from flyte_agent_factory import _seal_net
+
+    assert [s for s, _ in _seal_net._LOCKED_MOUNT_FLAGS] == [
+        os.ST_NOSUID,
+        os.ST_NODEV,
+        os.ST_NOEXEC,
+        os.ST_NOATIME,
+        os.ST_NODIRATIME,
+        os.ST_RELATIME,
+    ]
