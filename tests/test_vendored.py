@@ -685,3 +685,44 @@ def test_an_entry_with_a_field_that_is_not_a_string_is_a_problem_and_owns_nothin
     assert found.problems == ["vendored.toml tree 1: `path`, `repo` and `commit` must all be strings"]
     # The valid entry after it is still honoured.
     assert found.unchanged(f"{TREE}/{BIG}")
+
+
+def _grow_upstream(upstream):
+    root, older = upstream
+    (root / "later.txt").write_text("later\n")
+    newer = _commit(root)
+    (root / "head.txt").write_text("head\n")
+    _commit(root)
+    return root, older, newer
+
+
+@pytest.mark.parametrize("order", ["older-first", "newer-first"])
+def test_two_commits_of_one_upstream_are_both_read_through_one_cache(upstream, tmp_path, order):
+    """Every engine project declares the same upstream; the cache serves any commit of it, in any order."""
+    root, older, newer = _grow_upstream(upstream)
+    found = {}
+    for sha in [older, newer] if order == "older-first" else [newer, older]:
+        found[sha] = _vendored.read_upstream_tree(tmp_path, root.as_uri(), sha, "")[2]
+    assert "later.txt" in found[newer] and "later.txt" not in found[older]
+    assert BIG in found[older] and BIG in found[newer]
+
+
+def test_a_history_store_left_shallow_by_an_earlier_cache_layout_is_rebuilt(upstream, tmp_path):
+    """A cache one store held both fetches in is shallow; it is built again, not trusted for ancestry."""
+    root, older, newer = _grow_upstream(upstream)
+    history = _vendored._cache_dir_for(root.as_uri())
+    history.parent.mkdir(parents=True)
+    _git(tmp_path, "init", "-q", "--bare", str(history))
+    _git(
+        tmp_path,
+        f"--git-dir={history}",
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        root.as_uri(),
+        f"{newer}:refs/vendored/{newer}",
+    )
+    assert (history / "shallow").is_file()
+    assert "later.txt" not in _vendored.read_upstream_tree(tmp_path, root.as_uri(), older, "")[2]
+    assert not (history / "shallow").exists()

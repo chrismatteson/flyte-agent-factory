@@ -64,6 +64,9 @@ class Status(enum.Enum):
 
 _SKIP_DIRS = {".git", ".claude-flyte", "node_modules", ".venv"}
 
+#: Author mail endings that mark an agent's commit (`_gates.COMMIT_DOMAIN`, its fallbacks), not an operator's.
+AGENT_MAIL_SUFFIXES = ("@localhost", ".localhost")
+
 
 #: Seconds a tool may run, unless its rule says otherwise with a `Timeout: <seconds>` line.
 _TOOL_TIMEOUT = 300

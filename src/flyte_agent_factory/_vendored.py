@@ -18,6 +18,7 @@ import dataclasses
 import fcntl
 import hashlib
 import re
+import shutil
 import subprocess
 import time
 import tomllib
@@ -150,11 +151,16 @@ class Upstreams:
         return " ".join(parts)
 
 
-def _cache_dir_for(repo: str) -> Path:
+def _cache_dir_for(repo: str, commit: str = "") -> Path:
+    # One bare repository per upstream holds its default branch's history without trees (`tree:0`); one per
+    # commit holds that commit's shallow (`--depth 1`) fetch. Never one store for both: a shallow boundary
+    # cuts every ancestry walk below it, a tree-less history commit would pass for fetched, and the next pack
+    # would arrive thin against trees the store never had.
     # Imported here: `_gate_tests` imports this module for `fail_to_pass`.
     from . import _gate_tests
 
-    return _gate_tests.cache_root() / "vendored" / hashlib.sha256(repo.encode()).hexdigest()[:16]
+    key = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    return _gate_tests.cache_root() / "vendored" / (f"{key}-{commit}" if commit else key)
 
 
 def _env() -> dict[str, str]:
@@ -221,24 +227,24 @@ def _on_default_ref(git_args: list[str], cwd: Path, commit: str) -> bool:
 
 
 def _cached(repo: str, commit: str) -> tuple[list[str], Path]:
-    cache = _cache_dir_for(repo)
-    git_args = [f"--git-dir={cache}"]
+    history, objects = _cache_dir_for(repo), _cache_dir_for(repo, commit)
+    history_args, git_args = [f"--git-dir={history}"], [f"--git-dir={objects}"]
     if (
-        (cache / "HEAD").is_file()
-        and _has_commit(git_args, cache.parent, commit)
-        and _on_default_ref(git_args, cache.parent, commit)
+        (objects / "HEAD").is_file()
+        and (history / "HEAD").is_file()
+        and _has_commit(git_args, objects.parent, commit)
+        and _on_default_ref(history_args, history.parent, commit)
     ):
-        return git_args, cache.parent
+        return git_args, objects.parent
     raise _gate_start._GateError("not fetched yet (a snapshot reads only what a gate fetched)")
 
 
 def _fetch_now(repo: str, commit: str) -> tuple[list[str], Path]:
-    cache = _cache_dir_for(repo)
-    git_args = [f"--git-dir={cache}"]
+    history, objects = _cache_dir_for(repo), _cache_dir_for(repo, commit)
+    history_args, git_args = [f"--git-dir={history}"], [f"--git-dir={objects}"]
     # https only, no credentials: a private repository is "unavailable", not a prompt that hangs the gate. No
     # automatic gc: the default branch's history is fetched without trees, which gc must not trip over.
     fetch = [
-        *git_args,
         "-c",
         "protocol.allow=never",
         *(a for scheme in _ALLOWED_SCHEMES for a in ("-c", f"protocol.{scheme}.allow=always")),
@@ -249,38 +255,43 @@ def _fetch_now(repo: str, commit: str) -> tuple[list[str], Path]:
         "fetch",
         "--quiet",
     ]
-    with _locked(cache.with_suffix(".lock")):
-        if not (cache / "HEAD").is_file():
-            code, output = _git(["init", "--bare", str(cache)], cache.parent)
-            if code:
-                raise _gate_start._GateError(output.strip())
-        if not _has_commit(git_args, cache.parent, commit):
+    with _locked(history.with_suffix(".lock")):
+        if (history / "shallow").is_file():
+            # A shallow history store (one a commit's own shallow fetch went into) cuts every ancestry walk
+            # below its boundary, and no later fetch deepens it. It is a cache: build it again.
+            shutil.rmtree(history)
+        for store in (history, objects):
+            if not (store / "HEAD").is_file():
+                code, output = _git(["init", "--bare", str(store)], store.parent)
+                if code:
+                    raise _gate_start._GateError(output.strip())
+        if not _has_commit(git_args, objects.parent, commit):
             # A ref keeps the commit from being collected.
             code, output = _git(
-                [*fetch, "--depth", "1", repo, f"{commit}:refs/vendored/{commit}"],
-                cache.parent,
+                [*git_args, *fetch, "--depth", "1", repo, f"{commit}:refs/vendored/{commit}"],
+                objects.parent,
                 timeout=_FETCH_TIMEOUT,
             )
-            if code or not _has_commit(git_args, cache.parent, commit):
+            if code or not _has_commit(git_args, objects.parent, commit):
                 raise _gate_start._GateError(output.strip()[-500:] or f"fetch exited {code}")
-        if not _on_default_ref(git_args, cache.parent, commit):
+        if not _on_default_ref(history_args, history.parent, commit):
             # Commits only (`tree:0`): enough to walk the history, a few MB even for a large repository.
             code, output = _git(
-                [*fetch, "--filter=tree:0", repo, f"+HEAD:{_DEFAULT_REF}"],
-                cache.parent,
+                [*history_args, *fetch, "--filter=tree:0", repo, f"+HEAD:{_DEFAULT_REF}"],
+                history.parent,
                 timeout=_FETCH_TIMEOUT,
             )
             # The filtered fetch marks `repo` a promisor remote, from which git would then fetch any missing
             # object on demand, unbounded and mid-rule: a missing object must be an error instead.
-            _git([*git_args, "config", "--remove-section", f"remote.{repo}"], cache.parent)
-            _git([*git_args, "config", "--unset", "extensions.partialClone"], cache.parent)
+            _git([*history_args, "config", "--remove-section", f"remote.{repo}"], history.parent)
+            _git([*history_args, "config", "--unset", "extensions.partialClone"], history.parent)
             if code:
                 raise _gate_start._GateError(output.strip()[-500:] or f"fetch exited {code}")
-            if not _on_default_ref(git_args, cache.parent, commit):
+            if not _on_default_ref(history_args, history.parent, commit):
                 raise _gate_start._GateError(
                     f"commit {commit} is not in the history of the default branch of {repo}"
                 )
-    return git_args, cache.parent
+    return git_args, objects.parent
 
 
 def _list_blobs(git_args: list[str], cwd: Path, commit: str) -> dict[str, tuple[str, int]]:
@@ -358,6 +369,22 @@ def _omitted_tests(project: Path, tree: _Tree) -> list[str]:
     return found
 
 
+def read_upstream_tree(
+    project: Path, repo: str, commit: str, trusted_base: str, fetch: bool = True
+) -> tuple[list[str], Path, dict[str, tuple[str, int]]]:
+    """Return the git arguments, directory and blobs (path -> (sha, size)) of `repo` at `commit`.
+
+    A commit in `trusted_base`'s history is read from the workspace's own objects; any other is fetched
+    (`_fetch`). Raises `_gate_start._GateError` when it cannot be read.
+    """
+    git_args: list[str]
+    if _has_commit([], project, commit) and _in_trusted_base(project, commit, trusted_base):
+        git_args, cwd = [], project
+    else:
+        git_args, cwd = _fetch(repo, commit, fetch=fetch)
+    return git_args, cwd, _list_blobs(git_args, cwd, commit)
+
+
 def load(project: Path, skip_dirs: set[str], *, trusted_base: str = "", fetch: bool = True) -> Upstreams:
     """Return the upstream trees of `project`: its manifest's, and its nested git checkouts.
 
@@ -373,13 +400,9 @@ def load(project: Path, skip_dirs: set[str], *, trusted_base: str = "", fetch: b
     found = Upstreams(project, nested=nested, problems=problems)
     for entry in entries:
         try:
-            git_args: list[str]
-            local = _has_commit([], project, entry.commit)
-            if local and _in_trusted_base(project, entry.commit, trusted_base):
-                git_args, cwd = [], project
-            else:
-                git_args, cwd = _fetch(entry.repo, entry.commit, fetch=fetch)
-            tree = _Tree(entry.prefix, git_args, cwd, _list_blobs(git_args, cwd, entry.commit))
+            tree = _Tree(
+                entry.prefix, *read_upstream_tree(project, entry.repo, entry.commit, trusted_base, fetch)
+            )
             found.trees.append(tree)
             found.described.append(f"{entry.path} ({entry.repo} @ {entry.commit[:12]})")
             found.omitted_tests.extend(_omitted_tests(project, tree))

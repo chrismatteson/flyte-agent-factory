@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import io
+import os
 import re
 import subprocess
 import tarfile
 import tempfile
 from collections import Counter
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import _gate_base, _secret_env
 
@@ -58,6 +59,39 @@ class StartTree:
 
     path: Path
     upstream: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceStart:
+    """Where a workspace project is measured from: upstream's merge-base, plus an import only the branch has.
+
+    `import_commit` is None when the merge-base already holds the project folder or no import is trusted;
+    `ignored` then says why an import there was not used. `rel` is the project's folder relative to the
+    workspace. `verified_against` names the upstream commit an import was checked against, and `only` its
+    workspace paths byte-identical to that commit: the only ones the start takes from it, with `harness`, the
+    import tool's own files it wrote beside them. An operator's import is taken whole (`only` None).
+    """
+
+    upstream: str
+    rel: str
+    import_commit: str | None = None
+    verified_against: str = ""
+    only: frozenset[str] | None = None
+    ignored: str = ""
+    harness: frozenset[str] = frozenset()
+
+    def describe(self) -> str:
+        """Return the sentence the scope record carries, so the measured base is visible to the operator."""
+        text = f"measured from {self.upstream[:12]} (merge-base with origin/HEAD)"
+        if not self.import_commit:
+            return text + (f"; import not used: {self.ignored}" if self.ignored else "")
+        text += f" + import {self.import_commit[:12]} of {self.rel}"
+        if self.verified_against:
+            verified = len((self.only or frozenset()) - self.harness)
+            text += f", its {verified} files identical to {self.verified_against}"
+            names = ", ".join(sorted(PurePosixPath(path).name for path in self.harness))
+            text += f", with its own {names}" if names else ""
+        return text
 
 
 def _is_ancestor(workspace: Path, ancestor: str, descendant: str) -> bool:
@@ -122,12 +156,15 @@ def _is_own_merge(workspace: Path, start: str, sha: str, above: list[str], *, ha
 
 
 @contextlib.contextmanager
-def _start_tree(workspace: Path, base: str, commits: list[str] | None) -> Iterator[StartTree]:
+def _start_tree(
+    workspace: Path, base: str, commits: list[str] | None, imported: WorkspaceStart | None = None
+) -> Iterator[StartTree]:
     """Where the project started: `base` with the newest upstream merged in, else HEAD, its commits undone.
 
     The project is judged by its net change. Judging each commit against its parent blocked forever
     on a skip that was added and later removed, and pushed history cannot be rewritten. Without
-    `commits` (no attribution available) the start is simply `base`.
+    `commits` (no attribution available) the start is simply `base`. `imported` (a workspace project whose
+    import is only on its branch) lays the import's copy of the project folder over that start.
     """
     tip = None if commits is None else find_upstream_tip(workspace, base, commits)
     with tempfile.TemporaryDirectory(prefix="factory-start-") as directory:
@@ -139,6 +176,8 @@ def _start_tree(workspace: Path, base: str, commits: list[str] | None) -> Iterat
         else:
             _extract(workspace, "HEAD" if commits is not None else base, checkout)
             _reverse(workspace, checkout, commits or [])
+            if imported and imported.import_commit:
+                _overlay(workspace, imported.import_commit, imported, checkout)
         yield StartTree(checkout, tip)
 
 
@@ -188,16 +227,38 @@ def find_upstream_start(workspace: Path) -> str | None:
     return output.strip() if code == 0 and output.strip() else None
 
 
-def list_paths_since(workspace: Path, upstream: str) -> tuple[int, list[str]]:
+def list_paths_since(
+    workspace: Path, upstream: str, imported: WorkspaceStart | None = None
+) -> tuple[int, list[str]]:
     """Return the exit code and every path HEAD changes from `upstream` (`find_upstream_start`).
 
     Every commit's paths, a merge's own additions included, where a walk over the project's non-merge
-    commits would miss what a merge commit it authored added.
+    commits would miss what a merge commit it authored added. With an `imported` start the project's folder
+    is also compared with the import, which finds a file the import added and the project deleted: HEAD and
+    `upstream` agree it is absent.
     """
     code, output = _gate_base._run(
         ["git", "diff", "--name-only", "--no-renames", "-z", upstream, "HEAD"], workspace
     )
-    return (code, [output]) if code else (0, sorted(p for p in output.split("\0") if p))
+    if code or not (imported and imported.import_commit):
+        return (code, [output]) if code else (0, sorted(p for p in output.split("\0") if p))
+    code, folder = _gate_base._run(
+        [
+            "git",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            imported.import_commit,
+            "HEAD",
+            "--",
+            imported.rel,
+        ],
+        workspace,
+    )
+    if code:
+        return code, [folder]
+    return 0, sorted({p for p in (output + "\0" + folder).split("\0") if p})
 
 
 def list_foreign_commits(workspace: Path, base: str, attributed: list[str]) -> list[str]:
@@ -220,6 +281,58 @@ def _extract(workspace: Path, ref: str, checkout: Path, paths: list[str] | None 
     archive = _git_bytes(["archive", ref, "--", *(paths or [])], workspace)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(checkout, filter="data")
+
+
+def _overlay(workspace: Path, commit: str, imported: WorkspaceStart, checkout: Path) -> None:
+    """Write the import's files of the project folder into `checkout`, raw, beside what is already there.
+
+    Over the merge-base's folder, not in place of it: a path main put there is upstream's too, and main's
+    copy may be newer than the import's. Blobs are written as stored, where `git archive` would apply the
+    import's own `.gitattributes` (`export-ignore` drops files). A link that would leave the start is skipped.
+    """
+    listing = _git_bytes(["ls-tree", "-r", "-z", "--full-tree", commit, "--", imported.rel], workspace)
+    wanted: list[tuple[str, str, Path]] = []
+    root = checkout.resolve()
+    for entry in filter(None, listing.split(b"\0")):
+        meta, _, raw = entry.partition(b"\t")
+        mode, kind, sha = meta.decode().split()
+        try:
+            path = raw.decode()
+        except UnicodeDecodeError:
+            continue  # the rules cannot name a non-UTF-8 path; left out, it is judged as the project's
+        target = checkout / path
+        if kind != "blob" or (imported.only is not None and path not in imported.only):
+            continue
+        if target.exists() or target.is_symlink():
+            continue
+        nearest = target.parent
+        while not (nearest.exists() or nearest.is_symlink()):
+            nearest = nearest.parent
+        if not nearest.is_dir() or not nearest.resolve().is_relative_to(root):
+            continue  # main put a file (or a link) where the import has a directory: main's stays
+        wanted.append((mode, sha, target))
+    if not wanted:
+        return
+    batch = _run_git(
+        ["cat-file", "--batch"], workspace, stdin=b"".join(sha.encode() + b"\n" for _, sha, _ in wanted)
+    )
+    if batch.returncode:
+        raise _GateError(f"git cat-file failed: {batch.stderr.decode(errors='replace')}")
+    stream = io.BytesIO(batch.stdout)
+    for mode, _, target in wanted:
+        size = int(stream.readline().split()[2])
+        data = stream.read(size)
+        stream.read(1)  # the newline after each object
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if mode == "120000":
+            link = target.parent / os.fsdecode(data)
+            if not link.resolve().is_relative_to(root):
+                continue
+            target.symlink_to(os.fsdecode(data))
+            continue
+        target.write_bytes(data)
+        if mode == "100755":
+            target.chmod(0o755)
 
 
 def _reverse(workspace: Path, checkout: Path, commits: list[str]) -> None:

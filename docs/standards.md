@@ -232,10 +232,12 @@ history of the project's trusted base, the commit the supervisor recorded when t
 restart, `.claude-flyte/<name>/base-commit`, the base waivers are read against): any later local commit, and any
 ref such as `refs/remotes/origin/*`, may be one the session made, and declaring it would let a project call its
 own code upstream's. Otherwise by a shallow `https` fetch of that one commit into a cache under
-`$XDG_CACHE_HOME/factory-gate/vendored` (or `~/.cache/factory-gate/vendored`), made once per repository and
-reused. A fetched commit must also be in the history of the declared repository's default branch (checked by a
-fetch of that branch's history without trees): a repository serves a commit of any branch by its id, so a commit
-pushed to a side branch of upstream is not upstream's. The cache is not left a promisor remote, so a missing object
+`$XDG_CACHE_HOME/factory-gate/vendored` (or `~/.cache/factory-gate/vendored`), one store per commit. A fetched
+commit must also be in the history of the declared repository's default branch (checked by a fetch of that branch's
+history without trees, into one store per repository, reused): a repository serves a commit of any branch by its
+id, so a commit pushed to a side branch of upstream is not upstream's. The two stores are kept apart because a
+shallow boundary and a history without trees cannot share one: the boundary cuts the history walk, and a commit
+without its tree would pass for fetched. The history store is not left a promisor remote, so a missing object
 is an error, never an on-demand fetch. The fetch has no credentials and never
 prompts, so a private repository, an unreachable host or a missing commit leaves the tree "unavailable": its
 files are judged as the project's and the output names the tree, repository, commit and the error. The gate
