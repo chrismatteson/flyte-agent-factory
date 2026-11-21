@@ -84,7 +84,12 @@ def builds_locally() -> bool:
     """Return whether the selected profile builds images with the SDK's local (docker or podman) builder."""
     from . import _profile, _profile_oss
 
-    profile = _profile.current()
+    # Images are also defined where no usable profile exists (an ops script's --help under an old profile);
+    # the profile's own loader reports that, so here an unreadable one means the remote default.
+    try:
+        profile = _profile.current()
+    except _profile.ProfileError:
+        return False
     return profile is not None and _profile_oss.builder(profile.backend).startswith("local")
 
 
