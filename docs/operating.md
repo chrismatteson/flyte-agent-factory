@@ -170,6 +170,66 @@ An engine direction counts only as the whole message, in any case and with an op
 `please resume on claude when you can` is ordinary direction, delivered on resume. `/clear-limit` is matched
 the same way: `please /clear-limit` or `/clear-limit foo` is delivered as ordinary direction.
 
+### Usage meters
+
+A Claude setup-token has no usage endpoint: Anthropic's `/api/oauth/usage` needs the `user:profile` scope, which
+`claude setup-token` does not grant. So the factory meters a token by what its own sessions see and spend, never
+by an extra call to Anthropic. A reading's `source` says where it came from:
+
+- `cli-event`: a `rate_limit_event` (top-level `rateLimitType`/`utilization`/`resetsAt`, or
+  `rate_limit_info.unifiedWindows`) in stream-json output: the structured author session's, which reports one
+  with every turn and is the main source (`StreamClaudeProcess` hands each to `_usage.ingest_author_rate_limit`),
+  and a delegated sub-agent's (`--output-format stream-json --verbose`; a benchmark's plain run is not
+  metered). A `rejected` status is a refusal until its reset. `resetsAt` is read once, by
+  `_meter.parse_event_reset` (seconds, milliseconds or ISO), for the meter and the author's own refusal alike. An event that names one window leaves the other window's last percentage in place
+  while that window's reset is ahead, as does any reading without a percentage (a refusal). The window kept
+  keeps the time and source it was measured at (`five_hour_observed_at`/`_source`, `weekly_observed_at`/`_source`
+  on the meter, written only for a window carried this way), so a refusal does not make an old share look new.
+- `statusline`: a coordinator on the TUI fallback (a `-p` session runs no status line) runs a status-line command
+  (written into its `settings.json` beside the context guard's and the seal's hooks) that Claude Code passes the
+  token's `rate_limits` after each message. The command keeps only the five-hour and weekly `used_percentage`
+  and `resets_at` (`statusline-meter.json` in the session's config directory, numbers only, rewritten at most
+  every 30 seconds unless they change), and the supervisor records it as a reading of the token.
+- `cli-headers`: the `anthropic-ratelimit-unified-*` response headers, where a CLI surfaces them.
+- `limit-text`: a refusal's own text ("You've hit your limit · resets ..."), which gives a reset but no percentage.
+
+Readings reach the run report, so `factory.status` shows each project's meters. For the whole factory, run
+`factory.usage` from chat (no inputs). For each Claude credential the factory holds (the work token and the
+benchmark's, when that is another secret) it returns:
+
+- `account`: the secret's name and the token's fingerprint, never the token;
+- `observed`: the readings across the slot and benchmark runs of the last eight days. Each window comes from
+  the newest reading that has it, preferring one whose reset is still ahead, so a newer five-hour-only event
+  does not hide the week: `five_hour_pct` and `weekly_pct` (the share **used**), `five_hour_left_pct` and
+  `weekly_left_pct` (what remains), their reset times (epoch seconds and ISO), and each window's own
+  `*_observed_at` and `*_source`; `observed_at`, `age_s` and `source` are the newest of those. A window whose
+  reset has passed is `expired` with no percentage. `limited_until` is set while a refusal is in force (the
+  credential is out until then, whatever the percentages say) and `login_rejected` when the newest attempt was
+  refused as a login (a token to replace). `null` when no session has seen any of these;
+- `kind` and `measured`: `measured` (`true`) when a current reading from a measuring source exists, i.e. a
+  window whose reset is still ahead (or, when the reading carried no reset, one younger than the window: five
+  hours or seven days) with a percentage (`limit-text` is not one, and neither is a stale reading whose windows
+  have reset); `estimate` when not measured but the factory recorded tokens or dollars for the credential;
+  `unknown` otherwise;
+- `provider_usage: "unsupported-for-setup-token"` with a sentence saying why (the plain note when not measured);
+- `estimate`, labelled `"estimate"`: the input, output and cache tokens and the USD the factory's own sessions
+  spent on that credential since the current weekly window began (the observed weekly reset less seven days,
+  else the last seven days; a passed reset is not rolled forward), and in the last five hours (`five_hour`,
+  from the same hourly records), with the window, its `basis`, and how many runs were counted. Sub-agent dollars are
+  as the CLI reported them (`usd_subagents_cli_reported`); the coordinator's session reports none, so its
+  replies are priced at list price (`usd_author_list_price`). Each run's report carries its usage by UTC hour
+  for this (`cost.claude_usage`), and an hour is counted whole when any of it is in the window. A report written
+  before these records existed counts nothing and is counted in `runs_without_hourly_records`. The estimate
+  misses anything spent on the credential outside the factory. When a run listing was cut short at its bound
+  or failed, or a report could not be read, `lower_bound` is `true` and the `basis` says the sums are a lower
+  bound.
+
+A listing or report that could not be read is named, by error class only, in `errors`. `factory.read_login_meter`
+still answers for one token: for a setup-token it returns the newest measured reading of that credential from
+the meter store and run reports when one exists (unchanged, with its own `observed_at`), else
+`unsupported-for-setup-token` rather than `refresh-failed`. It makes no network call while Anthropic has no
+usage endpoint for setup-tokens.
+
 ### Remembered usage limits
 
 A refusal's reset time is remembered so that later calls route around the limit, but it is only a hint: the

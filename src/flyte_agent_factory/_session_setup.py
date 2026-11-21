@@ -24,6 +24,7 @@ from flyte_agent_factory import (
     _browser_exit_node,
     _browser_gate,
     _checkpoint,
+    _context_guard,
     _design_seed,
     _gates,
     _git,
@@ -41,11 +42,13 @@ from flyte_agent_factory import (
     _secret_env,
     _session_config,
     _session_log,
+    _statusline,
     _timeline,
     _union_identity,
     _usage,
     _workspace,
 )
+from flyte_agent_factory._auth import write_settings
 from flyte_agent_factory._bridge import (
     BRIDGE_DIR,
 )
@@ -66,6 +69,20 @@ from flyte_agent_factory.browser import (
 )
 
 _ASSETS = Path(__file__).parent / "_assets"
+
+
+def write_author_settings() -> None:
+    """Write the coordinator's Claude settings: the context guard, the usage status line and the seal's hook.
+
+    The status line shows a setup-token's usage windows to a coordinator on the TUI fallback (`_statusline`);
+    a structured session reports them as `rate_limit_event`s instead. A checkpoint restores the config dir,
+    and a capture in it may be from a token since replaced, so it starts empty.
+    """
+    capture = _statusline.locate_capture(_session_config.CONFIG_DIR)
+    capture.unlink(missing_ok=True)
+    guard = _statusline.settings_extra(_context_guard.settings_extra(), capture)
+    write_settings(_session_config.CONFIG_DIR, hold_dialogs=False, extra=_seal_session.settings_extra(guard))
+
 
 #: What the harness writes at a project's workspace root is listed in `_gates.HARNESS_PATHS`, for
 #: the clone's local `.git/info/exclude` and for the gates alike. Anchored: an unanchored

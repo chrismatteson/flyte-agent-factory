@@ -239,6 +239,7 @@ env = flyte.TaskEnvironment(
         "_factory_policy.py",
         "_factory_recreate.py",
         "_factory_status.py",
+        "_factory_usage.py",
         "_grants_cli.py",
         "_lane_shards.py",
         "_seal_launch.py",
@@ -553,11 +554,7 @@ async def project(
         # from anywhere, durable across restarts. Nobody is assumed to be watching,
         # so forwarded dialogs expire into their default rather than hold the session.
         mode = permission_mode or _AUTO_PERMISSION_MODE
-        write_settings(
-            _session_config.CONFIG_DIR,
-            hold_dialogs=False,
-            extra=_seal_session.settings_extra(_context_guard.settings_extra()),
-        )
+        _session_setup.write_author_settings()
         mark_trusted(_session_config.CONFIG_DIR, _session_config.WORKSPACE)
 
     # --- workspace ------------------------------------------------------ #
@@ -1202,7 +1199,8 @@ async def subagent(
                     "Finish with a short report of what you did."
                 ),
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 *_policy.argv(_policy.Setting(model, effort)),
                 "--max-turns",
                 str(max_turns),

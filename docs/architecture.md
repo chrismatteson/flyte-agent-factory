@@ -178,6 +178,7 @@ secret as present.
 | `factory.browser_link` | returns `{identity, url}`: a one-time (ten minutes, single use) sign-in/view link for a configured browser identity |
 | `factory.credential_link` | returns `{project, credential, hours, url, paste_to}` for a live project: the link where the owner seals a credential for it, and its `direct-` condition to signal the sealed text to; no credential passes through it ([credential grants](credential-grants.md)) |
 | `factory.credentials` | lists every live project's credential grants (name, kind, state, expiry), never a value |
+| `factory.usage` | per Claude credential: the newest observed five-hour and weekly usage, that Anthropic has no usage endpoint for setup-tokens, and a labelled estimate of what the factory spent on it this week ([usage meters](operating.md#usage-meters)) |
 | `factory-bench.benchmark` | measures one engine commit on a fixed task suite; spends nothing until given `max_usd` |
 
 A project's credential grants (AWS access the owner gives one project for a time) are controlled from chat with
@@ -187,7 +188,9 @@ into a project's `ask-` question (or its `direct-` condition); the supervisor ho
 
 Other tasks in the same environment, which chat can start but is not steered to: `factory.sweep` (every five minutes, dispatches the queue after a
 crash or lost hand-off), `factory.garden_weekly` (queues the weekly gardening project), `factory.plan_pass` (the
-planner-admission pass) and `factory.read_login_meter` (reads an account's usage meter).
+planner-admission pass) and `factory.read_login_meter` (reads an account's usage meter; for a setup-token it answers
+the newest measured reading of that credential, else `unsupported-for-setup-token`, since Anthropic has no usage
+endpoint for one).
 
 ## The roles
 

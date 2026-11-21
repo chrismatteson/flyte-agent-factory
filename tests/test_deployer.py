@@ -2264,7 +2264,9 @@ def test_a_hung_tree_child_is_killed_with_what_it_started(tmp_path, monkeypatch)
         f"open({str(pid_file)!r}, 'w').write(str(subprocess.Popen(['sleep', '60']).pid))\n"
         "time.sleep(60)\n",
     )
-    monkeypatch.setattr(_deploy, "CHECK_TIMEOUT", 2)
+    # Long enough for the child interpreter to start and write the pid file on a loaded CI shard: a timeout
+    # that fires first leaves no grandchild to check, and the test fails without testing the kill.
+    monkeypatch.setattr(_deploy, "CHECK_TIMEOUT", 10)
     with pytest.raises(DeployError, match="check in the engine tree did not finish in"):
         check(src)
     pid = int(pid_file.read_text())

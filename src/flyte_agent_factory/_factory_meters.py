@@ -7,11 +7,12 @@ import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from flyte import remote
 
-from flyte_agent_factory import _factory_base, _limit_share, _meter, _profile, _queue, _router
+from flyte_agent_factory import _dashboard, _factory_base, _limit_share, _meter, _profile, _queue, _router
 from flyte_agent_factory._errors import REMOTE_ERRORS
 
 if TYPE_CHECKING:
@@ -318,3 +319,58 @@ def _loop_slot_budget(slot: str, *, demand: bool) -> _loop.Budget:
         weekly_usd=limits.weekly_usd,
         owner_floor_pct=limits.owner_floor_pct,
     )
+
+
+def list_recent_runs(since: datetime, bench_label: str, limit: int, errors: list[str]) -> list[remote.Run]:
+    """Return the slot and benchmark-case (`bench_label`) runs updated since `since`, once each.
+
+    Failures go to `errors`, by class only. A listing that fills `limit` may be cut short: it is named in
+    `errors` like a failed one.
+    """
+    runs: dict[str, remote.Run] = {}
+    updated = remote.TimeFilter(after=since)
+    for slot in _factory_base.SLOTS:
+        try:
+            found = list(remote.Run.listall(task_name=slot, updated_at=updated, limit=limit))
+            if len(found) >= limit:
+                errors.append(f"listing {slot}: truncated at {limit}")
+            for run in found:
+                runs.setdefault(run.name, run)
+        except REMOTE_ERRORS as exc:  # class only: a remote error's text may hold a signed URL
+            errors.append(f"listing {slot}: {type(exc).__name__}")
+    try:
+        found = list(_factory_base.list_runs({}, keys=[bench_label], updated_at=updated, limit=limit))
+        if len(found) >= limit:
+            errors.append(f"listing benchmark runs: truncated at {limit}")
+        for run in found:
+            runs.setdefault(run.name, run)
+    except REMOTE_ERRORS as exc:
+        errors.append(f"listing benchmark runs: {type(exc).__name__}")
+    return list(runs.values())
+
+
+def read_run_reports(
+    runs: Iterable[remote.Run], errors: list[str]
+) -> tuple[list[_meter.Meter], list[tuple[str, dict[str, Any] | None]]]:
+    """Return every meter the runs' reports carry, and each run's project and `cost.claude_usage`.
+
+    A run whose report has a snapshot but no `claude_usage` predates the hourly records: its usage is None.
+    A run with no snapshot at all (the benchmark's own workflow run) is no project and is left out.
+    """
+    meters: list[_meter.Meter] = []
+    usage: list[tuple[str, dict[str, Any] | None]] = []
+    for run in runs:
+        try:
+            page = _factory_base.report_html(run)
+        except REMOTE_ERRORS as exc:
+            errors.append(f"report of {run.name}: {type(exc).__name__}")
+            continue
+        meters += _meter.from_report(page)
+        snapshot = _dashboard.from_report(page)
+        if snapshot is None:
+            continue
+        cost = snapshot.get("cost")
+        record = cost.get("claude_usage") if isinstance(cost, Mapping) else None
+        project = _factory_base.run_labels(run).get(_factory_base.LABEL_PROJECT) or run.name
+        usage.append((project, record if isinstance(record, dict) else None))
+    return meters, usage

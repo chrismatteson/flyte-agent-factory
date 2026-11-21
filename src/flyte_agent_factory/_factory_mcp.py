@@ -116,6 +116,7 @@ CHAT_TASKS = (
     "browser_link",
     "credential_link",
     "credentials",
+    "usage",
 )
 
 
@@ -179,6 +180,13 @@ Each account (claude, codex) can hold back k percent of every usage window per h
 window resets, so a launch waits when its account has less than k x hours-to-reset left and reopens by
 itself as the reset nears. run_task(name="factory.set_reserve", inputs={{"account": "claude", "k": 0.5}})
 sets it (0 removes it) and the next admission uses it; run_task(name="factory.get_reserve") reads every k.
+For "how much of the week is left", run_task(name="factory.usage") (no inputs), then get_run_io. It returns
+JSON per Claude credential: observed (the newest five-hour and weekly percentages USED a session saw, with
+*_left_pct for what remains, reset times, source and age_s; a window whose reset passed is expired, with no
+percentage; limited_until when the credential is refused until then; login_rejected for a token to replace;
+null when nothing was observed), provider_usage (Anthropic has no usage endpoint for setup-tokens: say so
+plainly) and estimate (tokens and USD the factory itself spent on that credential this week). Always call the
+estimate an estimate and give its basis; it misses use outside the factory.
 A usage limit the owner has reset by hand (a weekly reset, say) is forgotten by every project's pod with
 run_task(name="factory.clear_limit", inputs={{"engine": "claude"}}) (claude is the default); each pod
 drops what it remembered within a minute (it says "not cleared" when the state branch cannot be written).

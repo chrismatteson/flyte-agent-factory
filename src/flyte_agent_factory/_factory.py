@@ -35,12 +35,12 @@ from flyte_agent_factory import (
     _factory_policy,
     _factory_recreate,
     _factory_status,
+    _factory_usage,
     _gardening,
     _gates,
     _git,
     _github,
     _issues,
-    _meter,
     _names,
     _profile,
     _queue,
@@ -1003,7 +1003,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
         decisions=_factory_status.decisions(data),
         review=review,
         pr_url=(data.get("deliverables") or {}).get("pr", ""),
-        meters=(data.get("cost") or {}).get("meters", []),
+        meters=_factory_usage.expire_windows((data.get("cost") or {}).get("meters", []), time.time()),
         credentials=_factory_grants.reduce_to_public(data.get("credentials") or {}),
         snapshot_age_s=max(0, time.time() - generated) if generated is not None else None,
         standards=_factory_status._standards(data),
@@ -1146,14 +1146,15 @@ async def read_login_meter(account: str, engine: str = "claude") -> str:
     _union_identity.establish()
     if engine != "claude" or account.partition(" ")[0] != engine:
         raise ValueError("meter account must name the Claude setup-token")
-    try:
-        meter = await _meter.read_claude(
-            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip(), account, setup_token=True
-        )
-    except _meter.MeterError:
-        # Raw exceptions may carry credentials; persist only a fixed category in run outputs.
-        meter = _meter.Meter(account, "refresh-failed", time.time(), error="auth-or-meter-unavailable")
-    return json.dumps(meter.to_dict())
+    return json.dumps((await _factory_usage.probe_meter(account)).to_dict())
+
+
+# flyte ships py.typed; the decorator is untyped only where flyte is absent (the standards mypy gate).
+@env.task  # type: ignore[untyped-decorator, unused-ignore]
+async def usage() -> str:
+    """JSON of every Claude credential's observed usage windows and a labelled estimate (`_factory_usage`)."""
+    _union_identity.establish()
+    return json.dumps(await asyncio.to_thread(_factory_usage.build_usage_report))
 
 
 @env.task

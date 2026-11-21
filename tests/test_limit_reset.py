@@ -320,3 +320,148 @@ def test_a_bare_clock_time_an_hour_past_stays_stale_not_tomorrow():
     """
     at, stale = _at("resets 3pm (UTC)", _utc(2026, 11, 11, 16))
     assert at.timestamp() == _utc(2026, 11, 11, 15) and stale
+
+
+@pytest.mark.parametrize(
+    ("text", "seen", "expected"),
+    [
+        # #59: the TUI positions words with cursor moves, so the reset clause can arrive with no spaces.
+        ("resets12:40am(UTC)", _utc(2026, 11, 19, 0, 10), _utc(2026, 11, 19, 0, 40)),
+        ("resets Nov 20, 3am (UTC)", _utc(2026, 11, 19, 11), _utc(2026, 11, 20, 3)),
+        # Read as 03:00 today and stale until the month and day could touch.
+        ("resets Nov20,3am(UTC)", _utc(2026, 11, 19, 11), _utc(2026, 11, 20, 3)),
+        # 2026-11-19 is a Thursday. Read as no weekday (03:00 today, stale) until the day could touch.
+        ("resets Sat3am(UTC)", _utc(2026, 11, 19, 11), _utc(2026, 11, 21, 3)),
+        ("try again in 2h 30m", _utc(2026, 11, 19, 11), _utc(2026, 11, 19, 13, 30)),
+        # The same drawing of the other wordings: "will" runs into "reset", "at" and "in" into the time.
+        ("Yourlimitwillresetat12:40pm(UTC).", _utc(2026, 11, 19, 11), _utc(2026, 11, 19, 12, 40)),
+        ("resetsin2h30m", _utc(2026, 11, 19, 11), _utc(2026, 11, 19, 13, 30)),
+        ("resetsat2026-11-20T00:40:00Z", _utc(2026, 11, 19, 11), _utc(2026, 11, 20, 0, 40)),
+        ("tryagainat12:40PM", _utc(2026, 11, 19, 11), _utc(2026, 11, 19, 12, 40)),
+    ],
+)
+def test_a_reset_written_without_spaces_or_in_other_seen_forms(text, seen, expected):
+    at, stale = _at(text, seen)
+    assert at.timestamp() == expected and stale is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your weekly limit · resets12:40am(UTC)",
+        "You've hit your weekly limit · resets 12:40am (UTC)",
+        "You'vehityourweeklylimit·resets12:40am(UTC)",  # the stripped TUI scan
+        "weekly limit · resets12:40am(UTC)",  # `_usage.compose_limit_notice` of a TUI session
+        "You've hit your Opus limit · resets 12:40am (UTC)",
+        "You've hit your daily limit · resets 12:40am (UTC)",
+    ],
+)
+def test_a_weekly_notice_bare_time_is_the_next_one_up_to_a_day_ahead(text):
+    """#59: seen at 11:00Z on 2026-11-19 it is 00:40 tomorrow, 13 h 40 m ahead, not stale."""
+    at, stale = _at(text, _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 20, 0, 40) and stale is False
+
+
+def test_a_weekly_notice_bare_time_just_past_is_still_stale():
+    """The grace holds for a weekly notice too: a time just behind is the reset just gone, not tomorrow."""
+    at, stale = _at("You've hit your weekly limit · resets 10:40am (UTC)", _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 19, 10, 40) and stale
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your session limit · resets12:40am(UTC)",
+        "5-hour limit reached ∙ resets 12:40am (UTC)",
+        "session limit · resets12:40am(UTC)",
+    ],
+)
+def test_a_session_notice_bare_time_beyond_five_hours_is_stale(text):
+    """A session window is five hours long, so 13 h 40 m ahead is a notice from before midnight, reset."""
+    at, stale = _at(text, _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 19, 0, 40) and stale
+
+
+def test_a_session_notice_bare_time_within_five_hours_is_ahead():
+    at, stale = _at("You've hit your session limit · resets 3:30pm (UTC)", _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 19, 15, 30) and stale is False
+    # Six hours ahead is beyond the window: the half-day horizon of an unnamed limit would take it.
+    assert _at("You've hit your session limit · resets 5pm (UTC)", _utc(2026, 11, 19, 11))[1]
+    assert not _at("resets 5pm (UTC)", _utc(2026, 11, 19, 11))[1]
+
+
+def test_an_unnamed_notice_keeps_the_half_day_horizon():
+    """#194 still holds when the notice does not say which limit: 13 h 40 m ahead is stale."""
+    for text in ("resets12:40am(UTC)", "You've hit your usage limit · resets12:40am(UTC)"):
+        at, stale = _at(text, _utc(2026, 11, 19, 11))
+        assert at.timestamp() == _utc(2026, 11, 19, 0, 40) and stale, text
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("You've hit your weekly limit · resets 12:40am (UTC)", _limit_reset.WEEKLY),
+        ("Weekly limit reached ∙ resets Mon 9am", _limit_reset.WEEKLY),
+        ("You'vehityourOpuslimit", _limit_reset.WEEKLY),
+        ("You've hit your Sonnet limit", _limit_reset.WEEKLY),
+        ("You've hit your session limit · resets 7pm (UTC)", _limit_reset.SESSION),
+        ("5-hourlimitreached", _limit_reset.SESSION),
+        ("You've hit your usage limit. Try again at 11:40 PM.", ""),
+        ("resets 7pm (UTC)", ""),
+        ("", ""),
+    ],
+)
+def test_limit_kind_reads_the_word_before_limit(text, kind):
+    assert _limit_reset.classify_limit(text) == kind
+
+
+def test_a_lead_word_inside_another_word_is_not_the_lead():
+    """`available` matched inside "unavailable", so a clock time before the real reset was read instead."""
+    text = "The API was unavailable at 10:05 (UTC). You've hit your usage limit · resets 2:50pm (UTC)"
+    at, stale = _at(text, _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 19, 14, 50) and stale is False
+
+
+@pytest.mark.real_reset
+def test_a_headless_weekly_refusal_is_recorded_13_hours_ahead(monkeypatch):
+    """#59: a child's stream-json refusal carries the whole sentence, so its kind is read from the text."""
+    seen = _utc(2026, 11, 19, 11)
+    monkeypatch.setattr(vars(_usage)["time"], "time", lambda: seen)
+    text = "You've hit your weekly limit · resets 12:40am (UTC)"
+    assert _usage._refusal_until(text, seen) == _utc(2026, 11, 20, 0, 40)
+
+
+@pytest.mark.parametrize("text", ["Usage unavailable until 3pm", "presets 3pm"])
+def test_words_that_only_contain_the_lead_are_not_a_reset(text):
+    assert _limit_reset.parse_reset(text, _utc(2026, 11, 19, 11)) is None
+
+
+def test_a_word_that_begins_with_at_is_not_at():
+    at, stale = _at("resets atom 3pm", _utc(2026, 11, 19, 11))
+    assert at.timestamp() == _utc(2026, 11, 19, 15) and stale is False
+
+
+_THURSDAY = _utc(2026, 11, 19, 11)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "stale"),
+    [
+        ("resets12:40am(UTC)", _utc(2026, 11, 19, 0, 40), True),
+        ("resets 12:40am (UTC)", _utc(2026, 11, 19, 0, 40), True),
+        ("resets 2:50am (UTC)", _utc(2026, 11, 19, 2, 50), True),
+        ("resets 3pm", _utc(2026, 11, 19, 15), False),
+        ("resets Nov 21, 5am (UTC)", _utc(2026, 11, 21, 5), False),
+        ("resets Fri 9am (UTC)", _utc(2026, 11, 20, 9), False),
+        ("resets in 2h 15m", _utc(2026, 11, 19, 13, 15), False),
+        ("try again at Nov 16th, 2026 12:40 AM", _utc(2026, 11, 16, 0, 40), True),
+        ("resets 2026-11-20T12:40:00Z", _utc(2026, 11, 20, 12, 40), False),
+        ("resetsNov21,5am(UTC)", _utc(2026, 11, 21, 5), False),
+        ("resetsFri9am(UTC)", _utc(2026, 11, 20, 9), False),
+        ("You'vehityourlimit·resets12:40am(UTC)", _utc(2026, 11, 19, 0, 40), True),
+    ],
+)
+def test_every_observed_limit_text_format_gives_its_instant(text, expected, stale):
+    at, was_stale = _at(text, _THURSDAY)
+    assert at.timestamp() == expected
+    assert was_stale is stale

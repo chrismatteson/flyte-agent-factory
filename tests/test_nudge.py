@@ -2224,6 +2224,85 @@ def test_other_limit_wordings_are_caught(text):
 
 
 @pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("  ⎿  You've hit your weekly limit · resets 12:40am (UTC)\n", "weekly"),
+        ("  ⎿  You've hit your Opus limit · resets 3am (UTC)\n", "weekly"),
+        ("  ⎿  You've hit your session limit · resets 7pm (UTC)\n", "session"),
+        ("5-hour limit reached ∙ resets 7pm\n", "session"),
+        ("Weekly limit reached ∙ resets Mon 9am\n", "weekly"),
+        ("  ⎿  You've hit your usage limit · resets 7pm (UTC)\n", ""),
+        ("Claude usage limit reached. Your limit will reset at 7pm (UTC).\n", ""),
+    ],
+)
+def test_the_notice_records_which_limit_it_names(text, kind):
+    """#59: `limit_text` keeps only the reset clause, so the kind that sets its horizon is kept beside it."""
+    proc = _fresh_process()
+    proc._consume(text)
+    assert proc.limit_hit_at is not None and proc.limit_kind == kind, text
+
+
+def test_the_will_reset_wording_drawn_with_cursor_moves_keeps_a_reset_the_parser_reads():
+    """#59: "Claude usage limit reached. Your limit will reset at 7pm" with every space a cursor move."""
+    import datetime as dt
+
+    from flyte_agent_factory import _limit_reset
+
+    proc = _fresh_process()
+    words = ["Claude", "usage", "limit", "reached.", "Your", "limit", "will", "reset", "at", "7pm", "(UTC)."]
+    proc._consume("\x1b[1C".join(words) + "\r\n")
+    assert proc.limit_hit_at is not None
+    seen = dt.datetime(2026, 11, 19, 11, 0, tzinfo=dt.timezone.utc).timestamp()
+    reset = _limit_reset.parse_reset(_usage.compose_limit_notice(proc), seen)
+    assert reset is not None and reset.at == seen + 8 * 3600, proc.limit_text
+
+
+def test_a_notice_naming_another_limit_with_the_same_reset_is_a_new_one():
+    """#59: a session notice, then a weekly one with the same clock time and no submit between."""
+    proc = _fresh_process()
+    proc._consume("  ⎿  You've hit your session limit · resets 12:40am (UTC)\n")
+    first = proc.limit_hit_at
+    proc._consume("  ⎿  You've hit your weekly limit · resets 12:40am (UTC)\n")
+    assert proc.limit_kind == "weekly" and proc.limit_hit_at != first
+    # A redraw of the same notice is still the same one.
+    again = proc.limit_hit_at
+    proc._consume("  ⎿  You've hit your weekly limit · resets 12:40am (UTC)\n")
+    assert proc.limit_hit_at == again
+
+
+@pytest.mark.real_reset
+def test_a_weekly_notice_drawn_with_cursor_moves_records_a_reset_13_hours_ahead(tmp_path, monkeypatch):
+    """#59: "resets12:40am(UTC)" seen at 11:00Z on a weekly limit is 00:40 tomorrow, not "reset time unknown".
+
+    The TUI positions the words with cursor-forward escapes, so the stripped notice has no spaces at all.
+    """
+    import datetime as dt
+
+    from flyte_agent_factory import _meter
+
+    seen = dt.datetime(2026, 11, 19, 11, 0, tzinfo=dt.timezone.utc).timestamp()
+    monkeypatch.setattr(time, "time", lambda: seen)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test")
+    monkeypatch.setattr(_usage, "_author_engine", "claude")
+    store = _meter.MeterStore(tmp_path / "meters", clock=lambda: seen)
+    monkeypatch.setattr(_usage, "_meters", store)
+    proc = _fresh_process()
+    move = "\x1b[1C"
+    proc._consume(
+        move.join(["  ⎿", "You've", "hit", "your", "weekly", "limit", "·", "resets12:40am(UTC)"]) + "\r\n"
+    )
+    assert proc.limit_text == "resets12:40am(UTC)" and proc.limit_kind == "weekly"
+    assert proc.limit_seen_wall == seen
+    timeline = _timeline._Timeline()
+    reset, _ = _usage.note_session_refusal(proc, timeline)
+    tomorrow = dt.datetime(2026, 11, 20, 0, 40, tzinfo=dt.timezone.utc).timestamp()
+    assert reset == tomorrow
+    assert store.readings[_session_config._claude_account()].limited_until == tomorrow
+    # The same clock time with no kind keeps the half-day horizon (#194): stale, so nothing is recorded.
+    assert _usage._refusal_until(proc.limit_text, seen) is None
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "If a user has hit your usage limit, the API returns 429\n",

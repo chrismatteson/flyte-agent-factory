@@ -20,7 +20,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,15 +30,20 @@ import httpx
 from typing_extensions import Required
 
 if TYPE_CHECKING:
-    from . import _codex_auth, _limit_share, _secret_env
+    from . import _codex_auth, _limit_share, _secret_env, _statusline
     from ._bridge import _write_atomic
 else:
-    from flyte_agent_factory import _codex_auth, _secret_env
+    from flyte_agent_factory import _codex_auth, _secret_env, _statusline
     from flyte_agent_factory._bridge import _write_atomic
 
 # Pending the coordinator's token_meter probe. Enable only when both usage windows are returned.
 SETUP_TOKEN_USAGE_SUPPORTED = False
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+#: Readings that measured a window's utilisation, as against `limit-text` (a refusal's words) and
+#: `refresh-failed`. A reading of one of these with a percentage is a measurement.
+MEASURED_SOURCES = frozenset(
+    {"oauth-usage", "app-server", "exec-event", "cli-event", "cli-headers", "statusline"}
+)
 #: Separates a setup-token's secret name from its fingerprint in the account key.
 FINGERPRINT_SEP = "#"
 #: Never read an account more often than this, however many callers ask.
@@ -58,10 +63,15 @@ HISTORY_KEEP = 4000
 #: Claude's own refusal wording, current ("You've hit your limit") and older CLIs' ("Claude AI usage
 #: limit reached"). Nothing broader: a result's free text is often the model's summary of a failure,
 #: and "GitHub API rate limit exceeded" there is not a Claude usage limit.
-_CLAUDE_LIMIT = re.compile(r"hit your.*limit|claude ai usage limit reached", re.I)
+#: `\s*`: a terminal capture can squash the spaces out (`You'vehityourlimit·resets12:40am(UTC)`).
+_CLAUDE_LIMIT = re.compile(r"hit\s*your.*limit|claude\s*ai\s*usage\s*limit\s*reached", re.I)
 #: A Codex refusal, as Codex words it in its `error` / `turn.failed` events (not in free text).
 _CODEX_LIMIT = re.compile(r"usage limit|rate limit|quota|too many requests|429", re.IGNORECASE)
 _FIVE_HOURS_MIN = 360  # a Codex window up to this long is the "5-hour" one, a longer one the weekly
+
+
+WINDOW_PREFIXES = ("five_hour", "weekly")
+_WINDOW_ORIGIN_FIELDS = frozenset(f"{p}_{f}" for p in WINDOW_PREFIXES for f in ("observed_at", "source"))
 
 
 class MeterError(Exception):
@@ -85,6 +95,10 @@ class _MeterFields(TypedDict, total=False):
     limited_until: float | None
     limit_noted_at: float | None
     error: str
+    five_hour_observed_at: float
+    five_hour_source: str
+    weekly_observed_at: float
+    weekly_source: str
 
 
 class MeterData(_MeterFields, total=False):
@@ -133,7 +147,7 @@ def token_account_secret(account: str) -> str:
 @dataclass
 class Meter:
     account: str  # "claude <login>" or "codex"
-    source: str  # where the reading came from: oauth-usage, app-server, exec-event, limit-text
+    source: str  # where it came from: oauth-usage, app-server, exec-event, cli-event, statusline, limit-text
     observed_at: float
     five_hour_pct: float | None = None
     five_hour_resets_at: float | None = None
@@ -145,6 +159,12 @@ class Meter:
     #: When `limited_until` was last noted or probed (the router's probe clock). None: never probed.
     limit_noted_at: float | None = None
     error: str = ""
+    #: When and by what a window was measured, set only when it was carried from an earlier reading
+    #: (`MeterStore.update`); None: by this reading. See `find_window_origin`.
+    five_hour_observed_at: float | None = None
+    five_hour_source: str | None = None
+    weekly_observed_at: float | None = None
+    weekly_source: str | None = None
 
     @property
     def engine(self) -> str:
@@ -158,9 +178,30 @@ class Meter:
         """
         return bool(self.error) and self.source != "refresh-failed"
 
+    @property
+    def measured(self) -> bool:
+        """Whether a source in `MEASURED_SOURCES` measured the percent of at least one window."""
+        return any(self.find_measured_pct(prefix) is not None for prefix in WINDOW_PREFIXES)
+
+    def find_window_origin(self, prefix: str) -> tuple[float, str]:
+        """Return when and by what source window `prefix` ("five_hour", "weekly") was measured.
+
+        A window carried from an earlier reading keeps that reading's time and source; it is not as fresh as
+        the refusal or five-hour-only event it was carried into.
+        """
+        at, source = getattr(self, f"{prefix}_observed_at"), getattr(self, f"{prefix}_source")
+        return (self.observed_at if at is None else at, self.source if source is None else source)
+
+    def find_measured_pct(self, prefix: str) -> float | None:
+        """Return window `prefix`'s percent when a source in `MEASURED_SOURCES` measured it, else None."""
+        pct: float | None = getattr(self, f"{prefix}_pct")
+        return pct if self.find_window_origin(prefix)[1] in MEASURED_SOURCES else None
+
     def to_dict(self) -> MeterData:
-        # asdict recursively serializes Scoped using the same fields as _ScopedData.
-        return cast(MeterData, asdict(self))
+        # asdict recursively serializes Scoped using the same fields as _ScopedData. A window's origin is
+        # written only when it was carried, so every other reading keeps the shape it always had.
+        data = {k: v for k, v in asdict(self).items() if v is not None or k not in _WINDOW_ORIGIN_FIELDS}
+        return cast(MeterData, data)
 
     @classmethod
     def from_dict(cls, data: MeterData) -> Meter:
@@ -178,13 +219,17 @@ def _num(value: object) -> float | None:
     """Return a finite number, else None: `1e400` in a payload is `inf`, which no window can mean."""
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)  # a Python int can exceed the float range
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _time(value: object) -> float | None:
     """Epoch seconds from an ISO-8601 string (any offset) or a number; None if neither."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        return _num(value)
     if not isinstance(value, str):
         return None
     try:
@@ -218,10 +263,114 @@ def parse_claude(payload: object, account: str, now: float) -> Meter:
     return Meter(account, "oauth-usage", now, five_pct, five_at, week_pct, week_at, scoped)
 
 
+def from_statusline(capture: Mapping[str, float], account: str) -> Meter | None:
+    """Return a status-line capture (`_statusline.read_capture`) as a reading of `account`; None if empty.
+
+    The capture holds no account: the supervisor names the credential its session runs on.
+    """
+    if "observed_at" not in capture:
+        return None
+    return Meter(
+        account,
+        "statusline",
+        capture["observed_at"],
+        capture.get("five_hour_pct"),
+        capture.get("five_hour_resets_at"),
+        capture.get("weekly_pct"),
+        capture.get("weekly_resets_at"),
+    )
+
+
+#: A `resetsAt` above this is epoch milliseconds.
+_EPOCH_MS_FLOOR = 1e11
+
+
+def parse_event_reset(value: object) -> float | None:
+    """Return a `rate_limit_event` `resetsAt` as Unix seconds, with the status line's bounds on an epoch.
+
+    Seconds, milliseconds (scaled down) or ISO text; anything else is None. The one reading of the field:
+    the meter's windows and the structured author session's refusal (`_stream_process`) both use it.
+    """
+    at = _header_reset(value)
+    return _statusline.parse_epoch_s(at / 1000 if at is not None and at > _EPOCH_MS_FLOOR else at)
+
+
+def parse_rate_limit_event(event: Mapping[str, object], account: str, now: float) -> tuple[Meter, bool]:
+    """Return the reading a stream-json `rate_limit_event` carries, and whether it says the call was refused.
+
+    `rate_limit_info.unifiedWindows.{five_hour,seven_day}` give each window's `utilization` (a fraction)
+    and `resetsAt`; without them, the top-level `rateLimitType`/`utilization`/`resetsAt` describe one window.
+    A `rejected` status anywhere is a refusal until that window's reset.
+    """
+    info = event.get("rate_limit_info")
+    info = info if isinstance(info, dict) else {}
+    windows = info.get("unifiedWindows")
+    if not isinstance(windows, dict):
+        name = info.get("rateLimitType")
+        windows = {name: info} if isinstance(name, str) else {}
+    reading = Meter(account, "cli-event", now)
+    blocking: list[float] = []
+    for name, prefix in _statusline.WINDOWS.items():
+        window = windows.get(name)
+        if not isinstance(window, dict):
+            continue
+        fraction = _num(window.get("utilization"))
+        if fraction is not None and 0 <= fraction * 100 <= _statusline.MAX_PCT:
+            setattr(reading, f"{prefix}_pct", fraction * 100)
+        reset = parse_event_reset(window.get("resetsAt"))
+        setattr(reading, f"{prefix}_resets_at", reset)
+        if window.get("status") == "rejected" and reset is not None and reset > now:
+            blocking.append(reset)
+    refused = info.get("status") == "rejected" or bool(blocking)
+    if refused:
+        top = parse_event_reset(info.get("resetsAt"))
+        blocking += [top] if top is not None and top > now else []
+        reading.limit_noted_at = now
+        # As for a refusal header without a reset: a bounded backoff, not invented utilization.
+        reading.limited_until = max(blocking, default=now + 300)
+    return reading, refused
+
+
+def _keep_earlier_windows(reading: Meter, earlier: Meter | None) -> None:
+    """Fill what `reading` does not know from the reading before it in the same stream."""
+    if earlier is None:
+        return
+    for field_name in (
+        "five_hour_pct",
+        "five_hour_resets_at",
+        "weekly_pct",
+        "weekly_resets_at",
+        "limited_until",
+    ):
+        if getattr(reading, field_name) is None:
+            setattr(reading, field_name, getattr(earlier, field_name))
+
+
+def _keep_current_windows(reading: Meter, earlier: Meter, now: float) -> None:
+    """Keep `earlier`'s percentage and reset for each window `reading` lacks one for, while it is current.
+
+    A sub-agent's five-hour-only `rate_limit_event` must not hide the week a status line measured a minute
+    before. A window counts as current only while its reset is known and ahead; a newer reading naming a later
+    reset has seen a new window begin, so the old percentage is not carried into it. This is stricter than
+    `_factory_usage.is_window_current`, which also trusts a young reading with no reset. A carried window
+    keeps the time and source it was measured at (`Meter.find_window_origin`), not `reading`'s.
+    """
+    for prefix in WINDOW_PREFIXES:
+        pct, reset = getattr(earlier, f"{prefix}_pct"), getattr(earlier, f"{prefix}_resets_at")
+        if getattr(reading, f"{prefix}_pct") is not None or pct is None or reset is None or reset <= now:
+            continue
+        if (getattr(reading, f"{prefix}_resets_at") or reset) <= reset:
+            setattr(reading, f"{prefix}_pct", pct)
+            setattr(reading, f"{prefix}_resets_at", reset)
+            at, source = earlier.find_window_origin(prefix)
+            setattr(reading, f"{prefix}_observed_at", at)
+            setattr(reading, f"{prefix}_source", source)
+
+
 def from_claude_events(
     events: Sequence[object], account: str = "claude", now: float | None = None
 ) -> Meter | None:
-    """Read quota headers when the CLI exposes them; absent fields stay unknown.
+    """Read quota headers or stream-json `rate_limit_event`s where the CLI gives them; absent ones stay None.
 
     httpx parses HTTP headers, but neither it nor the CLI normalizes subscription
     windows. Keep that provider-specific mapping here beside the usage parser.
@@ -230,6 +379,12 @@ def from_claude_events(
     meter = None
     for event in events:
         if not isinstance(event, dict):
+            continue
+        if event.get("type") == "rate_limit_event":
+            reading, refused = parse_rate_limit_event(event, account, now)
+            if reading.five_hour_pct is not None or reading.weekly_pct is not None or refused:
+                _keep_earlier_windows(reading, meter)
+                meter = reading
             continue
         headers = _find(event, ("response_headers", "headers")) or {}
         headers = {str(k).lower(): v for k, v in headers.items()} if isinstance(headers, dict) else {}
@@ -286,16 +441,7 @@ def from_claude_events(
                 default=now + (retry if math.isfinite(retry) and retry > 0 else 300),
             )
         if reading.five_hour_pct is not None or reading.weekly_pct is not None or limited:
-            if meter is not None:
-                for field_name in (
-                    "five_hour_pct",
-                    "five_hour_resets_at",
-                    "weekly_pct",
-                    "weekly_resets_at",
-                    "limited_until",
-                ):
-                    if getattr(reading, field_name) is None:
-                        setattr(reading, field_name, getattr(meter, field_name))
+            _keep_earlier_windows(reading, meter)
             meter = reading
     return meter
 
@@ -303,7 +449,7 @@ def from_claude_events(
 def _header_reset(value: object) -> float | None:
     try:
         number = float(value)  # type: ignore[arg-type]  # Caught below.
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return _time(value)
     return number if math.isfinite(number) else None
 
@@ -794,6 +940,9 @@ class MeterStore:
                 # Only a replaced token mends a rejected login, so a later reading (a sub-agent's late report)
                 # or a failed read must not make it look probe-able.
                 meter.error, meter.source = previous.error, previous.source
+        if previous and not meter.error:
+            # A failed read records the failure; it is not a reading to fill in.
+            _keep_current_windows(meter, previous, self.clock())
         self.readings[meter.account] = meter
         self.latest[meter.engine] = meter
         self.attempts[meter.account] = max(self.attempts.get(meter.account, 0), meter.observed_at)

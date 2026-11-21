@@ -1163,13 +1163,22 @@ async def _dashboard_loop(timeline: _timeline._Timeline, stop: asyncio.Event, ev
         except (*REMOTE_ERRORS, *_usage._USAGE_READ_ERRORS) as exc:
             _timeline._log_line(f"[usage] child reports: {type(exc).__name__}", err=True)
         with contextlib.suppress(*_usage._USAGE_READ_ERRORS):
+            hours: dict[str, dict[str, float]] = {}
+            ledger = await asyncio.to_thread(
+                _usage.read_author_ledger, _session_config.STATE_ROOT / _usage.AUTHOR_LEDGER_NAME, hours
+            )
             split = await asyncio.to_thread(
-                _usage._author_usage_split, _session_config.CONFIG_DIR, _session_config.WORKSPACE
+                _usage._author_usage_split,
+                _session_config.CONFIG_DIR,
+                _session_config.WORKSPACE,
+                ledger,
+                hours=hours,
             )
             timeline.set_author_usage(
                 split,
                 _usage._sum_usage(split["coordinator"], split["helpers"]),
                 measured=_usage._is_coordinator_measured(split),
+                hours=hours,
             )
             roles = await asyncio.to_thread(
                 _author_subagent_roles, _session_config.CONFIG_DIR, _session_config.WORKSPACE

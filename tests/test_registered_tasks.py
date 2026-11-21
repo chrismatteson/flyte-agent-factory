@@ -31,6 +31,7 @@ EXPECTED = {
         "factory.set_reserve",
         "factory.status",
         "factory.sweep",
+        "factory.usage",
     ],
     "factory-bench": [
         "factory-bench.benchmark",
