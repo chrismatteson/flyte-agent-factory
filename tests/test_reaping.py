@@ -202,7 +202,7 @@ def test_every_image_installs_tini_and_runs_the_task_under_it(image):
     ]
 
     assert "tini" in packages
-    assert wrappers == [_images.INIT_WRAPPER]
+    assert wrappers == [_images.init_wrapper(_images.builds_locally())]
 
 
 def test_the_bench_check_image_runs_under_the_init():
@@ -218,7 +218,7 @@ def test_the_bench_check_image_runs_under_the_init():
         dict(layer.env_vars)["_F_EXEC_WRAPPER"]
         for layer in before_user
         if "_F_EXEC_WRAPPER" in dict(getattr(layer, "env_vars", None) or ())
-    ] == [_images.INIT_WRAPPER]
+    ] == [_images.init_wrapper(_images.builds_locally())]
 
 
 def test_the_init_command_is_the_wrapper_split_into_words():
@@ -246,7 +246,7 @@ def test_the_sdk_re_execs_the_task_under_the_wrapper(monkeypatch):
 
     calls = []
     monkeypatch.setattr(os, "execvp", lambda file, args: calls.append((file, args)))
-    monkeypatch.setenv("_F_EXEC_WRAPPER", _images.INIT_WRAPPER)
+    monkeypatch.setenv("_F_EXEC_WRAPPER", _images.init_wrapper(local=False))
     monkeypatch.delenv("_F_EXEC_WRAPPED", raising=False)
     monkeypatch.delenv("_F_EXEC_WRAPPER_CLUSTERED", raising=False)
     monkeypatch.delenv("FLYTE_CLUSTERED_WORKER", raising=False)
@@ -254,8 +254,8 @@ def test_the_sdk_re_execs_the_task_under_the_wrapper(monkeypatch):
 
     runtime._maybe_reexec_under_wrapper()
 
-    # The SDK execs tini with the same arguments (keeping the PID); TINI_SUBREAPER stands in for `-s`.
-    assert calls == [(_images.INIT_WRAPPER, [_images.INIT_WRAPPER, *sys.argv])]
+    # The SDK execs `tini -s --` before the task's own argv (keeping the PID); `--` keeps tini off its flags.
+    assert calls == [("tini", ["tini", "-s", "--", *sys.argv])]
     assert os.environ["_F_EXEC_WRAPPED"] == "1"
 
 
@@ -285,7 +285,7 @@ def test_every_image_env_value_is_one_word_for_the_local_docker_builder():
     import flyte
     from flyte._image import Env
 
-    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)))
+    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)), local=True)
     env = [layer for layer in image._layers if isinstance(layer, Env)]
     assert env, "with_init sets the exec wrapper"
     for layer in env:
@@ -293,14 +293,27 @@ def test_every_image_env_value_is_one_word_for_the_local_docker_builder():
             assert not any(ch.isspace() for ch in value), (key, value)
 
 
-def test_the_wrapper_is_the_apt_tini_binary_running_as_a_subreaper():
-    """No build command writes the wrapper: it is the apt-installed binary, so every builder has it."""
+def test_a_remote_build_runs_the_init_command_with_no_build_script():
+    """A remote build takes spaces in env values: the wrapper is `tini -s --`, with no build script."""
     import flyte
     from flyte._image import Commands, Env
 
-    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)))
+    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)), local=False)
     env = dict(kv for layer in image._layers if isinstance(layer, Env) for kv in layer.env_vars)
-    assert env["_F_EXEC_WRAPPER"] == "/usr/bin/tini"
-    assert env["TINI_SUBREAPER"]
+    assert env["_F_EXEC_WRAPPER"] == "tini -s --"
     assert not [layer for layer in image._layers if isinstance(layer, Commands)]
-    assert _images.INIT_COMMAND == ["tini", "-s", "--"]
+
+
+def test_a_local_build_runs_a_one_word_script_that_execs_tini_as_a_subreaper(tmp_path):
+    """The local builder writes `ENV key=value` unquoted, so its wrapper is a one-word script."""
+    import subprocess
+
+    import flyte
+    from flyte._image import Env
+
+    image = _images.with_init(flyte.Image.from_debian_base(name="x", python_version=(3, 12)), local=True)
+    env = dict(kv for layer in image._layers if isinstance(layer, Env) for kv in layer.env_vars)
+    assert env["_F_EXEC_WRAPPER"] == _images.INIT_WRAPPER_SCRIPT
+    script = tmp_path / "factory-init"
+    subprocess.run(["sh", "-c", f"printf '{_images._INIT_SCRIPT}' > {script}"], check=True)
+    assert script.read_text() == '#!/bin/sh\nexec tini -s -- "$@"\n'
