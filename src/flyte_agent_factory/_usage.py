@@ -24,7 +24,9 @@ from flyte_agent_factory import (
     _profile,
     _router,
     _session_config,
+    _statusline,
     _timeline,
+    _usage_hours,
 )
 
 #: The supervisor's meter record (None outside `project`), and the guard that keeps two
@@ -86,6 +88,19 @@ def note_session_refusal(proc: Any, timeline: _timeline._Timeline) -> tuple[floa
     fresh = session_refusal_until(proc)
     _note_session_limit(fresh, timeline, getattr(proc, "meter", None), text)
     return read_limit_times(_author_engine)
+
+
+def compose_limit_notice(proc: Any) -> str:
+    """Return the notice `proc` shows as `_limit_reset.parse_reset` should read it: its kind, then its reset.
+
+    A TUI session keeps the kind apart from the reset clause (`limit_kind`, `limit_text`); a weekly
+    notice's bare clock time is read up to a day ahead only when the text says it is weekly (#59). The
+    kind goes back in as text, not as an argument, so every `_reset_at` caller (and its test stubs) reads
+    it the same way as a headless refusal that carries the whole sentence.
+    """
+    text = getattr(proc, "limit_text", "")
+    kind = getattr(proc, "limit_kind", "")
+    return f"{kind} limit · {text}" if text and kind else text
 
 
 #: engine -> the `limit_noted_at` its probe claim wrote: the call that was routed as that probe.
@@ -159,6 +174,7 @@ async def _read_meters(timeline: _timeline._Timeline) -> None:
         store = _meters
         if store is None:
             return
+        _ingest_statusline(store, timeline)
         async with _meter_lock:
             if not store.due():
                 return
@@ -191,6 +207,52 @@ async def _read_meters(timeline: _timeline._Timeline) -> None:
         _timeline._log_line(f"[meter] {type(exc).__name__}", err=True)
 
 
+#: `observed_at` of the last status-line capture ingested, so an unchanged capture is not recorded again.
+_statusline_seen = 0.0
+
+
+def _ingest_statusline(store: _meter.MeterStore, timeline: _timeline._Timeline | None) -> None:
+    """Record the coordinator's status-line capture (`_statusline`) as a reading of its Claude credential.
+
+    One of a setup-token's two sources of windows: the TUI fallback's; the structured session's are its
+    `rate_limit_event`s (`ingest_author_rate_limit`), since a `-p` session runs no status line. Read on every
+    `_read_meters` call, outside the `MIN_INTERVAL_S` floor: it is a local file, not a request. Only a Claude
+    author's session writes one and clears it at start (`_session_setup.write_author_settings`); under a
+    Codex author a capture is a checkpoint's leftover, perhaps from a token since replaced, so it is not
+    credited to it.
+    """
+    global _statusline_seen
+    if _author_engine != "claude":
+        return
+    capture = _statusline.read_capture(_statusline.locate_capture(_session_config.CONFIG_DIR))
+    meter = _meter.from_statusline(capture, _session_config._claude_account())
+    if meter is None or meter.observed_at <= _statusline_seen:
+        return
+    _statusline_seen = meter.observed_at
+    # The log is the history's other copy, as for every other reading.
+    _timeline._log_line(f"[meter] {store.update(meter)}")
+    _show_meter(store, meter, timeline)
+
+
+def ingest_author_rate_limit(event: dict[str, Any], timeline: _timeline._Timeline | None) -> None:
+    """Record a `rate_limit_event` of the structured author session as a reading of its Claude credential.
+
+    Parsed as a sub-agent's are (`_meter.from_claude_events`, source `cli-event`): the session's own refusal
+    state is `StreamClaudeProcess`'s, read through `session_reset_at`. An event with no window and no
+    refusal records nothing. Never raises: it runs in the session's event reader.
+    """
+    if not _meters:
+        return
+    try:
+        meter = _meter.from_claude_events([event], _session_config._claude_account())
+        if meter is None:
+            return
+        _timeline._log_line(f"[meter] {_meters.update(meter)}")
+        _show_meter(_meters, meter, timeline)
+    except _METER_ERRORS as exc:  # meters must not fail the work
+        _timeline._log_line(f"[meter] {type(exc).__name__}", err=True)
+
+
 async def _meter_loop(timeline: _timeline._Timeline, stop: asyncio.Event) -> None:
     while not stop.is_set():
         await _read_meters(timeline)
@@ -209,20 +271,47 @@ _USAGE_TRAILER = re.compile(r"\n<!--factory-usage (\{.*?\})-->\s*$", re.DOTALL)
 _metering_round = 0
 
 
+def parse_cli_output(stdout: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return (events, result) from `claude -p` stdout.
+
+    Accepts one `--output-format json` object, a `--verbose` JSON array, or `stream-json` lines.
+    `result` is the last `type == "result"` object, else the lone object, else `{}`; whatever does not
+    parse contributes nothing. Never raises.
+    """
+    text = stdout.strip()
+    try:
+        parsed: Any = json.loads(text)
+    except ValueError:
+        parsed = []
+        for line in text.splitlines():
+            try:
+                parsed.append(json.loads(line))
+            except ValueError:  # a stray non-JSON line must not hide the events around it
+                continue
+    items = parsed if isinstance(parsed, list) else [parsed]
+    events = [e for e in items if isinstance(e, dict)]
+    results = [e for e in events if e.get("type") == "result"]
+    if results:
+        return events, results[-1]
+    return events, events[0] if len(events) == 1 else {}
+
+
 def _usage_trailer(stdout: str) -> str:
-    """Return the CLI's own usage and notional cost from `claude -p --output-format json`, as a trailer.
+    """Return the CLI's own usage and notional cost from `claude -p` output, as a trailer.
 
     Never raises: it runs inside the sub-agent task after the work is done (qa).
     """
     try:
-        payload = json.loads(stdout)
+        events, payload = parse_cli_output(stdout)
+        if not events:
+            return ""
         usage = payload.get("usage") or {}
         rec: dict[str, Any] = {k: int(usage.get(k) or 0) for k in _session_config._USAGE_FIELDS}
         rec["cost_usd"] = float(payload.get("total_cost_usd") or 0.0)
         rec["models"] = sorted((payload.get("modelUsage") or {}).keys())
         rec["modelUsage"] = payload.get("modelUsage") or {}
         rec["turns"] = int(payload.get("num_turns") or 0)
-        observed = _meter.from_claude_events([payload], _session_config._claude_account())
+        observed = _meter.from_claude_events(events, _session_config._claude_account())
         if observed:
             rec["rate_limits"] = observed.to_dict()
         return f"{_USAGE_MARK}{json.dumps(rec)}-->"
@@ -282,6 +371,7 @@ def _record_usage(role: str, round_: int, rec: dict[str, Any]) -> None:
         if call_id in calls:
             return
         calls.append(call_id)
+    _usage_hours.record_subagent(rec, _session_config._claude_account(), read_wall_clock())
     for f in (*_session_config._USAGE_FIELDS, "cost_usd"):
         row[f] += float(rec.get(f) or 0)
     for model, counts in rec.get("modelUsage", {}).items():
@@ -357,7 +447,7 @@ AUTHOR_LEDGER_NAME = "author-turns.jsonl"
 _USAGE_READ_ERRORS = (OSError, ValueError, TypeError, AttributeError)
 
 
-def read_author_ledger(path: Path) -> dict[str, Any]:
+def read_author_ledger(path: Path, hours: _usage_hours.Hours | None = None) -> dict[str, Any]:
     """Return what the structured author session reported about its turns (`StreamClaudeProcess._record`).
 
     Tokens and turns are summed over the `result` events; `total_cost_usd` is the conversation's running
@@ -366,7 +456,9 @@ def read_author_ledger(path: Path) -> dict[str, Any]:
     ledger is empty: the transcripts are read instead.
 
     Each row's `at` is Unix seconds (UTC); `total_cost_usd` is Claude Code's USD list-price estimate and
-    the token fields are counts.
+    the token fields are counts. With `hours`, each row's tokens are also added there by its `at`, priced
+    at list price as the transcripts' replies are (`_usage_hours.add_author_entry`): the conversations the
+    ledger covers are the ones `_author_usage_split` then does not read.
     """
     usage = {f: 0.0 for f in _session_config._USAGE_FIELDS}
     models: dict[str, dict[str, Any]] = {}
@@ -387,6 +479,8 @@ def read_author_ledger(path: Path) -> dict[str, Any]:
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
         results += 1
+        if hours is not None and isinstance(row.get("at"), int | float):
+            _usage_hours.add_author_turn(hours, float(row["at"]), counts, str(row.get("model") or ""))
         turns += row_turns
         errors += bool(row.get("is_error"))
         cost[session] = max(cost.get(session, 0.0), spent)
@@ -409,7 +503,11 @@ def read_author_ledger(path: Path) -> dict[str, Any]:
 
 
 def _author_usage_split(
-    config_dir: Path, workspace: Path, ledger: dict[str, Any] | None = None
+    config_dir: Path,
+    workspace: Path,
+    ledger: dict[str, Any] | None = None,
+    *,
+    hours: _usage_hours.Hours | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Tokens the author session has used so far, split into `coordinator` and `helpers`.
 
@@ -417,6 +515,9 @@ def _author_usage_split(
     `ledger` (`read_author_ledger`); a conversation the ledger does not cover (one the TUI ran, or one from
     before this ledger) is read from its top-level `<session>.jsonl` transcript. `helpers` are the in-pod
     Agent-tool helpers, whose transcripts sit under `<session>/subagents/`.
+
+    With `hours`, each transcript reply read is also added there by its timestamp
+    (`_usage_hours.add_author_entry`); the ledger's own turns are added by `read_author_ledger`.
 
     Claude Code writes one entry per content block of a reply, each carrying the reply's
     usage, so entries are deduplicated by message id.
@@ -459,6 +560,8 @@ def _author_usage_split(
                 continue
             seen.add(mid)
             usage = msg.get("usage") or {}
+            if hours is not None:
+                _usage_hours.add_author_entry(hours, d, usage, str(msg.get("model") or ""))
             model = part["modelUsage"].setdefault(msg.get("model") or "unknown", {})
             for field, target in zip(
                 _session_config._USAGE_FIELDS,
@@ -855,16 +958,29 @@ def _reset_at(text: str, now: float | None = None) -> float | None:
     return reset.at if reset else None
 
 
+def _redraw_passed(proc: Any) -> bool:
+    """Whether a redraw of a notice already handled names a reset that has passed.
+
+    The structured session's reset is a number (`limit_reset_at`). A TUI notice is judged on the bare reset
+    text, with no limit kind: a weekly notice's 24-hour reading of a bare clock time (`_limit_reset`) would
+    turn the reset that already came into the same time tomorrow, and the supervisor would start a false
+    day-long episode on a redraw of a notice it has just resumed from.
+    """
+    structured = getattr(proc, "limit_reset_at", None)
+    reset = float(structured) if structured is not None else _reset_at(getattr(proc, "limit_text", ""))
+    return reset is not None and reset <= time.time()
+
+
 def session_reset_at(proc: Any) -> float | None:
     """Unix time the refusal `proc` last hit reopens; None if it does not say.
 
     The structured session reports it (`limit_reset_at`, from the `rate_limit_event`'s `resetsAt`); only the
-    TUI fallback has to read it out of the notice's text.
+    TUI fallback has to read it out of the notice's text, with its kind (`compose_limit_notice`).
     """
     structured = getattr(proc, "limit_reset_at", None)
     if structured is not None:
         return float(structured)
-    return _reset_at(getattr(proc, "limit_text", ""))
+    return _reset_at(compose_limit_notice(proc))
 
 
 def session_refusal_until(proc: Any) -> float | None:
@@ -872,7 +988,7 @@ def session_refusal_until(proc: Any) -> float | None:
     structured = getattr(proc, "limit_reset_at", None)
     if structured is not None:
         return float(structured) if structured > time.time() else None
-    return _refusal_until(getattr(proc, "limit_text", ""), getattr(proc, "limit_seen_wall", None))
+    return _refusal_until(compose_limit_notice(proc), getattr(proc, "limit_seen_wall", None))
 
 
 def _refusal_until(text: str, observed_at: float | None = None) -> float | None:

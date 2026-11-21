@@ -170,6 +170,8 @@ async def _start_session(
                 on_notice=timeline.row,
                 # Its turns as it reported them, for the usage report (`_usage.read_author_ledger`).
                 ledger=_session_config.STATE_ROOT / _usage.AUTHOR_LEDGER_NAME,
+                # Its credential's windows, for the meter: a `-p` session runs no status line.
+                on_rate_limit=lambda event: _usage.ingest_author_rate_limit(event, timeline),
                 token=token,
             )
         else:

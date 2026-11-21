@@ -154,6 +154,7 @@ def test_factory_env_holds_the_queue_tasks_and_the_meter_task():
         "factory.rotate_token",
         "factory.sweep",
         "factory.read_login_meter",
+        "factory.usage",
         "factory.plan_pass",
         "factory.garden_weekly",
     }

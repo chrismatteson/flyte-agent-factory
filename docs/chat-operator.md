@@ -256,7 +256,7 @@ on. When review passes it tells you the pull request is ready; it merges when yo
 | know what is happening | "How is `<name>` doing?", "What's running and what's queued?", "Why is it waiting?" |
 | steer | "Tell `<name>` to ...", "Answer its question: ...", "Stop `<name>`" |
 | deliver | "Merge the PR for `<name>`", "Promote `<name>` to `<repo>`" (the operator runs [`ops/promote.py`](architecture-repos.md#promotion), so it needs a shell) |
-| manage spend | "What are the meters at?", "Hold back 0.5% of each window per hour to its reset" (`factory.set_reserve`, `k = 0.5`) |
+| manage spend | "What are the meters at?" (`factory.usage`), "Hold back 0.5% of each window per hour to its reset" (`factory.set_reserve`, `k = 0.5`) |
 
 The tools behind these are in [architecture.md](architecture.md#the-controls-on-the-mcp) and the day-to-day detail
 in [operating.md](operating.md).

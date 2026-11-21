@@ -202,7 +202,6 @@ async def _pump(
                 seen_limit = hit
                 text_now = getattr(proc, "limit_text", "")
                 submission = getattr(proc, "last_submission", None)
-                notice_reset = _usage.session_reset_at(proc)
                 same_notice = _usage._same_limit_notice(text_now, ended_limit_text)
                 # A refusal inside the episode: a resume was refused.
                 refused_again = limited_since is not None
@@ -210,11 +209,7 @@ async def _pump(
                     limited_since is None
                     and ended_at is not None
                     and same_notice
-                    and (
-                        time.monotonic() - ended_at <= 300
-                        or notice_reset is not None
-                        and notice_reset <= time.time()
-                    )
+                    and (time.monotonic() - ended_at <= 300 or _usage._redraw_passed(proc))
                     and (submission == ended_submission or submission == resume_submission)
                 ):
                     # A recent redraw is ambiguous; a later refused direction is a new episode.
@@ -285,11 +280,7 @@ async def _pump(
                     and getattr(proc, "last_submission", None) == resume_submission
                     and resumed_after_reset
                     and _usage._same_limit_notice(limit_text, resumed_notice)
-                    and (
-                        time.monotonic() - resumed_at <= 300
-                        or notice_reset is not None
-                        and notice_reset <= time.time()
-                    )
+                    and (time.monotonic() - resumed_at <= 300 or _usage._redraw_passed(proc))
                 ):
                     # Same ambiguity as `same_notice` above: the TUI redrawing the notice that the resume
                     # already handled is not a refusal. Pausing on it would leave nothing to deliver again.

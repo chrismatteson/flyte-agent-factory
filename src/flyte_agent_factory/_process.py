@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _unprivileged
+from . import _limit_reset, _unprivileged
 from ._auth import token_fd
 
 # Escape sequences, OSC strings, and the control characters a TUI emits by the
@@ -258,6 +258,10 @@ class ClaudeProcess:
         #: Wall-clock time of the same refusal: a clock-only reset in `limit_text` is read against it.
         self.limit_seen_wall: float | None = None
         self.limit_text = ""
+        #: Which limit the notice named (`_limit_reset.classify_limit`). `limit_text` keeps only the reset
+        #: clause, and a weekly notice's bare clock time can be up to a day ahead where an unnamed one's
+        #: cannot (#59), so the kind is kept beside it.
+        self.limit_kind = ""
         self.last_submission: tuple[str, float, int] | None = None
         self.sent_texts: deque[str] = deque(maxlen=500)
         self._limit_scan = ""
@@ -413,13 +417,20 @@ class ClaudeProcess:
             anchor = re.search(r"⎿[^\r\n]*?limit|(?:^|[\r\n])[^\r\n]*limit\s*reached", raw, re.IGNORECASE)
             reset = _LIMIT_RESET.search(raw[anchor.start() :] if anchor else raw)
             text = " ".join(reset.group(0).split()) if reset else ""
+            kind = _limit_reset.classify_limit(found.group(0))
             # New when something was submitted since the last one (a genuine refusal),
-            # when it is the first, or when its reset time differs (a new episode the
-            # session walked into on its own, with no submit in between).
-            if self._submitted_since_limit or self.limit_hit_at is None or (text and text != self.limit_text):
+            # when it is the first, or when its reset time or its limit differs (a new
+            # episode the session walked into on its own, with no submit in between).
+            if (
+                self._submitted_since_limit
+                or self.limit_hit_at is None
+                or (text and text != self.limit_text)
+                or (kind and kind != self.limit_kind)
+            ):
                 self.limit_hit_at = time.monotonic()
                 self.limit_seen_wall = time.time()
                 self.limit_text = text
+                self.limit_kind = kind
                 self._submitted_since_limit = False
             self._limit_scan, self._limit_raw = "", ""
         else:

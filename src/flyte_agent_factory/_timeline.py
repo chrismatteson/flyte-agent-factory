@@ -25,6 +25,7 @@ from flyte_agent_factory import (
     _roles,
     _session_config,
     _state,
+    _usage_hours,
 )
 from flyte_agent_factory._bridge import DEFAULT_ASK_TIMEOUT_S, Bridge, _write_atomic, redact_tokens
 from flyte_agent_factory._delegation import ActiveJob, Delegations, EndedJob
@@ -200,6 +201,8 @@ class _Timeline:
         #: False when the author engine reports no usage (Codex), so zeros here mean "not read", not "free".
         self.coordinator_measured: bool = True
         self.helper_usage: dict[str, Any] = {}
+        #: The same tokens by UTC hour (`_usage_hours`), for `factory.usage`'s estimate of the week.
+        self.author_hours: _usage_hours.Hours = {}
         #: Projects waiting for a slot, from the launch queue (`_refresh_queue`): position, name, since.
         self.queue: list[dict[str, Any]] = []
         self.checks: dict[str, Any] | None = None
@@ -559,10 +562,17 @@ class _Timeline:
         return groups, sum(g["usd"] for g in groups.values() if g["usd"] is not None)
 
     def set_author_usage(
-        self, split: dict[str, dict[str, Any]], total: dict[str, Any], *, measured: bool = True
+        self,
+        split: dict[str, dict[str, Any]],
+        total: dict[str, Any],
+        *,
+        measured: bool = True,
+        hours: _usage_hours.Hours | None = None,
     ) -> None:
         """Record what `_author_usage_split` read, with its total (the figure history is compared on)."""
         self.author_usage = total
+        if hours is not None:
+            self.author_hours = hours
         self.coordinator_usage, self.helper_usage = split["coordinator"], split["helpers"]
         self.coordinator_measured = measured
 
@@ -608,6 +618,9 @@ class _Timeline:
             "meters": sorted(self._meter_data.values(), key=lambda m: m["account"]),
             "fallbacks": list(self._fallbacks),
             "fallback_counts": dict(self._fallback_counts),
+            "claude_usage": _usage_hours.build_claude_usage(
+                _session_config._claude_account(), self.author_hours, now
+            ),
         }
         if _session_config._usage:
             cost.update(

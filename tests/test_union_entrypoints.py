@@ -20,7 +20,7 @@ ENTRY_POINTS = {
     PKG / "_factory.py": [
         "read_login_meter", "launch", "browser_link", "credential_link", "credentials", "status",
         "queue_list", "queue_cancel", "rotate_token", "set_reserve", "get_reserve", "clear_limit", "sweep",
-        "list_targets", "scan_target", "garden_weekly", "plan_pass",
+        "list_targets", "scan_target", "garden_weekly", "plan_pass", "usage",
     ],
     PKG / "_loop_flow.py": ["loop_run", "generate_backlog"],
     PKG / "_reconcile.py": ["reconcile"],

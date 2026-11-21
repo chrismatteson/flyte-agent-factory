@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
-from . import _permission_policy, _unprivileged
+from . import _meter, _permission_policy, _unprivileged
 from ._auth import token_fd
 
 #: Flags that make `claude` the structured session. `--verbose` is required with stream-json output;
@@ -78,13 +78,6 @@ def _describe_reset(at: float | None, kind: str = "") -> str:
     return f"resets {when}" + (f" ({kind})" if kind else "")
 
 
-def _to_epoch_seconds(value: object) -> float | None:
-    """Return a `resetsAt` as Unix seconds; milliseconds are scaled down, junk is None."""
-    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
-        return None
-    return float(value) / 1000 if value > 1e11 else float(value)
-
-
 class StreamClaudeProcess:
     """A Claude Code `-p` stream-json process with structured state for the supervisor."""
 
@@ -106,6 +99,7 @@ class StreamClaudeProcess:
         on_notice: Notice | None = None,
         policy: _permission_policy.Policy | None = None,
         ledger: Path | None = None,
+        on_rate_limit: Callable[[dict[str, Any]], None] | None = None,
         tail_lines: int = 400,
         token: str = "",
     ) -> None:
@@ -114,6 +108,7 @@ class StreamClaudeProcess:
         self._env = env
         self._on_line = on_line
         self._on_notice = on_notice
+        self._on_rate_limit = on_rate_limit
         self._policy = policy or _permission_policy.Policy()
         self._token = token
         self._proc: asyncio.subprocess.Process | None = None
@@ -344,6 +339,9 @@ class StreamClaudeProcess:
             self._note_activity()
         elif kind == "rate_limit_event":
             self._handle_rate_limit_event(event.get("rate_limit_info") or {})
+            if self._on_rate_limit is not None:
+                # The credential's windows, for the meter (`_usage.ingest_author_rate_limit`).
+                self._on_rate_limit(event)
         elif kind == "result":
             self._handle_result(event)
         elif kind == "control_request":
@@ -405,7 +403,9 @@ class StreamClaudeProcess:
         kind = str(info.get("rateLimitType") or info.get("rate_limit_type") or "unknown")
         self.rate_limits[kind] = info
         if (info.get("status") or "") == "rejected":
-            self._record_limit_hit(_to_epoch_seconds(info.get("resetsAt", info.get("resets_at"))), kind=kind)
+            self._record_limit_hit(
+                _meter.parse_event_reset(info.get("resetsAt", info.get("resets_at"))), kind=kind
+            )
 
     def _find_known_exhausted_reset(self) -> float | None:
         now = time.time()
@@ -413,7 +413,7 @@ class StreamClaudeProcess:
             at
             for info in self.rate_limits.values()
             if info.get("status") == "rejected"
-            and (at := _to_epoch_seconds(info.get("resetsAt", info.get("resets_at")))) is not None
+            and (at := _meter.parse_event_reset(info.get("resetsAt", info.get("resets_at")))) is not None
             and at > now
         ]
         return max(resets) if resets else None

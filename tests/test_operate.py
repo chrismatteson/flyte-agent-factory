@@ -654,7 +654,7 @@ def test_every_package_module_loads_with_the_agent():
         "_bootstrap_github,_bootstrap_keys,_bootstrap_profile,_bootstrap_state,_bootstrap_steps,_code_closure,_deploy,_deploy_apps,_deploy_child,_deploy_reads,_deployer,"
         "_factory,_factory_base,_factory_envs,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
-        "_factory_status,_grant_page,_grants_cli,_image_user,_isolation_canary,_loop,_loop_flow,"
+        "_factory_status,_factory_usage,_grant_page,_grants_cli,_image_user,_isolation_canary,_loop,_loop_flow,"
         "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_seal_launch,_seal_report,_slow_lane,_state_bucket,_state_volume,_tick_guard,"
         "_webhook,voice"
     )

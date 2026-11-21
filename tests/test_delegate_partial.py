@@ -229,6 +229,9 @@ async def test_a_claude_worker_at_the_turn_limit_returns_its_partial_work(fake_c
     assert (work / "plan.md").read_text() == "1. the remaining step\n"
     first, followup = [json.loads(line) for line in fake_claude.calls.read_text().splitlines()]
     assert first[first.index("--max-turns") + 1] == "7"
+    # The stream carries the `rate_limit_event`s the meter reads; stream-json needs --verbose.
+    for argv in (first, followup):
+        assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
     assert followup[followup.index("--resume") + 1] == "sess-1"
     assert int(followup[followup.index("--max-turns") + 1]) <= 3
 

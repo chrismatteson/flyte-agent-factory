@@ -278,6 +278,15 @@ Summarize current work, review round, blocking findings and who it is waiting on
 `passed review in N round(s)`. `SUCCEEDED` only means the run ended; `/stop` also ends that way.
 Usage-limit pauses resume automatically after reset unless the report requests human help.
 
+For "what are the meters at" or "how much of the week is left", run `factory.usage` (no inputs) and read it
+with `get_run_io`. Per Claude credential it returns `observed` (the newest five-hour and weekly percentages
+used a session saw, `*_left_pct` for what remains, reset times, `source` and `age_s`; an expired window has no
+percentage; `limited_until` while the credential is refused, `login_rejected` for a token to replace; `null`
+when nothing was seen), `provider_usage: "unsupported-for-setup-token"` (Anthropic has no usage endpoint for setup-tokens: say
+so plainly rather than calling the meter broken) and `estimate` (tokens and USD the factory itself spent on
+that credential this week). Always call the estimate an estimate, give its `basis` and window, and note it
+misses use outside the factory.
+
 With GitHub configured, work uses `factory/<name>`. Review opens a draft PR (ready where drafts are unavailable),
 marks it ready on a pass and writes `factory/verifier` status. Pre-review check failures do not open a PR.
 The factory never merges or force-pushes (except `[loop] merge = "on"` on the `[loop] repo` repository, which needs the App there); the user merges, or tells you to merge with the GitHub connector. Slot secrets are not an isolation boundary.
@@ -379,7 +388,7 @@ three times and waits for a new commit thereafter. With auto disabled, scheduled
 The deployed profile comes from the direction repo when configured, otherwise the deployed tree.
 
 For deployment diagnostics, filter `list_runs(task_name="factory-deployer.deploy_if_changed", limit=5)` and
-read small logs. `factory.read_login_meter` is internal, as are sweep and
+read small logs. `factory.read_login_meter` is internal (use `factory.usage`), as are sweep and
 worker tasks: use launch, status, queue_list, queue_cancel and `factory-bench.benchmark` for ordinary work.
 After a failed deploy, `run_task(name="factory-deployer.deploy_if_changed")` (no inputs) retries it now instead of
 waiting for the next tick; read the result with `get_run_io`.

@@ -83,10 +83,14 @@ is deleted before a session starts. Direction and questions use Flyte conditions
 
 The coordinator runs `ops/probes/token_meter.py` with the mounted token and a fresh nonce to
 record whether the usage endpoint returns both 5-hour and weekly utilization. Until that evidence
-is reviewed, `SETUP_TOKEN_USAGE_SUPPORTED` stays false. Quota headers exposed by CLI result events
-and 429/usage-limit refusals supply observations through the existing router meters. Missing
-utilization remains unknown. Refusals block until the reset, with bounded backoff when no reset
-is available. The CLI may omit headers; in that case only refusals provide a quota signal.
+is reviewed, `SETUP_TOKEN_USAGE_SUPPORTED` stays false. A setup-token's windows come from the
+`rate_limit_event`s in the author session's and sub-agents' stream-json output (`cli-event`), and from the
+status line of a coordinator on the TUI fallback (`statusline`). `factory.usage` reports them per credential with `kind` and `measured`, and always adds an `estimate`, labelled
+as such, from the factory's own hourly records; with no current reading the estimate is the answer. While
+`SETUP_TOKEN_USAGE_SUPPORTED` is false, `factory.read_login_meter` answers the credential's newest measured
+reading, else `unsupported-for-setup-token`. Refusals block until the
+reset, with bounded backoff when no reset is available. See
+[`docs/operating.md`](operating.md#usage-meters).
 
 For direct Flyte commands, resolve the selected profile in your shell first:
 

@@ -465,6 +465,7 @@ def test_the_allowlist_is_exactly_the_factory_chat_tasks_and_benchmark():
         "browser_link",
         "credential_link",
         "credentials",
+        "usage",
     )
     assert factory.CODEX_LOGIN_TASK == "factory-setup.codex_bootstrap_login"
     assert not any(slot in task for task in factory.CHAT_TASKS for slot in _factory_base.SLOTS)
@@ -516,6 +517,7 @@ def remote(lagging, monkeypatch):
     [
         (_factory.PROJECT, "factory.launch", True),
         (_factory.PROJECT, "factory.status", True),
+        (_factory.PROJECT, "factory.usage", True),
         (_factory.PROJECT, "factory.queue_list", True),
         (_factory.PROJECT, "factory.queue_cancel", True),
         (_factory.PROJECT, "factory-bench.benchmark", True),

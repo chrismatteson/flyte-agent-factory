@@ -230,7 +230,8 @@ async def _ask_remaining_work(
             "--resume",
             str(session),
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",  # stream-json requires it; the stream carries the `rate_limit_event`s
             *_policy.argv(_policy.Setting(model, effort)),
             "--max-turns",
             "2",
@@ -363,14 +364,11 @@ def _raise_on_cli_error(stdout: str, *, only_limit: bool = False) -> None:
     Otherwise an auth error becomes the "result", the reviewer gives no verdict, and a
     review round is spent on an infrastructure failure.
     """
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        return
-    if isinstance(payload, dict) and payload.get("is_error"):
+    events, payload = _usage.parse_cli_output(stdout)
+    if payload.get("is_error"):
         result = str(payload.get("result", ""))[:300]
         # Not `_CODEX_LIMIT`: "quota" or a bare "429" in an ordinary error is not a usage refusal.
-        meter = _meter.from_claude_events([payload], _session_config._claude_account())
+        meter = _meter.from_claude_events(events, _session_config._claude_account())
         if meter and meter.limited_until:
             # Carry any observed reset to the supervisor's refusal cache: a failed action has no outputs.
             meter.limited_until = _usage._keep_later_reset(result, meter.limited_until)
@@ -381,28 +379,24 @@ def _raise_on_cli_error(stdout: str, *, only_limit: bool = False) -> None:
 
 
 def _final_text(stdout: str) -> str:
-    """Pull the final message out of `claude -p --output-format json`.
+    """Pull the final message out of `claude -p` output (`_usage.parse_cli_output`).
 
     Falls back to raw stdout: a sub-agent that produced a useful answer in an
     unexpected shape should not be reported as having produced nothing. A
     successful result payload whose message is empty is the CLI saying the agent
     wrote nothing, so it gives "" rather than the payload itself.
     """
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        return stdout.strip()
-    if isinstance(payload, dict):
-        for key in ("result", "text", "content"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        if (
-            payload.get("type") == "result"
-            and payload.get("subtype") == "success"
-            and not payload.get("is_error")
-        ):
-            return ""
+    _, payload = _usage.parse_cli_output(stdout)
+    for key in ("result", "text", "content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if (
+        payload.get("type") == "result"
+        and payload.get("subtype") == "success"
+        and not payload.get("is_error")
+    ):
+        return ""
     return stdout.strip()
 
 
@@ -693,9 +687,9 @@ async def _run_codex_session(
         await asyncio.gather(bridge_task, return_exceptions=True)
 
 
-async def _report_claude_meter(payload: dict[str, Any]) -> None:
-    """Log the usage meter a Claude result carries to the report; a failure to log is only noted."""
-    observed = _meter.from_claude_events([payload], _session_config._claude_account())
+async def _report_claude_meter(events: list[dict[str, Any]], payload: dict[str, Any]) -> None:
+    """Log the usage meter a Claude run's events carry to the report; a failure to log is only noted."""
+    observed = _meter.from_claude_events(events, _session_config._claude_account())
     if observed:
         if observed.limited_until:
             observed.limited_until = _usage._keep_later_reset(
@@ -728,11 +722,8 @@ async def _claude_summary(
     """Return the text a finished `claude -p` sub-agent leaves, or raise the error its exit stands for."""
     out = raw.decode(errors="replace")
     stderr = err.decode(errors="replace")
-    try:
-        payload = json.loads(out)
-    except ValueError:
-        payload = {}
-    await _report_claude_meter(payload)
+    events, payload = _usage.parse_cli_output(out)
+    await _report_claude_meter(events, payload)
     if partial_base and not answer_only and payload.get("subtype") == "error_max_turns":
         # Checked before the exit code: the CLI exits non-zero at the turn limit.
         summary = await _partial_handback(

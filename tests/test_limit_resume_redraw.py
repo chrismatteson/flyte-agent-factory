@@ -505,3 +505,47 @@ async def test_redraws_after_a_refused_probe_do_not_clear_the_limit(monkeypatch,
     assert store.readings[account].limited_until is not None
     assert store.wake_count() == 0
     await finish(stop, pump)
+
+
+class _KindProc(_LimitProc):
+    """A `_LimitProc` whose notices name their limit, as `ClaudeProcess.limit_kind` does (#59)."""
+
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+        self.limit_kind = ""
+
+    def notice(self, text, now):
+        recorded = super().notice(text, now)
+        if recorded:
+            self.limit_kind = self.kind
+        return recorded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["", "session", "weekly"])
+@pytest.mark.parametrize("late_min", [0.5, 90])
+async def test_the_old_notice_redrawn_after_its_reset_is_no_new_episode_whatever_its_kind(
+    monkeypatch, kind, late_min
+):
+    # A weekly notice reads a bare clock time up to a day ahead; a redraw of the notice the supervisor has
+    # just resumed from, an hour and more after its reset, must not read as the same time tomorrow.
+    now = _clock(monkeypatch, WALL0)  # 20:01:34Z
+    proc = _KindProc(kind)
+    _b, tl, stop, pump = await start(proc)
+    await proc.submit(FINDINGS)
+    now["t"] += 33
+    proc.notice("resets 8:40pm (UTC)", now["t"])
+    proc.last_output = now["t"] - 120
+    await wait_for(lambda: rows(tl, "usage limit reached"))
+    now["t"] += 46 * 60
+    await wait_for(lambda: len(proc.submitted) == 2)
+    now["t"] += 61
+    proc.output_count += 6000
+    proc.last_output = now["t"]
+    await wait_for(lambda: rows(tl, "running again"))
+    now["t"] += late_min * 60
+    assert proc.notice("resets 8:40pm (UTC)", now["t"])  # the resume re-armed it
+    await tick(0.1)
+    await finish(stop, pump)
+    assert len(rows(tl, "usage limit reached")) == 1
