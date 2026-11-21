@@ -27,6 +27,7 @@ from . import (
     _design_seed,
     _evidence,
     _gate_base,
+    _gate_import,
     _gate_rules,
     _gate_scope,
     _gate_start,
@@ -100,6 +101,11 @@ _CAPTURED_BASES: dict[tuple[Path, str], str] = {}
 def _trusted_base(workspace: Path, name: str) -> str:
     """Return the base commit waivers are read from when there is no repository URL."""
     return _CAPTURED_BASES.get((workspace.resolve(), name)) or resolve_base(workspace, name)
+
+
+def _captured_base(workspace: Path, name: str) -> str:
+    """Return the base `capture_base` recorded in this process, or "" (lost to a restart)."""
+    return _CAPTURED_BASES.get((workspace.resolve(), name), "")
 
 
 def resolve_base(workspace: Path, name: str) -> str:
@@ -413,11 +419,14 @@ def _judge_project(
         record("attribution", _gate_base.Status.NOT_APPLICABLE, "no project changes yet")
     try:
         # A workspace project's change is everything its branch holds beyond the upstream it merged.
-        upstream = _gate_start.find_upstream_start(workspace) if layout == "workspace" else None
-        with _gate_start._start_tree(workspace, upstream or base, None if upstream else commits) as built:
+        measured = _gate_import.measure_from(workspace, name, layout, folder, _captured_base(workspace, name))
+        upstream = measured.upstream if measured else None
+        with _gate_start._start_tree(
+            workspace, upstream or base, None if upstream else commits, measured
+        ) as built:
             start = built.path
             code, touched = (
-                _gate_start.list_paths_since(workspace, upstream)
+                _gate_start.list_paths_since(workspace, upstream, measured)
                 if upstream
                 else _changed_paths(workspace, commits)
             )
@@ -451,9 +460,7 @@ def _judge_project(
                 if layout in {"root", "workspace"}
                 else "outside project/brief"
             )
-            record(
-                "scope",
-                _gate_base.Status.FAIL if violations else _gate_base.Status.PASS,
+            scope_output = (
                 "; ".join(
                     ([f"{outside}: {', '.join(violations)}"] if violations else [])
                     + (
@@ -463,7 +470,12 @@ def _judge_project(
                     )
                     + ([f"flagged, not blocking: {', '.join(flagged)}"] if flagged else [])
                 )
-                or "within the project",
+                or "within the project"
+            )
+            record(
+                "scope",
+                _gate_base.Status.FAIL if violations else _gate_base.Status.PASS,
+                scope_output + (f"; {measured.describe()}" if measured else ""),
             )
             if not fail_to_pass_rules:
                 return
@@ -1345,14 +1357,19 @@ def run(
         start = None
         if layout in {"root", "workspace"} and base:
             # A workspace project starts from the upstream its branch merged (`find_upstream_start`).
-            upstream = _gate_start.find_upstream_start(workspace) if layout == "workspace" else None
+            measured = _gate_import.measure_from(
+                workspace, name, layout, folder, _captured_base(workspace, name)
+            )
+            upstream = measured.upstream if measured else None
             commits = None
             if not upstream:
                 code, output = _project_commits(workspace, name, base)
                 commits = None if code else output.splitlines()
             try:
                 start = _gate_start.make_start_folder(
-                    stack.enter_context(_gate_start._start_tree(workspace, upstream or base, commits)).path,
+                    stack.enter_context(
+                        _gate_start._start_tree(workspace, upstream or base, commits, measured)
+                    ).path,
                     _gate_base.project_rel(name, layout, folder),
                 )
             except _gate_start._GateError as exc:

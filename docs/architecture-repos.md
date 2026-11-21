@@ -67,8 +67,33 @@ A routed folder that does not exist in the workspace is refused too, unless it i
 A workspace project is judged against its start tree: the newest default-branch (`origin/HEAD`) commit its
 branch holds (`git merge-base HEAD origin/HEAD`), narrowed to its folder, so debt it inherited passes and what it
 adds or grows fails. Everything not on the default branch is the project's, a merge commit it authored included,
-so a merge cannot carry new code into the start, and `scope` judges every path that differs from it. (Without `origin/HEAD`, the start is HEAD with the project's
-own commits reverse-applied, as in the root layout.) A non-merge commit since
+so a merge cannot carry new code into the start, and `scope` judges every path that differs from it. (Without
+`origin/HEAD`, the start is HEAD with the project's own commits reverse-applied, as in the root layout.)
+
+When the operator's `promote.py import` commit (`promote.toml`'s first commit) is only on the project's branch,
+the start's project folder takes that import's files, written as stored (its `.gitattributes` does not filter
+them), beside what the default branch's copy of that folder already holds, which they never replace; so
+upstream's files are not the project's new code. The import is taken whole only if the base the supervisor
+recorded at creation, in its own process, contains it (never a commit made later) and no agent identity authored
+it; after a supervisor restart only the session-writable `base-commit` file is left, so nothing is taken whole
+and the import is verified as below.
+
+Any other import, a session's own included (the first commit of `promote.toml`, or of a `vendored.toml` whose
+tree is the whole folder, `.` or `projects/<name>`), gives the start only its files byte-identical to the
+upstream commit that file names, read as a vendored tree's upstream is
+([standards](standards.md#vendored-upstream-trees)): fetched over `https` and in the history of that
+repository's default branch. The import tool's own files at the folder's top (`promote.toml`, `checks.sh`,
+`SUMMARY.md`) come in with it only when no agent identity authored the import and, while the supervisor's recorded
+base is intact, only if that base contains it, which is the whole-import case above. So with the record intact a
+verified import never brings them, and a `promote.toml` committed after the base stays the project's whatever mail
+it carries: `scope` blocks it. After a supervisor restart the record is gone, so an operator's branch-only import
+verified against its upstream keeps them (`promote.toml` must still match the import). In that state a commit
+under a faked operator mail together with a rewritten `base-commit` file can bring its own `promote.toml` in: that
+case is as trustworthy as that file, the known limit `_waivers.py` already documents. A whole-folder
+`vendored.toml` tree is read by this start rule only, to name the upstream commit to verify against; the
+vendored-tree rule still reports it as not a sub-tree.
+
+The `scope` record names the commits measured from, or why an import was not used. A non-merge commit since
 the base that is neither attributed to the launch nor on the default branch (`origin/HEAD`) fails
 `attribution`, so a commit made under another `--author` cannot pass the project's additions off as debt.
 
