@@ -125,7 +125,7 @@ def _roles() -> set[str]:
 
 
 def _mcp_names() -> set[str]:
-    return set(_factory_mcp.TOOLS) | {f"factory.{task}" for task in _factory_mcp.CHAT_TASKS}
+    return set(_factory_mcp.SERVED_TOOLS) | {f"factory.{task}" for task in _factory_mcp.CHAT_TASKS}
 
 
 # ---- (a) names in the docs are defined ----

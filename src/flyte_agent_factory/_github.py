@@ -122,6 +122,15 @@ def parse_repo(url: str) -> str:
     return f"{match[1]}/{match[2]}"
 
 
+def require_owner_repo(url: str) -> str:
+    """`owner/repo` of a github.com URL, or `GithubError` unless it names exactly one repository."""
+    parsed = parse_repo(url)
+    # The URL pattern lets a path or spaces through (`.../org/engine/tree/main`): only `owner/repo` reads.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", parsed):
+        raise GithubError(f"not one owner/repo: {url!r}")
+    return parsed
+
+
 def clone_url(repo: str, token: str) -> str:
     """Return the HTTPS URL git authenticates to with an installation token. Secret: never log it."""
     return f"https://x-access-token:{token}@github.com/{repo}.git"

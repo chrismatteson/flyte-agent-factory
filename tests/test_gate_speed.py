@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -382,6 +383,47 @@ def test_checks_sh_waits_for_each_lanes_tee_before_its_verdicts(tmp_path):
         "=== factory-improvement/checks.sh: fast lane exit 1 ===\n=== 1 failed in 1.00s ===\n"
         "=== factory-improvement/checks.sh: slow lane exit 0 ===\n=== 7 passed in 9.00s ===\n"
     ), run.stdout[-2000:]
+
+
+def test_checks_sh_waits_for_a_slow_tee_before_printing_the_verdict(tmp_path):
+    """Each lane's `tee` is waited for: a `tee` that is slow to write still comes out before the verdicts."""
+    repo = Path(__file__).resolve().parents[1]
+    real_tee = shutil.which("tee")
+    assert real_tee is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tee = bin_dir / "tee"
+    tee.write_text(f'#!/bin/bash\nsleep 1\nexec {shlex.quote(real_tee)} "$@"\n')
+    tee.chmod(0o755)
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/bash\n"
+        'if [[ "$*" == *"not slow"* ]]; then\n'
+        "  echo 'FAILED tests/test_a.py::t - AssertionError'\n"
+        "  echo '=== 1 failed, 9 passed in 2.00s ==='; exit 1\n"
+        "fi\n"
+        "if [[ \"$*\" == *pytest* ]]; then echo '=== 7 passed in 9.00s ==='; fi\n"
+    )
+    uv.chmod(0o755)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("AGENT_FACTORY_SLOW_LANE", _gate_tests.PYTEST_JUNIT_ENV)
+    }
+    env.update(PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", AGENT_FACTORY_RUN_SLOW="1")
+    run = subprocess.run(
+        ["bash", str(repo / "factory-improvement/checks.sh")],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 1
+    assert run.stdout.endswith(
+        "=== factory-improvement/checks.sh: fast lane exit 1 ===\n"
+        "FAILED tests/test_a.py::t - AssertionError\n=== 1 failed, 9 passed in 2.00s ===\n"
+        "=== factory-improvement/checks.sh: slow lane exit 0 ===\n=== 7 passed in 9.00s ===\n"
+    )
 
 
 def test_checks_sh_leaves_the_slow_lane_to_ci_unless_asked(tmp_path):

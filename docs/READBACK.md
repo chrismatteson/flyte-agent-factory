@@ -46,21 +46,21 @@ Budget: 3 CPU, 12 GiB of requests, 50 GiB ephemeral disk (allocatable on an `e2-
 
 | Line | CPU request | Memory request | Disk |
 |---|---|---|---|
-| factory-mcp (BestEffort) | 0 | 0 | 0 |
+| factory-mcp | 0.10 | 0.25 Gi | 0 |
 | factory tick | 0.10 | 0.25 Gi | 0 |
 | factory-deployer | 0.25 | 0.50 Gi | 0 |
 | factory-reconcile tick | 0.10 | 0.25 Gi | 0 |
-| gardening-scan (one at a time) | 0.25 | 0.50 Gi | 0 |
-| **idle** | **0.70** | **1.50 Gi** | **0** |
+| gardening-scan (one at a time) | 0.15 | 0.50 Gi | 0 |
+| **idle** | **0.70** | **1.75 Gi** | **0** |
 | slot | 0.50 | 1.50 Gi | 20 Gi |
 | one 2-CPU lane shard | 1.50 | 3.00 Gi | 0 |
-| **one project live** | **2.70** | **6.00 Gi** | **20 Gi** |
+| **one project live** | **2.70** | **6.25 Gi** | **20 Gi** |
 
 Shards at once beside the idle factory and one slot: CPU 3.00 - 0.70 - 0.50 = 1.80 free, 1.80 // 1.50 = 1; memory
-12.00 - 1.50 - 1.50 = 9.00 free, 9.00 // 3 = 3. CPU binds: **1 shard at a time**; the others wait their turn.
+12.00 - 1.75 - 1.50 = 8.75 free, 8.75 // 3 = 2. CPU binds: **1 shard at a time**; the others wait their turn.
 
 With every optional component on (webhook with issue intake, board, loop, bench tick, one personal browser): idle
-1.00 CPU / 2.50 Gi / 10 Gi, one project live **3.00 CPU / 7.00 Gi / 30 Gi**, exactly at the CPU budget, still 1
+1.00 CPU / 2.75 Gi / 10 Gi, one project live **3.00 CPU / 7.25 Gi / 30 Gi**, exactly at the CPU budget, still 1
 shard at a time. Both are asserted in `tests/test_resources.py`; the default table is asserted to appear verbatim in
 `docs/small-nodes.md` (new test `test_the_docs_show_the_default_profiles_budget_as_it_prints`).
 

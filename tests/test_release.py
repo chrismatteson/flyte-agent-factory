@@ -156,6 +156,11 @@ class Rig:
         monkeypatch.setattr(_inbox, "_last_direction_at", None, raising=False)
         monkeypatch.setattr(_supervise_support, "_released", False, raising=False)
         monkeypatch.setattr(_session_config, "STATE_ROOT", tmp_path / "state")
+        # The pump's own workspace, not the repo this suite runs in, in the sandbox layout `checks` above
+        # was written for. Pinned rather than asked of git: every ask is a tool run whose load clock scans
+        # /proc, and on a node full of unreaped zombies those runs outlast the turns `advance` gives.
+        monkeypatch.setattr(_session_config, "WORKSPACE", tmp_path)
+        monkeypatch.setattr(_session_config, "_layout", lambda: "sandbox")
         monkeypatch.setattr(_supervise_support, "_escalated", False)
         monkeypatch.setattr(_supervise_support, "_in_flight_error", "")
 

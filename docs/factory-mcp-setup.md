@@ -26,6 +26,26 @@ and no tool returns a secret value. `create_secret` and `delete_secret` exist (`
 this server where the owner types the value), but engine credentials are stored with local commands
 ([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat.
 
+**The app tools and long calls.** Besides the stock tools the server has `get_app_status` (an app's status history and
+why it last failed), `get_app_logs` (its newest log lines, including replicas that have died), `restart_app`
+(deactivate then activate, never delete), `factory_mcp_health` (this server's uptime, restarts and errors; its call and error counts cover the last hour and
+reset on a restart, so read a whole day from `get_app_logs` with `since=24h` and its `mcp_call` lines, or from the health
+tool once an hour) and
+`get_operation`; `get_app`, `activate_app` and `deactivate_app` list environment and secret names, never values.
+`restart_app` and `deactivate_app` refuse the server's own app (`AGENT_FACTORY_MCP_APP`, set at deploy), since stopping it
+would end the call that restarts it. The chat client cuts a call at about 230 s, and a cut call reaches it as a 502 with
+nothing to read. So every call has a 200 s budget: past it the tool returns
+`{"status": "still_working", "operation_id": ...}`, the work goes on in the server, and `get_operation` gives the
+result (or the steps done so far). A call that changes state (`ACTING` in `_factory_mcp.py`), repeated with the same
+arguments before its result was delivered, joins the first instead of acting twice. A request the client drops is
+cancelled on the server (`CancelOnDisconnect` watches the transport's disconnect); the work goes on and an identical
+repeat joins it. `wait_for_run`'s `timeout_s` is
+capped at 170 s (the result says `timeout_capped_to_s`); a run still going returns `timed_out: true`, so call it again.
+The operations live in the server's memory: after a restart an id is `unknown_operation`, and the effect should be read
+directly (`get_run`, `get_app_status`) before acting again. Every result is masked for secrets before it leaves the
+server, and each call writes one log line (tool, duration, outcome, never the arguments). The server asks Kubernetes for
+100m CPU and 256Mi memory (limit 512Mi); its measured RSS is 114-126 MiB ([small-nodes.md](small-nodes.md)).
+
 The search tools read the Flyte SDK examples, the Union examples and the Union docs from `/opt/flyte-mcp-docs`,
 fetched into the app image when it is built (the SDK at tag `v2.10.7`).
 
@@ -193,3 +213,30 @@ The `agent-factory` and `since` skills are public and need no profile: download 
 [`skills/dist/`](../skills/dist) and install them as in
 [chat-operator.md](chat-operator.md#install-and-update). `ops/package_skill.py` builds them from `skills/`, and
 `ops/package_skill.py --check <zip>` says whether an installed copy is current.
+
+## Operating and measuring
+
+These scripts run from `projects/mcp-apps-reliability/` with `PYTHONPATH=src uv run python <script>`; each takes
+`--profile`, and `--help` lists the rest. None prints a token.
+
+- `ops/live_mcp_test_app.py` deploys a throwaway copy of the factory MCP app named
+  `factory-mcp-test-<short sha>` (it refuses `factory-mcp`). Run bare, it deploys, prints the endpoint and the
+  connector URL `<endpoint>/flyte-mcp/mcp`, then holds until Ctrl-C, SIGTERM or end of stdin and deletes the
+  app on the way out (a failed deploy deletes it too). `--keep` deploys, prints and exits, leaving the app
+  running; `--delete --name <name>` removes it later. `--dry-run` prints the plan.
+- `ops/mcp_soak.py --endpoint <connector URL> --app <test app> --status-name <project> [--rounds 10]`
+  makes rounds of calls in separate MCP sessions (tool list, four parallel `run_task factory.status` with
+  `rows` 20 to 23, waiting for the run, run output, logs, app logs and status, health) and writes
+  latencies and errors by kind to `evidence/mcp-soak.json`. Each call has distinct inputs because identical
+  parallel calls join into one run, by design.
+- `ops/mcp_burst.py --endpoint <connector URL> --app <test app> --status-name <project>` replays the parallel
+  bursts that timed out (8 `whoami`, 8 `tools/list`, 4 `get_app`, 4 `factory.status`), reads
+  `factory_mcp_health` before and after, and writes `evidence/mcp-burst.json`.
+- `ops/mcp_chat_check.py --endpoint <connector URL> --test-app <name>` does what the operator does from chat
+  (app logs, app status, health, a refused self-restart, then a restart of the test app) and keeps the
+  evidence. Production is only read.
+- `ops/app_logs_probe.py [--app <name>] [--out <file>]` checks the app tools against a live app, read-only,
+  with this pod's token as the bearer header, and writes redacted evidence.
+- `ops/devbox_mcp/` is the one-shot devbox harness: `python -m devbox_mcp.run --out evidence/devbox-<label>.json`
+  with `PYTHONPATH=ops:...` as its docstring in `ops/devbox_mcp/run.py` gives. It submits one privileged child
+  action, takes about 12 minutes once a node is placed, has no retries, and never overwrites `--out`.

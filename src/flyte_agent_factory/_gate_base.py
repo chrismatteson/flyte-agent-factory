@@ -150,17 +150,18 @@ def _run(
         # The limit is on load-adjusted time: a busy shared node must not fail a tool that is working.
         clock = _load_clock.LoadClock(timeout, proc.pid)
         try:
-            # Poll before waiting, so a command is judged at least once: the clock's first scan of /proc can
-            # outlast a short command in a pod with a large process table (#34).
-            while not clock.poll():
+            # Poll before each wait, so a command is judged at least once: the clock's first scan of /proc can
+            # outlast a short command in a pod with a large process table (#34). A command that has already
+            # exited is not killed for it.
+            while True:
+                if clock.poll() and proc.poll() is None:
+                    _kill_group(proc)
+                    return 124, _describe_timeout(timeout, clock)
                 try:
                     proc.wait(timeout=0.05)
                     break
                 except subprocess.TimeoutExpired:
-                    pass
-            else:
-                _kill_group(proc)
-                return 124, _describe_timeout(timeout, clock)
+                    continue
         except BaseException:
             _kill_group(proc)  # this thread was interrupted: no tool is left running behind the gate
             raise

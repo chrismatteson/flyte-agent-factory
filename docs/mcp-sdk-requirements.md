@@ -16,6 +16,41 @@ removing it is worth, most first:
 | 3 | `signal_condition` is strict about the answer and fails on an ended condition | The owner's answer is lost to the project |
 | 4 | No public way to read, wrap or replace a registered tool | Forces the one private read that is left, in the wrappers above |
 | 5 | Custom HTTP routes only through an underscore-named hook | One static page (the credential grant page) |
+| 6 | No public way to read an app's logs, and no `get_app_logs` tool | A failing app (the MCP server itself) could not be diagnosed from chat; the factory reads logs through the generated log clients |
+| 7 | App status history is only in raw `pb2.status.conditions` | "Why did it restart" had no answer in any tool |
+| 8 | No per-call deadline, and no resumable result, in the stock server | The chat client cuts a call at about 230 s and the caller sees a bare 502 |
+| 9 | `get_logs` asks for attempt 0 on OSS | The tool fails for every action that started a child |
+| 10 | Stock `get_app` returns environment values | A secret in an app's environment reached the chat |
+| 11 | The server logs no line per tool call | Nothing says which call was slow or failed |
+| 12 | `list_projects` needs an organisation-level list | It is unauthorized for a project-scoped key |
+| 13 | The app's readiness probe does not use `/health` | A busy process looks unready, and the probe failures are only in the SYSTEM log |
+| 14 | No telemetry opt-out for a long-running server | Library code in the server sends crash reports and counters |
+| 15 | Run and action URLs built from the in-cluster endpoint | On OSS, a URL from a pod points at `flyte-binary-http.flyte:8090`, which no browser can open |
+
+## Factory-side or SDK-side: each capability added for #49
+
+Decided per capability. An SDK-side item is built in the factory now as an interim, which names the gap that
+replaces it (in the module's docstring) and is removed once the gap lands. A factory-side item stays.
+
+| Capability | Side | Reason | Where |
+|---|---|---|---|
+| App logs: newest N, a time window, replica and revision on each line (`get_app_logs`) | SDK (gap 6) | Any app owner needs it, and the stream is a public service; only the SDK can add `App.get_logs` | `_app_logs.py` |
+| Status history and the classified last failure (`get_app_status`) | SDK (gap 7) | The conditions are an SDK object; classifying their substates belongs with it | `_app_tools.py` |
+| Image and version in an app summary with env *names* only (`get_app`) | SDK (gap 10) | The stock tool returns env values; the fix is in the stock tool | `_app_tools.summarise_app` |
+| `restart_app` | Factory | A composition of the stock `deactivate_app` and `activate_app`; its refusals (its own app, another project's) are factory policy | `_app_tools.py` |
+| `factory_mcp_health` | Factory | It reports the factory's own server: its revision, restarts and its call ring. It reads gap 7's history and gap 11's records once those land | `_app_tools.py`, `_factory_mcp.py` |
+| A call budget below the client's 230 s, `still_working` and `get_operation`, acting calls joined not repeated | SDK (gap 8) | The client limit applies to every stock server; the stock tools are the ones that wait | `_mcp_budget.py` |
+| One log line per call | SDK (gap 11) | The server's request handler is the SDK's | `_mcp_budget._record` |
+| Redaction of every result and error | Factory | The secret shapes are the deployment's (its Union keys, GitHub, Anthropic, cloud keys), and redaction must cover the factory's own tools too. The SDK side is a public way to wrap every tool to apply it (gap 4) and no env values in the first place (gap 10) | `_mcp_redact.py` |
+| Project and domain scope on every tool | SDK (gap 1) | A security boundary every multi-tenant server needs | `_factory_mcp._serve` |
+| The served tool list pinned to the docs | Factory | A test of the factory's own docs | `tests/test_factory_mcp.py::test_served_tools_match_the_docs_both_ways` |
+| `list_projects` for a project-scoped key | SDK (gap 12) | The stock tool's organisation-level call | `_factory_mcp._list_only_the_factory_project` |
+| `get_logs` with the real attempt on OSS, and a gap result naming the alternative | SDK (gap 9) | `Action.get_logs` defaults the attempt | `_oss_follow.wrap_get_logs` |
+| An openable URL on OSS, or a plain "no openable URL" | SDK (gap 15) | The SDK builds the URL from its endpoint | `_oss_follow.find_openable_url`, `fix_urls` |
+| `factory.status` on OSS: the report from storage, the reason when it cannot, open questions from conditions | Factory | The report and its state store are the factory's | `_oss_follow.read_stored_report`, `_factory.read_status` |
+| `factory.status <project>` on OSS by reading run details | Factory, with an owner note | OSS run listings come back without labels and refuse label filters; that is the OSS server, not the SDK. Raise it on flyte OSS if the scan's 30-run limit bites | `_oss_follow.find_run_by_label` |
+| Telemetry off in factory pods | Factory, and SDK (gap 14) | The default is the factory's; a documented server switch is the SDK's | `_profile_telemetry.py` |
+| Resources for the `mcp` app | Factory | Deployment configuration | `_resources.py` |
 
 The factory rebuilds a tool by removing it and adding a wrapper (`_use_the_factorys_tools`), and each wrapper
 copies a stock tool's signature by hand or through `functools.wraps`. A stock tool that gains a parameter is
@@ -53,7 +88,7 @@ At 2.13.5:
 
 What the factory builds to cover it, in `_factory_mcp.py`:
 
-- `_scoped_to_the_factory` wraps every registered tool that has a scoped parameter and raises
+- `_build_scope_check` wraps every registered tool that has a scoped parameter and raises
   `ToolError("... is not allowed; this server is limited to ...")` for a different non-empty value. A parameter
   is scoped when `_scoped_arguments` finds its name ending in `project` or `domain`, so `project`, `domain`,
   `run_project` and `run_domain` are all checked, and so is any parameter a later SDK release names the same way.
@@ -98,9 +133,9 @@ FlyteMCPAppEnvironment(
 
 ### What the factory removes once it lands
 
-In `_factory_mcp.py`: `_scoped_to_the_factory`, `_scoped_arguments`, `_list_only_the_factory_project` and
+In `_factory_mcp.py`: `_build_scope_check`, `_scoped_arguments`, `_list_only_the_factory_project` and
 `_get_only_the_factory_project`, the scoping half of `_use_the_factorys_tools`, the `task_allowlist=None` comment
-that points at `_scoped_to_the_factory`, and the `FLYTE_MCP_PROJECT` / `FLYTE_MCP_DOMAIN` entries of `env_vars` if
+that points at `_build_scope_check`, and the `FLYTE_MCP_PROJECT` / `FLYTE_MCP_DOMAIN` entries of `env_vars` if
 the defaults come from the allowed lists. The tests for the wrappers become one test that the constructor
 arguments are passed. A parameter the factory's name rule would miss is then covered, because the SDK checks
 where scope is resolved.
@@ -346,6 +381,224 @@ FlyteMCPAppEnvironment(
 `_GrantPage`, the `FactoryMCPAppEnvironment` subclass and its `_starlette_middleware` override (the page is passed
 in the constructor instead, and the stock environment is used as it is). The `_grant_page.serve_grant_page`
 handler stays.
+
+## 6. Public app logs: `App.get_logs` and a stock `get_app_logs` tool
+
+### Problem
+
+`AppLogs.tail` lives in the private `flyte.remote._logs`, and the public `App.show_logs` only prints. A server that has to
+tell an owner why an app keeps restarting cannot read the app's logs, nor those of a replica that has already died, nor the
+`SYSTEM` lines where a failed probe appears (the SDK's `filter_system` drops them).
+
+### Requirement
+
+```python
+class App:
+    async def get_logs(
+        self,
+        max_lines: int = 200,
+        since: datetime | timedelta | None = None,
+        until: datetime | None = None,
+        replica: str | None = None,
+        revision: str | None = None,
+        source: Literal["live", "persisted", "both"] = "both",
+        include_system: bool = True,
+    ) -> AppLogPage: ...  # lines newest last: ts, replica, revision, stream, message; truncated; gaps
+```
+
+and a stock tool `get_app_logs(name, max_lines, since, until, replica, revision, source, include_system, project, domain)`
+returning the same page. Tests: recorded proto streams; a `NOT_FOUND` tail ends cleanly with a gap; a replica filter and a
+time window apply; `max_lines` is capped; persisted lines of a replica that no longer exists are returned.
+
+### What the factory removes once it lands
+
+`_app_logs.py` (the connect clients, the merge of live and persisted lines) and `_app_tools.get_app_logs`, which becomes a
+registration of the stock tool.
+
+## 7. App status history
+
+### Problem
+
+An app's restarts and their reasons are only in the raw `pb2.status.conditions` (substate `OOM_KILLED`, `CRASH_LOOP`,
+`IMAGE_PULL_ERROR`, ...), with no typed record and no tool.
+
+### Requirement
+
+```python
+class App:
+    def conditions(self) -> list[AppCondition]: ...  # at, deployment_status, substate, message; oldest first
+```
+
+and a stock `get_app_status(name, history=20)` returning the summary, the history and the newest failure with a class
+(`oom`, `crash`, `probe_failed`, `image_pull`, `secret_mount`, `unknown`) and the raw message. Tests: one fixture per class;
+an empty history; a failed probe found only in the `SYSTEM` log lines.
+
+### What the factory removes once it lands
+
+`_app_tools.get_app_status`, `classify_failure`, `_conditions` and the restart reconstruction in `factory_mcp_health`.
+
+## 8. A per-call deadline and resumable results in the stock server
+
+### Problem
+
+The stock server holds each tool call's HTTP request open until the tool finishes. `wait_for_run` without `timeout_s` and
+`activate_app` / `deactivate_app` (`App.watch()`) can block forever, and the claude.ai connector cuts a call at about 230 s,
+so the caller sees a 502 with no hint of what the server did, and may repeat a `run_task` that had succeeded. And the
+stock streamable-HTTP transport, stateless with JSON responses, never reads ASGI `receive` after the body, so a client
+that disconnects is not noticed: the handler completes, its result goes to a closed socket, and it is forgotten.
+
+### Requirement
+
+```python
+FlyteMCPAppEnvironment(tool_deadline_s: float = 200.0, acting_tools: Iterable[str] = ...)
+```
+
+Every tool runs as its own task and the server waits for it only for `tool_deadline_s`. Past that it returns
+`{"status": "still_working", "operation_id": ..., "steps_done": [...], "call_again": {...}}` and the work goes on; a stock
+`get_operation(operation_id, wait_s)` gives the result or the progress. A tool in `acting_tools` called again with the same
+arguments joins the undelivered operation instead of acting twice, and a request whose client disconnects cancels its
+handler (never the work), so the operation stays open. `App.watch(timeout=...)` for the waits underneath.
+Tests: a fake remote that never finishes, so each waiting tool returns within the deadline; a dropped acting call, a real
+HTTP request closed on the stock transport, is joined, not repeated; an unknown id after a restart says so.
+
+### What the factory removes once it lands
+
+`_mcp_budget.py` (`run_within_budget`, `Operations`, `get_operation`, `CancelOnDisconnect` and the `dropped`
+outcome), the clamp of `wait_for_run`'s `timeout_s`, and the `get_operation`
+registration in `_factory_mcp.py`.
+
+## 9. `get_logs` attempt resolution on OSS
+
+### Problem
+
+OSS resets an action's attempt count to 0 once the action starts a child, so the stock tool asks for attempt 0 and fails with
+"Log stream not available" (`pb2.attempts` still lists the real attempts).
+
+### Requirement
+
+With no `attempt` given, `get_logs` (and `Action.get_logs`) resolves the newest attempt from `ActionDetails.pb2.attempts`
+instead of defaulting to 0, and says in the result which attempt it read:
+
+```python
+async def Action.get_logs(self, attempt: int | None = None, ...) -> AsyncIterator[str]  # None: the newest attempt
+# stock tool
+async def get_logs(run_name: str, action_name: str | None = None, attempt: int | None = None,
+                   max_lines: int = 100) -> {"attempt": int, "lines": list[str], "gap": str | None}
+```
+ When no stream exists it returns `lines: []` with
+a gap that names the cause, not an error. Tests: an action whose count was reset; one with no attempts; one whose stream is
+gone.
+
+### What the factory removes once it lands
+
+`_oss_follow.wrap_get_logs` and `resolve_real_attempt`, and the `get_logs` replacement in `_use_the_factorys_tools`.
+
+## 10. A stock `get_app` summary without environment values
+
+### Problem
+
+The stock `get_app`, `activate_app` and `deactivate_app` return `App.to_dict()`, which includes every environment variable
+with its value. An app whose environment holds a token showed it to the chat.
+
+### Requirement
+
+Return a summary: name, project, domain, status, URL, image, version, revision, replica counts, last start, and the *names*
+of environment variables and secrets; a `include_env_values: bool = False` argument, off by default, for a caller that needs
+them. Tests: an app with `API_TOKEN=...` gives no value in any of the three tools.
+
+### What the factory removes once it lands
+
+`_app_tools.summarise_app`, `get_app`, `activate_app` and `deactivate_app`, which today replace the stock ones under the same
+names.
+
+## 11. One structured log line per tool call
+
+### Problem
+
+The server logs "Processing request of type CallToolRequest" with no tool name, duration or outcome, so a slow or failed call
+cannot be found afterwards. Arguments must stay out of it: `create_secret` carries values.
+
+### Requirement
+
+One `INFO` record per call from the server, on the logger `flyte.ai.mcp.calls`:
+`mcp_call tool=<name> duration_ms=<n> outcome=<ok|joined|still_working|dropped|error:<class>|refused>`, switched by
+`FlyteMCPAppEnvironment(call_log: bool = True)`, with the records also readable in process through
+`FlyteMCPAppEnvironment.recent_calls(window_s: float = 3600) -> list[CallRecord]`.
+Test: a `caplog` test that the line is there once per call and holds no argument value.
+
+### What the factory removes once it lands
+
+The log line in `_mcp_budget._record` (the call ring behind `factory_mcp_health` stays, or reads the same records).
+
+## 12. `list_projects` for a project-scoped key
+
+### Problem
+
+The stock tool lists every project of the organisation, which a key scoped to one project may not do. The factory's own
+queue key got `PERMISSION_DENIED`, so `list_projects` failed on the server that is limited to one project anyway.
+
+### Requirement
+
+When the organisation-level list is denied, fall back to the server's default project (`FLYTE_MCP_PROJECT`) fetched by
+name, or take a `scope` parameter that says so: `list_projects(scope: Literal["org", "default"] = "org")`. Test: a remote whose `Project.listall` raises unauthorized still returns the
+default project.
+
+### What the factory removes once it lands
+
+`_list_only_the_factory_project` (which already asks for the one project by name).
+
+## 13. Readiness on `/health`
+
+### Problem
+
+The app serves `/health` (`_mcp_app.py:171-173`), but the readiness probe hits `/` on the queue-proxy port, which a busy
+process answers late: "Readiness probe failed: Get http://...:8012/: context deadline exceeded". Each failure costs the
+revision about 30 s of `PENDING`, and the failures are visible only in the `SYSTEM` log lines.
+
+### Requirement
+
+`flyte.app.AppEnvironment(readiness_path="/health")` (or a `health_check` on the app spec) carried into the serialized app
+spec. Test: the serialized spec names `/health`.
+
+### What the factory removes once it lands
+
+Nothing today: the factory cannot set it, so `factory_mcp_health` reports `probe_failed` restarts (gap 7) instead.
+
+## 14. A telemetry opt-out for servers
+
+### Problem
+
+Library code in a long-running server sends Sentry crash reports (with frame locals) and usage counters, to a third party,
+and the only switch is the `DO_NOT_TRACK` environment variable, which is undocumented for apps.
+
+### Requirement
+
+`FlyteMCPAppEnvironment(telemetry=False)`, or `DO_NOT_TRACK` documented and set in the generated app environment by default.
+Test: the environment of the serialized app.
+
+### What the factory removes once it lands
+
+The `telemetry_env` entry the factory puts in every deployed environment for the MCP app (the factory's default,
+`docs/security.md`).
+
+## 15. Run and action URLs from a public console host
+
+### Problem
+
+Inside a pod the SDK builds run and action URLs from the endpoint it was configured with. On OSS that is the in-cluster
+service (`http://flyte-binary-http.flyte:8090/v2/...`), which the chat client cannot open, and the stock tools return it as
+if it were a link.
+
+### Requirement
+
+A public console base the SDK uses for every URL it returns, separate from the API endpoint:
+`flyte.init(..., console_url: str | None = None)` (and `FLYTE_CONSOLE_URL`); with none set, `Run.url` and `Action.url`
+return `None` rather than an in-cluster address when the endpoint is cluster-internal. Tests: an in-cluster endpoint with and
+without `console_url`; a public endpoint unchanged.
+
+### What the factory removes once it lands
+
+`_oss_follow.find_openable_url` and `fix_urls`, and the `console_host` rewrite.
 
 ## What 2.13.5 already changed under the factory's wrappers
 

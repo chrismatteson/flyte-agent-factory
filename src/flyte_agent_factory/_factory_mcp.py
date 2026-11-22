@@ -4,12 +4,18 @@ With `[mcp] auth = "union"` (the default on a Union backend) Union authenticates
 ingress (`requires_auth=True`) and Flyte runs each call as the caller, so a Union user's sign-in token or a
 Union API key both work as the bearer. What the caller may do inside the factory's project and domain is
 bounded by their Union auth (RBAC); this module only keeps every tool from reaching outside it
-(`_scoped_to_the_factory`).
+(`_build_scope_check`).
 
 With `auth = "proxy"` (the default on OSS) the app does no authentication of its own (`requires_auth=False`):
 it trusts whoever reaches it. It must sit behind an authenticating proxy (an OAuth proxy) and never be exposed
-on its own: anyone who can reach the app can launch and abort runs in the factory's project. It also asks
-Kubernetes for no CPU or memory (an empty `flyte.Resources()`), so it schedules on a lean node.
+on its own: anyone who can reach the app can launch and abort runs in the factory's project.
+
+Every served tool goes through one layer (`_serve`): the scope check, then the call budget
+(`_mcp_budget.run_within_budget`), then the OSS URL fix, then redaction, and one log line per call. See
+`_serve`'s docstring.
+
+SDK proposals: gaps 1 (scope), 4 (wrapping a registered tool) and 12 (list_projects) in
+docs/mcp-sdk-requirements.md; the factory-side or SDK-side decision for each tool is the table there.
 """
 
 from __future__ import annotations
@@ -29,15 +35,20 @@ from mcp.server.fastmcp import (
     Context as MCPContext,
 )  # annotations below are strings; FastMCP resolves them here
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from starlette.middleware import Middleware
 from starlette.routing import Match, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import (
+    _app_tools,
     _factory,
     _git,
     _grant_page,
     _grant_seal,
+    _mcp_budget,
+    _mcp_redact,
+    _oss_follow,
     _profile,
     _profile_oss,
     _resources,
@@ -53,9 +64,40 @@ from ._images import agent_image
 from ._policy import LAUNCH_MODEL
 from ._reserved import list_owner_reserved
 
-#: The tools the factory serves: every stock tool, as it always has. `_scoped_to_the_factory` is what limits
+#: The tools the factory serves: every stock tool, as it always has. `_build_scope_check` is what limits
 #: them to the factory's project and domain, and it covers a tool a newer SDK adds without a change here.
 TOOLS: tuple[str, ...] = tuple(ALL_MCP_TOOLS)
+#: The tools the factory adds to the stock ones (`get_app`, `activate_app` and `deactivate_app` keep their
+#: stock names and are served by `_app_tools`). Documented in docs/architecture.md, which a test holds equal.
+FACTORY_TOOLS: tuple[str, ...] = (
+    "get_app_status",
+    "get_app_logs",
+    "restart_app",
+    "factory_mcp_health",
+    "get_operation",
+)
+SERVED_TOOLS: tuple[str, ...] = TOOLS + FACTORY_TOOLS
+#: The tools that change state. A call to one that was cut off is joined, never repeated: a second
+#: `run_task` would start a second run. Every tool not named here only reads, and is simply run again.
+ACTING: tuple[str, ...] = (
+    "run_task",
+    "rerun_run",
+    "abort_run",
+    "abort_action",
+    "signal_condition",
+    "activate_app",
+    "deactivate_app",
+    "restart_app",
+    "delete_app",
+    "create_secret",
+    "update_secret",
+    "delete_secret",
+    "generate_secret",
+    "create_trigger",
+    "delete_trigger",
+    "activate_trigger",
+    "deactivate_trigger",
+)
 
 _mcp = PROFILE.mcp
 if _mcp is None:
@@ -71,6 +113,9 @@ _POLL_MAX_S = 10.0
 _SUCCESS_PHASES = ("succeeded", "recovered")
 #: Phases after which a run has no outputs coming, so a null `outputs` is the right answer straight away.
 _FAILURE_PHASES = ("failed", "aborted", "timed_out")
+#: The share of the call budget `wait_for_run` and `get_operation` plan to be done in: the rest is the slack
+#: that keeps the budget's own `still_working` answer from racing the call's.
+_FOLLOW_UP_BUDGET_SHARE = 0.95
 
 
 def _phase_name(phase: Any) -> str:
@@ -141,8 +186,11 @@ when a report is unavailable. SUCCEEDED alone does not mean review passed.
 The software factory builds projects in long-lived Claude sessions with Codex workers and
 independent review. It has {CAPACITY}; launches never fail for
 capacity: when none is free the launch waits in a queue and starts by itself.
-Launch with run_task(name="factory.launch", inputs=...), then wait_for_run(timeout_s=300), then
-get_run_io for the JSON result. After a run SUCCEEDED, wait_for_run and get_run_io wait up to
+Launch with run_task(name="factory.launch", inputs=...), then
+wait_for_run(timeout_s={_mcp_budget.WAIT_CAP_S:g}), then get_run_io for the JSON
+result. A call is cut off by the chat client at about {_mcp_budget.CLIENT_LIMIT_S:g}s,
+so timeout_s is capped at {_mcp_budget.WAIT_CAP_S:g}: a run still going comes back timed_out: true; call
+wait_for_run again. After a run SUCCEEDED, wait_for_run and get_run_io wait up to
 {_OUTPUTS_WAIT_S:g}s for its outputs to become readable; if get_run_io still returns outputs null with an
 outputs_error saying they are not yet readable, call get_run_io again. Inputs: brief (full markdown),
 name (lowercase slug, 2-41 letters, digits or hyphens), model (always pass it: {LAUNCH_MODEL} unless the
@@ -243,6 +291,16 @@ this server that the owner opens to type the value into a password field: give t
 ask for the value in chat; once they have used it, list_secrets shows the name. delete_secret removes one.
 list_apps, get_app, activate_app and deactivate_app, and
 list_triggers, get_trigger, activate_trigger and deactivate_trigger, manage this project's apps and triggers.
+get_app lists an app's environment and secret names, never values. get_app_status gives an app's status
+history and why it last failed (oom, crash, probe_failed, image_pull, secret_mount); get_app_logs reads its
+newest log lines, including those of replicas that have died; restart_app deactivates then activates it
+(never deletes), and refuses this server's own app; factory_mcp_health reports this server's uptime, restarts
+and errors.
+A call that takes longer than {_mcp_budget.TOOL_BUDGET_S:g}s returns
+{{"status": "still_working", "operation_id": ...}} and goes on in the server: do not repeat it (an acting
+call repeated with the same arguments joins the first), call get_operation(operation_id=...) for its result
+or progress. An unknown_operation answer means the server restarted: look at the effect (get_run,
+get_app_status) before acting again.
 """
 
 _public_url = os.environ.get("FACTORY_MCP_PUBLIC_URL", _mcp.public_url).rstrip("/")
@@ -265,6 +323,21 @@ _FETCH_DOCS = (
 )
 
 
+#: How late the event loop wakes from a 1 s sleep, for `factory_mcp_health`: a blocked loop shows as lag.
+LOOP_LAG = _mcp_budget.LoopLag()
+_loop_lag_task: asyncio.Task[None] | None = None
+
+
+def _start_loop_lag() -> None:
+    """Start the sampler on the server's own event loop, once.
+
+    The task is kept in a global because the loop holds only a weak reference to it.
+    """
+    global _loop_lag_task
+    if _loop_lag_task is None or _loop_lag_task.done():
+        _loop_lag_task = asyncio.ensure_future(LOOP_LAG.run())
+
+
 class _GrantPage:
     """ASGI middleware that serves the grant page at `PAGE_PATH`, ahead of the app's router.
 
@@ -274,6 +347,10 @@ class _GrantPage:
     which the stock environment offers no public hook for. A middleware installed through the documented
     `_starlette_middleware` hook is inside the stock auth middleware, as the page was when it was a
     `custom_route`: Union mode asks for the caller's sign-in, proxy mode asks for nothing.
+
+    Its first scope also starts the loop-lag sampler behind the health tool's `loop_lag_ms`: the stock
+    environment has no start-up hook, and this is the first code of ours that runs on the server's loop.
+    Removing this middleware would leave `loop_lag_ms` at zero.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -283,6 +360,9 @@ class _GrantPage:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Serve the page for a request to its path, pass any other request on."""
+        # The stock environment has no start-up hook of its own, but this runs on the server's loop from its
+        # first scope: the lifespan start under uvicorn, else the first request.
+        _start_loop_lag()
         if scope["type"] == "http":
             match, child_scope = self.route.matches(scope)
             if match is Match.FULL:
@@ -296,24 +376,36 @@ class FactoryMCPAppEnvironment(FlyteMCPAppEnvironment):
     """The stock Flyte MCP app, plus the factory's grant page."""
 
     def _starlette_middleware(self) -> list[Middleware]:
-        return [*super()._starlette_middleware(), Middleware(_GrantPage)]
+        # The disconnect watch first, so it is outermost: a dropped request cancels every layer under it.
+        return [
+            Middleware(_mcp_budget.CancelOnDisconnect),
+            *super()._starlette_middleware(),
+            Middleware(_GrantPage),
+        ]
 
 
 _QUEUE_SECRETS, _QUEUE_ENV = _union_identity.pod_for(PROFILE, "queue")  # none on OSS
 _PROXY_AUTH = _profile_oss.mcp_auth(PROFILE) == "proxy"
 app = FactoryMCPAppEnvironment(
-    name="factory-mcp",
+    name=_app_tools.DEFAULT_OWN_APP,
     image=agent_image().with_pip_packages(FLYTE_PIN, "mcp>=1.30.0,<2").with_commands([_FETCH_DOCS]),
     requires_auth=not _PROXY_AUTH,
     tools=list(TOOLS),
-    task_allowlist=None,  # any task in the factory project; `_scoped_to_the_factory` bounds it
+    task_allowlist=None,  # any task in the factory project; `_build_scope_check` bounds it
     instructions=INSTRUCTIONS,
     allowed_hosts=[urlparse(_public_url).netloc] if _public_url else None,
     allowed_origins=[_public_url] if _public_url else None,
     **_state_pod.environment_kwargs(PROFILE, "factory", app=True),
     secrets=[*_QUEUE_SECRETS],
-    env_vars={"FLYTE_MCP_PROJECT": PROJECT, "FLYTE_MCP_DOMAIN": DOMAIN, **_profile.pod_env(), **_QUEUE_ENV},
-    # Spelled out: the app defaults to 1 CPU / 512Mi when it gets None, and `mcp` asks for nothing.
+    env_vars={
+        "FLYTE_MCP_PROJECT": PROJECT,
+        "FLYTE_MCP_DOMAIN": DOMAIN,
+        # So a separately named test app knows itself and `restart_app` can refuse to stop its own server.
+        _app_tools.OWN_APP_ENV: _app_tools.DEFAULT_OWN_APP,
+        **_profile.pod_env(),
+        **_QUEUE_ENV,
+    },
+    # Spelled out: the app defaults to 1 CPU / 512Mi when it gets None.
     resources=_resources.for_component(_profile.current(), "mcp").to_flyte(),
     # One replica: the secret-input links `create_secret` mints live in the process's memory.
     scaling=flyte.app.Scaling(replicas=1),
@@ -343,9 +435,14 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, ToolFn]) -> dict[str, ToolF
         project: str | None,
         domain: str | None,
         ctx: MCPContext | None,  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
+        wait_s: float | None = None,
     ) -> dict[str, Any]:
-        """Poll for the run's outputs until they are there, `outputs_error` is set or the wait is spent."""
-        deadline = time.monotonic() + _OUTPUTS_WAIT_S
+        """Poll for the run's outputs until they are there, `outputs_error` is set or the wait is spent.
+
+        `wait_s` is shorter than `_OUTPUTS_WAIT_S` when the caller has little of its call budget left.
+        """
+        wait_s = _OUTPUTS_WAIT_S if wait_s is None else min(wait_s, _OUTPUTS_WAIT_S)
+        deadline = time.monotonic() + wait_s
         delay = _POLL_FIRST_S
         while True:
             # outputs_only: the inputs are already in hand, and each poll would fetch them again.
@@ -355,7 +452,7 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, ToolFn]) -> dict[str, ToolF
             if time.monotonic() + delay > deadline:
                 io["outputs_error"] = (
                     f"outputs not yet readable: Flyte had not published the outputs of run {name!r} "
-                    f"after {_OUTPUTS_WAIT_S:g}s. Retry get_run_io; if the run may still be going, "
+                    f"after {wait_s:g}s. Retry get_run_io; if the run may still be going, "
                     "wait_for_run tells the two apart."
                 )
                 return io
@@ -371,16 +468,27 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, ToolFn]) -> dict[str, ToolF
     ) -> dict:  # type: ignore[type-arg]  # bare on purpose, see `get_run_io`
         """Block until a run reaches a terminal phase, then report it.
 
-        Prefer this over polling `get_run` in a loop. Always pass `timeout_s` for runs that
-        might be long. On timeout this does *not* error: it returns the run's current,
-        non-terminal status with `timed_out: true`. A run that SUCCEEDED is reported only once
-        its outputs are readable by `get_run_io` (`outputs_ready: true`), up to a bounded wait;
-        if they are not, `outputs_ready` is false and `get_run_io` should be retried.
+        Prefer this over polling `get_run` in a loop. `timeout_s` is capped at WAIT_CAP_S (a call is cut off
+        by the client at about 230 s); the result then says `timeout_capped_to_s`. On timeout this does
+        *not* error: it returns the run's current, non-terminal status with `timed_out: true`, and the
+        call can be repeated. A run that SUCCEEDED is reported only once its outputs are readable by
+        `get_run_io` (`outputs_ready: true`), up to a bounded wait; if they are not, `outputs_ready` is
+        false and `get_run_io` should be retried.
         """
-        result = await stock_wait(name=name, timeout_s=timeout_s, project=project, domain=domain, ctx=ctx)
+        started = time.monotonic()
+        # Read at call time, so a test can patch them. Unbounded or too long is clamped: past the client's
+        # cut the call would only come back as a 502.
+        capped = timeout_s is None or timeout_s > _mcp_budget.WAIT_CAP_S
+        wait_s = _mcp_budget.WAIT_CAP_S if capped else timeout_s
+        result = await stock_wait(name=name, timeout_s=wait_s, project=project, domain=domain, ctx=ctx)
         if _phase_name(result.get("phase")) in _SUCCESS_PHASES:
-            io = await poll_outputs(name, project, domain, ctx)
+            # The outputs wait runs inside the same call, so it gets what the budget has left (never more than
+            # `_OUTPUTS_WAIT_S`), and the call answers for itself instead of coming back as `still_working`.
+            left = _FOLLOW_UP_BUDGET_SHARE * _mcp_budget.TOOL_BUDGET_S - (time.monotonic() - started)
+            io = await poll_outputs(name, project, domain, ctx, wait_s=max(left, 0.0))
             result["outputs_ready"] = io.get("outputs") is not None
+        if capped:
+            result["timeout_capped_to_s"] = _mcp_budget.WAIT_CAP_S
         return result
 
     async def get_run_io(
@@ -425,6 +533,8 @@ def _wrap_tools_to_wait_for_outputs(stock: dict[str, ToolFn]) -> dict[str, ToolF
         polled = await poll_outputs(name, project, domain, ctx)
         return {**io, **{k: v for k, v in polled.items() if k in ("outputs", "outputs_error")}}
 
+    # The cap is the budget's constant, so the tool description cannot drift from the clamp above.
+    wait_for_run.__doc__ = (wait_for_run.__doc__ or "").replace("WAIT_CAP_S", f"{_mcp_budget.WAIT_CAP_S:g}")
     return {"wait_for_run": wait_for_run, "get_run_io": get_run_io}
 
 
@@ -442,20 +552,20 @@ def _scoped_arguments(fn: ToolFn) -> dict[str, str]:
     }
 
 
-def _scoped_to_the_factory(name: str, fn: ToolFn) -> ToolFn:
-    """Wrap `fn` so it refuses a project or domain other than the factory's, else calls through.
+def _build_scope_check(name: str, fn: ToolFn) -> Callable[..., None] | None:
+    """Return a check that refuses a project or domain other than the factory's, or None if `fn` takes none.
 
     The stock tools take any `project` and `domain` (and `run_task`, a `run_project` and `run_domain` to
     create the run elsewhere) and run the call there as the caller, so without this chat could reach every
     project the caller's Union RBAC allows. Empty means "the server default", which is the factory's
-    (`FLYTE_MCP_PROJECT`/`FLYTE_MCP_DOMAIN`).
+    (`FLYTE_MCP_PROJECT`/`FLYTE_MCP_DOMAIN`). The check runs before the call is made into an operation.
     """
     signature = inspect.signature(fn)
     scoped_arguments = _scoped_arguments(fn)
+    if not scoped_arguments:
+        return None
 
-    # functools.wraps copies the signature, annotations and docstring, so FastMCP builds the same schema.
-    @functools.wraps(fn)
-    async def scoped(*args: Any, **kwargs: Any) -> Any:
+    def check(*args: Any, **kwargs: Any) -> None:
         given = signature.bind(*args, **kwargs).arguments
         for argument, factory_value in scoped_arguments.items():
             value = given.get(argument)
@@ -464,20 +574,21 @@ def _scoped_to_the_factory(name: str, fn: ToolFn) -> ToolFn:
                     f"{name}: {argument} {value!r} is not allowed; this server is limited to "
                     f"{argument.rsplit('_', 1)[-1]} {factory_value!r}."
                 )
-        return await fn(*args, **kwargs)
 
-    return scoped
+    return check
 
 
-def _list_only_the_factory_project(stock: ToolFn) -> ToolFn:
-    """`list_projects` that shows only the factory's project."""
+def _list_only_the_factory_project(stock_list: ToolFn, stock_get_project: ToolFn) -> ToolFn:
+    """`list_projects` that shows only the factory's project, fetched by name.
 
-    @functools.wraps(stock)
+    The stock tool pages through the organisation's projects, which a project-scoped key (the server's own
+    when it acts as the queue tier) is not allowed to list; one `get_project` is all it needs.
+    """
+
+    @functools.wraps(stock_list)
     async def list_projects(limit: int = 100, ctx: MCPContext | None = None) -> Any:  # type: ignore[type-arg]
-        # Ask for everything: the stock limit counts projects before this filter drops all but one.
-        everything = cast(list[dict[str, Any]], await stock(limit=10**6, ctx=ctx))
-        # Stock returns at least one project for any limit (it checks the count after appending).
-        return [p for p in everything if p["id"] == PROJECT][: max(limit, 1)]
+        # `limit` is ignored: stock returns at least one project for any limit, and there is only one.
+        return [await stock_get_project(name=PROJECT, ctx=ctx)]
 
     return list_projects
 
@@ -597,12 +708,107 @@ def _registered_tool_functions(server: Any) -> dict[str, Any]:
     return {tool.name: tool for tool in server._tool_manager.list_tools()}
 
 
-def _use_the_factorys_tools(environment: FlyteMCPAppEnvironment) -> None:
-    """Replace the stock tools in `environment.mcp` that the factory needs different, and scope every one.
+def _note_steps(fn: ToolFn) -> ToolFn:
+    """Bind `on_step` of an app tool to `_mcp_budget.note_step` and hide it from the client's schema.
 
-    The patient `wait_for_run` and `get_run_io`, `list_projects`, `get_project` and `signal_condition` come
-    first, and then every tool that takes a project or a domain is wrapped to refuse any but the factory's.
-    Tools with neither (`whoami`, the searches) are left alone.
+    A call that is cut off then shows in its `still_working` result how far it got.
+    """
+    signature = inspect.signature(fn)
+    if "on_step" not in signature.parameters:
+        return fn
+
+    @functools.wraps(fn)
+    async def with_steps(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return await fn(*args, on_step=_mcp_budget.note_step, **kwargs)
+
+    # A bare `dict`, as the tools declare it: FastMCP turns `dict[str, Any]` into structured output, a second
+    # content block that clients do not expect. The string annotation is resolved here, not by FastMCP.
+    with_steps.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[p for p in signature.parameters.values() if p.name != "on_step"],
+        return_annotation=dict,
+    )
+    return with_steps
+
+
+def _serve(name: str, fn: ToolFn) -> ToolFn:
+    """Wrap `fn` in the one layer every served tool goes through, in this order.
+
+    Scope check (a refusal is logged as `refused` and makes no operation), then the call budget
+    (`still_working` past `TOOL_BUDGET_S`; an acting tool is joined, not repeated), then the OSS URL fix,
+    then redaction. Redaction is outermost, so `still_working` and `get_operation` results are redacted too,
+    and so is the message of an error the call raises.
+    The per-call log line is the budget's. One place wraps every tool, so "every served tool" is true by
+    construction; a test checks it against the live tool list.
+    """
+    budgeted = _mcp_budget.run_within_budget(
+        name, fn, acting=name in ACTING, check=_build_scope_check(name, fn)
+    )
+
+    @functools.wraps(fn)
+    async def served(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = await budgeted(*args, **kwargs)
+        except Exception as exc:
+            # The client sees an error's message, so it is redacted like a result. The original is not
+            # chained: FastMCP would not send it, but a log of the cause would carry the secret.
+            message = await asyncio.to_thread(_mcp_redact.redact_text, str(exc))
+            if message == str(exc):
+                raise
+            raise ToolError(message) from None
+        # In a thread, always: a large result is a long regex scan, and it must not stall the other calls.
+        return await asyncio.to_thread(
+            lambda: _mcp_redact.redact_result(_oss_follow.fix_urls(result, PROFILE))
+        )
+
+    served.served_layer = True  # type: ignore[attr-defined]  # what the tests look for on every tool
+    return cast(ToolFn, served)
+
+
+def _get_operation_within_the_budget_share() -> ToolFn:
+    """Return the budget's `get_operation`, its wait held to `_FOLLOW_UP_BUDGET_SHARE` of the call budget.
+
+    The share is bound here and hidden from the client's schema, so the tool's name and parameters are the
+    budget's own, and so is its description.
+    """
+    signature = inspect.signature(_mcp_budget.get_operation)
+    bound = functools.partial(_mcp_budget.get_operation, budget_share=_FOLLOW_UP_BUDGET_SHARE)
+    functools.update_wrapper(bound, _mcp_budget.get_operation)
+    # A bare `dict`, as in `_note_steps`.
+    bound.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=[p for p in signature.parameters.values() if p.name != "budget_share"],
+        return_annotation=dict,
+    )
+    return cast(ToolFn, bound)
+
+
+def _summarise_calls() -> dict[str, int]:
+    """Count the calls of the last hour in the budget's ring (which holds at most `CALL_LOG_MAX`)."""
+    since = time.monotonic() - 3600
+    log = [entry for entry in _mcp_budget.CALL_LOG if entry[3] >= since]
+    durations = sorted(duration for _, _, duration, _ in log)
+    return {
+        "count": len(log),
+        "still_working": sum(1 for _, outcome, _, _ in log if outcome == "still_working"),
+        "dropped": sum(1 for _, outcome, _, _ in log if outcome == "dropped"),
+        "tool_errors": sum(1 for _, outcome, _, _ in log if outcome.startswith("error:")),
+        "p95_ms": _mcp_budget.pick_percentile(durations, 0.95) if durations else 0,
+    }
+
+
+def _read_loop_lag() -> dict[str, Any]:
+    snapshot = LOOP_LAG.summarise_lag()
+    return {"max_5m": snapshot["max_ms"], "p95_5m": snapshot["p95_ms"]}
+
+
+_READS_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+
+
+def _use_the_factorys_tools(environment: FlyteMCPAppEnvironment) -> None:
+    """Replace the stock tools in `environment.mcp` with the factory's and add the factory's own.
+
+    The patient `wait_for_run` and `get_run_io`, `list_projects`, `get_project`, `signal_condition`, the app
+    tools and (on OSS) `get_logs` come first; then every tool, those and the stock ones alike, is wrapped by
+    `_serve`. The five `FACTORY_TOOLS` are added last.
     """
     server = environment.mcp
     assert server is not None  # built in the environment's __post_init__
@@ -611,21 +817,52 @@ def _use_the_factorys_tools(environment: FlyteMCPAppEnvironment) -> None:
 
     replacements: dict[str, ToolFn] = {}
     replacements.update(_wrap_tools_to_wait_for_outputs(stock))
-    replacements["list_projects"] = _list_only_the_factory_project(stock["list_projects"])
+    replacements["list_projects"] = _list_only_the_factory_project(
+        stock["list_projects"], stock["get_project"]
+    )
     replacements["get_project"] = _get_only_the_factory_project(stock["get_project"])
     replacements["signal_condition"] = _signal_condition_that_reaches_the_project(
         stock["signal_condition"], stock["list_conditions"]
     )
+    replacements["get_logs"] = _oss_follow.wrap_get_logs(stock["get_logs"], PROFILE)
+    # The stock app tools return `to_dict()`, env values included; these list names only.
+    for app_tool in ("get_app", "activate_app", "deactivate_app"):
+        replacements[app_tool] = cast(ToolFn, getattr(_app_tools, app_tool))
     for name, fn in stock.items():
-        fn = replacements.get(name, fn)
-        if _scoped_arguments(fn):
-            fn = _scoped_to_the_factory(name, fn)
-        if fn is stock[name]:
-            continue
         tool = registered[name]
         server.remove_tool(name)
         # Annotations are the registered tool's: the SDK's own table of them is private.
-        server.add_tool(fn, name=name, title=tool.title, annotations=tool.annotations)
+        server.add_tool(
+            _serve(name, _note_steps(replacements.get(name, fn))),
+            name=name,
+            title=tool.title,
+            annotations=tool.annotations,
+        )
+
+    health = _app_tools.make_factory_mcp_health(
+        _app_tools.HealthInputs(
+            calls=_summarise_calls,
+            loop_lag=_read_loop_lag,
+            operations_in_flight=lambda: _mcp_budget.OPERATIONS.count_in_flight(),
+            budget_s=_mcp_budget.TOOL_BUDGET_S,
+            started_at=_mcp_budget.SERVER_STARTED_AT,
+        )
+    )
+    added: dict[str, tuple[ToolFn, ToolAnnotations]] = {
+        "get_app_status": (cast(ToolFn, _app_tools.get_app_status), _READS_ONLY),
+        "get_app_logs": (cast(ToolFn, _app_tools.get_app_logs), _READS_ONLY),
+        "restart_app": (
+            cast(ToolFn, _app_tools.restart_app),
+            ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+            ),
+        ),
+        "factory_mcp_health": (health, _READS_ONLY),
+        "get_operation": (_get_operation_within_the_budget_share(), _READS_ONLY),
+    }
+    assert tuple(added) == FACTORY_TOOLS
+    for name, (fn, hints) in added.items():
+        server.add_tool(_serve(name, _note_steps(fn)), name=name, annotations=hints)
 
 
 _use_the_factorys_tools(app)

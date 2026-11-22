@@ -174,7 +174,8 @@ inbox right now, so tell the user.
 
 Launches never fail for capacity: one project runs per slot (or up to `[concurrency] max_projects`), and excess launches queue automatically.
 Do not pick a slot. Call `run_task(name="factory.launch", inputs=...)`, then
-`wait_for_run(name=<run id>, timeout_s=300)` and `get_run_io(name=<run id>)`. Inputs:
+`wait_for_run(name=<run id>, timeout_s=170)` and `get_run_io(name=<run id>)`. `timeout_s` is capped at 170 (the
+chat client cuts a call at about 230 s): a run still going returns `timed_out: true`, so call `wait_for_run` again. Inputs:
 
 - `brief`: full markdown; see Writing the brief.
 - `name`: lowercase slug of 2–41 letters, digits or hyphens; starts with a letter or digit, no trailing `-`, no `--`.
@@ -338,8 +339,16 @@ permissions. Beyond launching and following projects:
 - restart the deployer after a failed deploy (below, under deployment diagnostics);
 - `list_secrets` shows secret names and types; no tool returns a value. Although `create_secret` and
   `delete_secret` exist, engine credentials must be stored or rotated with local commands, never sent through chat;
-- `list_apps`, `get_app`, `activate_app` and `deactivate_app` manage the factory's apps; `list_triggers`,
-  `get_trigger`, `activate_trigger` and `deactivate_trigger` its triggers (the queue sweep is one);
+- `list_apps`, `get_app`, `activate_app` and `deactivate_app` manage the factory's apps (`get_app` lists environment
+  and secret names, never values); `get_app_status` gives an app's status history and why it last failed (`oom`,
+  `crash`, `probe_failed`, `image_pull`, `secret_mount`); `get_app_logs` reads its newest log lines, including
+  those of replicas that have died; `restart_app` deactivates then activates it (never deletes) and refuses the
+  MCP server's own app; `factory_mcp_health` reports the server's uptime, restarts and errors. `list_triggers`,
+  `get_trigger`, `activate_trigger` and `deactivate_trigger` manage its triggers (the queue sweep is one);
+- a call that takes longer than 200 s returns `{"status": "still_working", "operation_id": ...}` and goes on in the
+  server. Do not repeat it (an acting call repeated with the same arguments joins the first): call
+  `get_operation(operation_id=...)` for the result or progress. `unknown_operation` means the server restarted: check
+  the effect with `get_run` or `get_app_status` before acting again;
 - `list_tasks` and `get_task` show what is registered; `rerun_run` repeats a run and `abort_action` stops one action;
 - `search_flyte_sdk_examples`, `search_flyte_docs_examples` and `search_full_docs` search the Flyte docs.
 

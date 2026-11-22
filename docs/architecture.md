@@ -92,10 +92,20 @@ in the same way; a waiver is always the owner's decision ([contributing.md](cont
 The factory MCP is Flyte's stock `FlyteMCPAppEnvironment` behind Union sign-in, so every call runs as the caller and
 Union RBAC applies ([factory-mcp-setup.md](factory-mcp-setup.md)); the wrappers around the stock server are
 listed in [mcp-stock-move.md](mcp-stock-move.md). The server exposes every stock tool
-(`TOOLS` in `_factory_mcp.py` is `ALL_MCP_TOOLS`). Their scope is the factory's project and domain, enforced by the server's own
+(`TOOLS` in `_factory_mcp.py` is `ALL_MCP_TOOLS`) and five of its own (`FACTORY_TOOLS`); `SERVED_TOOLS` is both, and a
+test holds the table below equal to what the server lists, in both directions. Their scope is the factory's project and domain, enforced by the server's own
 project/domain check: a call naming another project or domain is refused before any request to Union, and
 `list_projects` shows only the factory project. What the caller may do inside that scope is bounded by the caller's
 Union auth (the RBAC of the bearer token or API key).
+
+Every call goes through one layer (`_serve` in `_factory_mcp.py`): the scope check, then a time budget, then (on OSS) the
+URL fix, then redaction of every secret shape, wherever it starts, including inside JSON- and URL-encoded text and after a terminal colour code (but never the *name* of a secret the
+pod itself carries in `AGENT_FACTORY_*_SECRET`, which is what a `secret_mount` diagnosis needs), and
+one log line (tool, duration, outcome; never the arguments). The budget is 200 s, under the roughly 230 s at which the claude.ai connector cuts a call: a call that takes
+longer returns `{"status": "still_working", "operation_id": ...}` and goes on in the server, and `get_operation` gives its
+result. An acting tool (`ACTING`) called again with the same arguments before its result was delivered joins the first
+call instead of acting twice. A request the client drops is cancelled on the server (`CancelOnDisconnect` watches the
+transport's disconnect); the work goes on and an identical repeat joins it. The operations live in the server's memory, so after a restart an id is `unknown_operation`.
 
 | Tool | What it does |
 |---|---|
@@ -104,7 +114,7 @@ Union auth (the RBAC of the bearer token or API key).
 | `list_tasks` | lists the registered tasks |
 | `get_run` | reads a run's phase and metadata |
 | `get_run_io` | reads a run's inputs and outputs; waits up to 90 seconds for outputs that Union's read model has not caught up on |
-| `wait_for_run` | waits for a run to end, with the same patience for outputs |
+| `wait_for_run` | waits for a run to end, with the same patience for outputs; `timeout_s` is capped at 170 s (the result then says `timeout_capped_to_s`), and a run still going comes back `timed_out: true` to be waited on again |
 | `list_runs` | lists runs, filtered by task name |
 | `list_actions` | lists the actions of a run |
 | `get_action` | reads one action, including its error info |
@@ -114,13 +124,18 @@ Union auth (the RBAC of the bearer token or API key).
 | `abort_run` | aborts a run; unsaved work is lost, so prefer `/stop` through `direct-NNN` |
 | `rerun_run` | starts a run again with the same inputs |
 | `abort_action` | aborts one action of a run |
-| `list_apps`, `get_app` | list and read the factory's apps |
-| `activate_app`, `deactivate_app` | turn an app on or off |
+| `list_apps`, `get_app` | list and read the factory's apps; `get_app` lists environment and secret names, never values |
+| `activate_app`, `deactivate_app` | turn an app on or off and wait (up to 150 s) until it is; `deactivate_app` refuses the MCP server's own app |
+| `get_app_status` | an app's status history (oldest first) and why it last failed, as `oom`, `crash`, `probe_failed`, `image_pull`, `secret_mount` or `unknown`, with the raw message |
+| `get_app_logs` | an app's newest log lines (newest last, at most 1000), each with its replica and revision, live and persisted, so the replicas that died are readable; `since`, `until`, `replica`, `revision` and `source` filter |
+| `restart_app` | deactivates then activates an app and reports the revision and replicas before and after; never deletes; refuses the MCP server's own app, since stopping it ends the call that would start it again |
+| `factory_mcp_health` | this server's revision, uptime, restarts in 24 h with their reasons, errors in the last hour, call counts, event-loop lag and operations in flight |
+| `get_operation` | the result, or the progress, of a call that returned `still_working`; `unknown_operation` after a server restart |
 | `delete_app` | deletes an app; it comes back only by a redeploy, so prefer `deactivate_app` |
 | `list_triggers`, `get_trigger` | list and read the factory's triggers (the queue sweep, for one) |
 | `activate_trigger`, `deactivate_trigger` | turn a trigger on or off |
 | `create_trigger`, `delete_trigger` | add or remove a schedule on a task; the factory's own schedules (the queue sweep) come from its deployed environments |
-| `list_projects`, `get_project` | show the factory project only; `get_project` refuses any other name |
+| `list_projects`, `get_project` | show the factory project only (`list_projects` reads it by name, as the factory's own key may not list the organisation); `get_project` refuses any other name |
 | `list_secrets`, `get_secret` | list secret names and types, or whether one exists and is ready; no tool returns a secret value |
 | `create_secret`, `update_secret`, `delete_secret` | write, replace or remove a secret: create and update return a one-time link the owner opens to type the value, which never goes through chat. Engine credentials are not set this way: they are stored with local commands ([quickstart §4](quickstart.md#4-store-engine-credentials-locally)), never sent through chat |
 | `search_flyte_sdk_examples`, `search_flyte_docs_examples`, `search_full_docs` | search the Flyte SDK examples, the Union examples and the Union docs, which the app image carries in `/opt/flyte-mcp-docs` |
@@ -604,6 +619,7 @@ the session role definitions, the browser image files and the workspace template
 | `_workspace.py` | git helpers over a workspace, and creating a workspace from the shipped template |
 | `_ci_status.py` | read-only CI results for the session's own branch, served by the supervisor |
 | `_errors.py` | exception tuples for best-effort calls |
+| `_timefmt.py` | the time formats of the MCP tools' results (UTC, to the second for tool fields, to the millisecond for log lines), shared by modules that load with and without `mcp` |
 | `child.py` | `attach()`: lets the session run work as child actions of its own run |
 
 **The coordinator and its helpers**
@@ -684,7 +700,11 @@ the session role definitions, the browser image files and the workspace template
 | `_factory_status.py` | reading an older project report's HTML for the timeline and activity |
 | `_tick_guard.py` | a scheduled tick skips itself while an earlier run of its task is live |
 | `_queue.py` | the launch queue's storage and the reserve file in the factory's state store (the branch, on the git backend) |
-| `_factory_mcp.py` | the factory MCP server: the stock tools in `TOOLS`, the project/domain check that limits them, and `CHAT_TASKS`, the tasks its instructions steer chat to |
+| `_factory_mcp.py` | the factory MCP server: the tools in `SERVED_TOOLS`, the layer every one goes through (scope, budget, redaction), and `CHAT_TASKS`, the tasks its instructions steer chat to |
+| `_mcp_budget.py` | the per-call time budget, the operations a cut-off call leaves behind (`get_operation`), the call log and the event-loop lag sampler |
+| `_mcp_redact.py` | masks secrets in every tool result, keeping git SHAs, digests and UUIDs readable |
+| `_app_tools.py`, `_app_logs.py` | the app tools (`get_app`, `get_app_status`, `get_app_logs`, `restart_app`, `activate_app`, `deactivate_app`, `factory_mcp_health`) and the reader of an app's logs through the public log services |
+| `_oss_follow.py` | what exists only because the backend is OSS: `get_logs` with the real attempt, run reports from storage, openable URLs |
 
 **Planning, the loop and the board**
 

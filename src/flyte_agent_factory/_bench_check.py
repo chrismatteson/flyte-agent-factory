@@ -94,6 +94,8 @@ env = flyte.TaskEnvironment(
             ]
         )
     ),
+    # Not `pod_env()`: this pod runs unreviewed code without credentials, so it gets no profile text.
+    env_vars=_profile.telemetry_env(_profile.current()),
     # Heavy and optional: not in the default budget (`_resources`).
     resources=_resources.for_component(_profile.current(), "bench").to_flyte(),
     # A missed check is rerun with the case; it may be preempted.

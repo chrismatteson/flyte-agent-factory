@@ -355,9 +355,25 @@ def mcp_under(monkeypatch):
 def test_the_mcp_app_trusts_its_proxy_on_oss(mcp_under):
     app = mcp_under(EXAMPLE_OSS).app
     assert app.requires_auth is False
-    assert app.resources == flyte.Resources()
+    # The `mcp` default on every backend (#49: as BestEffort it was the first pod OOM-killed).
+    assert app.resources == flyte.Resources(cpu=("100m", "1"), memory=("256Mi", "512Mi"))
     assert not app.secrets
     assert app.env_vars is not None and app.env_vars["_U_EP_OVERRIDE"] == ENDPOINT
+
+
+def test_the_serialized_mcp_app_names_each_env_variable_once_on_oss(mcp_under):
+    """Knative rejects a duplicate env name, and the endpoint variables are already in `app.env_vars`.
+
+    The SDK has no public serializer, hence the private one (as `test_deploy_personal_browser` does).
+    """
+    from flyte.app._runtime.app_serde import translate_app_env_to_idl
+    from flyte.models import SerializationContext
+
+    app = mcp_under(EXAMPLE_OSS).app
+    spec = translate_app_env_to_idl(app, SerializationContext(version="v1", root_dir=ROOT / "src"))
+    names = [kv.key for kv in spec.spec.container.env]
+    assert {"_U_EP_OVERRIDE", "_U_INSECURE"} <= set(names)
+    assert len(names) == len(set(names))
 
 
 def test_an_empty_resources_leaves_every_request_unset():
@@ -393,9 +409,10 @@ def test_the_example_oss_profile_deploys_offline_without_keys(mcp_under, monkeyp
     assert _builder_the_init_asks_for(monkeypatch, EXAMPLE_OSS, tmp_path) == "local"
     app = mcp_under(EXAMPLE_OSS).app
     assert app.requires_auth is False
-    assert app.resources == flyte.Resources()
+    # The `mcp` default on every backend (#49: as BestEffort it was the first pod OOM-killed).
+    assert app.resources == flyte.Resources(cpu=("100m", "1"), memory=("256Mi", "512Mi"))
     assert app.resources is not None
-    assert (app.resources.cpu, app.resources.memory) == (None, None)
+    assert (app.resources.cpu, app.resources.memory) == (("100m", "1"), ("256Mi", "512Mi"))
 
 
 # --- environments that get the endpoint without the profile text ---------------------------
@@ -432,9 +449,10 @@ def test_the_documented_oss_path_end_to_end(mcp_under, monkeypatch, tmp_path):
     assert _builder_the_init_asks_for(monkeypatch, EXAMPLE_OSS, tmp_path) == "local"
     app = mcp_under(EXAMPLE_OSS).app
     assert app.requires_auth is False
-    assert app.resources == flyte.Resources()
+    # The `mcp` default on every backend (#49: as BestEffort it was the first pod OOM-killed).
+    assert app.resources == flyte.Resources(cpu=("100m", "1"), memory=("256Mi", "512Mi"))
     assert app.resources is not None
-    assert (app.resources.cpu, app.resources.memory) == (None, None)
+    assert (app.resources.cpu, app.resources.memory) == (("100m", "1"), ("256Mi", "512Mi"))
 
 
 # --- the docs cannot drift from the example ------------------------------------------------
@@ -526,6 +544,7 @@ def test_every_environment_that_reaches_flyte_gets_the_oss_endpoint():
 
     src = ROOT / "src"
     missing = []
+    telemetry_only = []
     for path in sorted(src.rglob("*.py")):
         source = path.read_text()
         for node in ast.walk(ast.parse(source)):
@@ -534,10 +553,18 @@ def test_every_environment_that_reaches_flyte_gets_the_oss_endpoint():
             text = ast.get_source_segment(source, node.value) or ""
             if "pod_env" in text or "endpoint_env" in text:
                 continue
+            if text == "_profile.telemetry_env(_profile.current())":
+                # Only the SDK's crash-report switch (see REPORT.md, crash reporting, and
+                # docs/security.md): a pod that never calls Flyte.
+                telemetry_only.append(str(path.relative_to(src)))
+                continue
             missing.append(f"{path.relative_to(src)}:{node.value.lineno}")
     # Left out on purpose: the probe/doctor environments that run a shell script and never call Flyte, and
     # `native_child_probe`'s leaf `child_env` (they have no `env_vars=` at all, so are not listed here).
     assert missing == [], f"env_vars without the OSS endpoint: {missing}"
+    # The one pod that gets the telemetry switch and nothing else is the bench check, which runs unreviewed
+    # candidate code without credentials and never reaches Flyte.
+    assert telemetry_only == ["flyte_agent_factory/_bench_check.py"]
 
 
 def test_the_secrets_the_oss_docs_create_are_exactly_the_ones_the_example_deploy_mounts():
