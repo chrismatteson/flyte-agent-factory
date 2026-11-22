@@ -3,12 +3,14 @@
     promote.py import  <target-url> <project-dir> [--ref BRANCH] [--path DIR] [--new]
     promote.py deliver <project-dir> <branch> [--to URL] [--fork URL] [--title TEXT]
                        [--base SHA] [--dco | --no-dco] [--fixes OWNER/REPO#N] [--dry-run] [--replace]
+                       [--checks off|advisory|required]
 
 Uses YOUR git credentials and identity; the factory holds none for the target. `import` commits the
 target's tree and `promote.toml` in the workspace (and pushes nothing). `deliver` makes one commit by you on a
-branch of the target's current default branch, scans it, runs the target's own CI, pushes and opens the
-pull request; it never merges. A branch that already exists on the target is replaced only if it is your
-earlier promotion, or with `--replace`. For a new repository (`--new`) it pushes the first commit and opens no
+branch of the target's current default branch, scans it, pushes and opens the pull request; it never
+merges. The target's CI and coverage are not rerun unless `--checks` asks (the PR's CI is the gate). A
+branch that already exists on the target is replaced only if it is your earlier promotion, or with
+`--replace`. For a new repository (`--new`) it pushes the first commit and opens no
 pull request. See `flyte_agent_factory._promote` for the steps.
 """
 
@@ -67,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="overwrite the branch if it exists and is not your earlier promotion",
     )
+    deliver.add_argument(
+        "--checks",
+        choices=_promote.CHECKS,
+        default="off",
+        help="rerun the target's CI and coverage before pushing: off (default; the PR's CI is the gate), "
+        "advisory (report failures in the PR body) or required (refuse on anything but a pass)",
+    )
     return parser
 
 
@@ -94,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         fixes=args.fixes,
         dry_run=args.dry_run,
         replace=args.replace,
+        checks=args.checks,
     )
     print(f"{report.stage}: {report.message}" + (f"\n{report.url}" if report.url else ""))
     return 0 if report.ok else 1

@@ -141,15 +141,18 @@ stands for the project's path in your workspace checkout, such as `../agent-work
    listed in the project's `SUMMARY.md`.
 3. **Review.** As for every project. Only committed, reviewed content is delivered.
 4. **Deliver.** `python ops/promote.py deliver projects/<name> <branch> [--to URL] [--fork URL] [--title TEXT]
-   [--base SHA] [--dco | --no-dco] [--fixes OWNER/REPO#N] [--dry-run] [--replace]` replays the project's changes onto the
+   [--base SHA] [--dco | --no-dco] [--fixes OWNER/REPO#N] [--dry-run] [--replace]
+   [--checks off|advisory|required]` replays the project's changes onto the
    target's current default branch as one commit by the operator's git identity (`user.name` and `user.email`
-   must be set), scans what the commit adds (`ops/scan_public.py`), reruns the target's CI and coverage, and
-   pushes the branch and opens or updates a pull request with `SUMMARY.md` as its body. Changes made upstream
-   since the import are kept. A conflict, an empty result, a finding or a red check stops it before anything
-   is pushed. A target with no coverage command of its own is measured with pytest-cov (a uv project in its
-   own environment), so for one that is not a uv project the `python` on your PATH needs `pytest-cov`.
-   The rerun skips the workflow's machine-setup steps (`sudo`, `apt`, `npm install -g` and the like), so what they
-   install must already be on your machine: for the engine that is Playwright MCP with Chromium. Without
+   must be set), scans what the commit adds (`ops/scan_public.py`), and pushes the branch and opens or updates a
+   pull request with `SUMMARY.md` as its body. Changes made upstream since the import are kept. A conflict, an
+   empty result or a scan finding stops it before anything is pushed: a push to a public repository cannot be
+   undone, so the scan always blocks. The target's CI and changed-line coverage already ran in the pre-review gate
+   and run again as the pull request's CI, so `deliver` does not rerun them by default (`--checks off`).
+   `--checks advisory` reruns them and writes what failed or could not run into the pull request body;
+   `--checks required` refuses on anything but a pass. A rerun measures a target with no coverage command of its
+   own with pytest-cov (a uv project in its own environment), and skips the workflow's machine-setup steps
+   (`sudo`, `apt`, `npm install -g` and the like), so what they install must already be on your machine. Without
    `gh` the report prints the pull request body to open it by hand. `--fork` pushes to your fork instead,
    `--fixes` adds a `Fixes OWNER/REPO#N` line to the body for each public issue the change resolves (the
    workspace item records that link), and `--dry-run` does everything but push. A branch that already exists

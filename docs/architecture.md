@@ -733,7 +733,7 @@ the session role definitions, the browser image files and the workspace template
 | `_push_guard.py` | the `pre-push` hook that pins a session's pushes to its launch repository |
 | `_github.py` | GitHub App access: installation tokens, default branch, commit health |
 | `_pull_requests.py` | a project's pull request, opened and kept current as the App |
-| `_promote.py` | `deliver`: the project's tree committed onto the target's head, scan, the target's CI and coverage, DCO sign-off, the PR |
+| `_promote.py` | `deliver`: the project's tree committed onto the target's head, scan (blocking), the target's CI and coverage (off by default; `--checks`), DCO sign-off, the PR |
 | `_delivery.py` | the `promote.toml` manifest, `import` (the baseline commit), and the scratch target checkout the gates run on |
 
 **Profile, names and deployment**

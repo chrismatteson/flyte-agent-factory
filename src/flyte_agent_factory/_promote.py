@@ -8,8 +8,14 @@ so nothing here reads the factory's secrets.
 at `base`) into ONE commit on a new branch of the target's current default branch, by the operator: the
 tree becomes a commit whose parent is `base`, and that commit is cherry-picked onto the target's head. A
 cherry-pick is a three-way merge of base -> tree, so what the target changed since the import is neither a
-conflict nor reverted. A conflict, a secret in what is added, a red check of the target's own CI, an uncovered
-changed line or a missing sign-off stops it before anything is pushed. It never merges.
+conflict nor reverted. A conflict, a secret in what is added or a missing sign-off stops it before anything is
+pushed. It never merges.
+
+The target's own CI and the changed-line coverage check already ran in the factory's pre-review gate, and the
+pull request's CI runs them again where the toolchain is right, so delivery does not rerun them by default
+(`checks="off"`). `"advisory"` reruns them and writes what failed or could not run into the pull request
+body; `"required"` refuses on anything but a pass, as delivery used to. The secret scan is always blocking: a
+push to a public repository cannot be undone.
 """
 
 from __future__ import annotations
@@ -398,6 +404,7 @@ def deliver(
     dry_run: bool = False,
     replace: bool = False,
     scan: Scan = _scan_public,
+    checks: str = "off",
 ) -> Report:
     """Push the project's committed tree to `to` (else `promote.toml`'s repo) as `branch`, and open a PR.
 
@@ -405,13 +412,26 @@ def deliver(
     None follows what the target asks for. `fixes` names the public issues (`owner/repo#N`) the pull request
     resolves: each becomes a `Fixes owner/repo#N` line of its body. `dry_run` stops before the push, with
     everything checked. An existing `branch` is only replaced when it is this operator's earlier promotion
-    (see `_check_branch`), or `replace` says to.
+    (see `_check_branch`), or `replace` says to. `checks` is off, advisory or required (module docstring).
     """
     try:
+        if checks not in CHECKS:
+            raise _Refuse("checks", f"--checks is one of {', '.join(CHECKS)}, not {checks!r}")
         if bad := [ref for ref in fixes if not _ISSUE_REF.fullmatch(ref)]:
             raise _Refuse("fixes", f"not an issue reference of the form owner/repo#N: {', '.join(bad)}")
         return _deliver(
-            project.resolve(), branch, to, fork, title, base, dco, tuple(fixes), dry_run, replace, scan
+            project.resolve(),
+            branch,
+            to,
+            fork,
+            title,
+            base,
+            dco,
+            tuple(fixes),
+            dry_run,
+            replace,
+            scan,
+            checks,
         )
     except _Refuse as exc:
         return Report(False, exc.stage, str(exc))
@@ -429,6 +449,7 @@ def _deliver(
     dry_run: bool,
     replace: bool,
     scan: Scan,
+    checks: str = "off",
 ) -> Report:
     try:
         delivery = _delivery.load(project)
@@ -531,20 +552,16 @@ def _deliver(
 
         if failure := _scan_added(checkout, head, scan) or _scan_text(f"{title}\n\n{summary}", scan):
             raise _Refuse("scan", failure)
-        ci = _gates.target_ci_result(checkout, against_base=False)
-        # Only a pass is pushed: a CI that could not run (a toolchain that cannot be installed) shows nothing.
-        if ci.status not in (_gate_base.Status.PASS, _gate_base.Status.NOT_APPLICABLE):
-            outcome = "fails" if ci.status == _gate_base.Status.FAIL else f"is {ci.status.value}"
-            raise _Refuse("ci", f"the target's own CI {outcome}:\n{ci.output}")
-        # A new repository has no head: its whole tree is the change, as in the gate (empty-tree baseline).
-        if failure := _check_coverage(checkout, head or _delivery.EMPTY_TREE, summary):
-            raise _Refuse("coverage", failure)
+        ci_status, advisories = _rerun_checks(checkout, head, summary, checks)
         if use_dco and (unsigned := _unsigned(checkout, head)):
             raise _Refuse(
                 "signoff", f"commits without a Signed-off-by by their author: {', '.join(unsigned)}"
             )
 
         notes = "".join(f"\n{notice}" for notice in rules.notices)
+        if advisories:
+            notes += "\nwarning: the rerun checks did not all pass (advisory, pushed anyway); see the PR body"
+            summary = (summary or title) + "\n\n" + advisories
         if rules.dco and not use_dco:
             notes += (
                 f"\nwarning: the target asks for DCO sign-off ({rules.dco_where}); --no-dco left the "
@@ -555,12 +572,45 @@ def _deliver(
                 True,
                 "dry-run",
                 f"{branch} is {sha[:10]} over {head[:10] or 'nothing (new repository)'}, by {name} <{email}>"
-                f"; sign-off: {'yes' if use_dco else 'no'}; scan clean; the target's CI {ci.status.value}; "
+                f"; sign-off: {'yes' if use_dco else 'no'}; scan clean; the target's CI {ci_status}; "
                 f"nothing pushed{notes}",
             )
         return _push(
             checkout, delivery.repo, fork, default, branch, head, title, summary or title, sha, notes, seen
         )
+
+
+CHECKS = ("off", "advisory", "required")
+
+
+def _rerun_checks(checkout: Path, head: str, summary: str, checks: str) -> tuple[str, str]:
+    """Rerun the target's CI and coverage per `checks`; return the CI status word and any advisory text.
+
+    `off` runs nothing ("not rerun"). `required` raises `_Refuse` on anything but a pass, as before.
+    `advisory` never refuses: what failed or could not run comes back as markdown for the PR body.
+    """
+    if checks == "off":
+        return "not rerun (the PR's CI is the gate)", ""
+    ci = _gates.target_ci_result(checkout, against_base=False)
+    passed = ci.status in (_gate_base.Status.PASS, _gate_base.Status.NOT_APPLICABLE)
+    problems = []
+    if not passed:
+        outcome = "fails" if ci.status == _gate_base.Status.FAIL else f"is {ci.status.value}"
+        if checks == "required":
+            # Only a pass is pushed: a CI that could not run (a toolchain that cannot install) shows nothing.
+            raise _Refuse("ci", f"the target's own CI {outcome}:\n{ci.output}")
+        problems.append(
+            f"The target's own CI {outcome} on the delivering machine:\n\n```\n{ci.output[-3000:]}\n```"
+        )
+    # A new repository has no head: its whole tree is the change, as in the gate (empty-tree baseline).
+    if failure := _check_coverage(checkout, head or _delivery.EMPTY_TREE, summary):
+        if checks == "required":
+            raise _Refuse("coverage", failure)
+        problems.append(f"Changed-line coverage on the delivering machine:\n\n```\n{failure[-3000:]}\n```")
+    advisory = ""
+    if problems:
+        advisory = "### Delivery checks (advisory)\n\n" + "\n\n".join(problems)
+    return ci.status.value, advisory
 
 
 def _push(
