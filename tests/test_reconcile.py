@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from obstore.exceptions import GenericError
 
 from flyte_agent_factory import (
     _board,
+    _board_events,
     _dashboard,
     _github,
     _issues,
@@ -1105,8 +1107,8 @@ async def test_board_remote_failure_does_not_skip_milestone_healing(world, monke
         raise RuntimeError("No report is available")
 
     monkeypatch.setattr(_board.Reconciler, "tick", fail)
-    with pytest.raises(RuntimeError, match="No report"):
-        await _reconcile.reconcile()
+    # A partial failure is reported in the result, not raised as the whole tick's failure (#103).
+    assert "board FAILED (RuntimeError)" in await _reconcile.reconcile()
     assert healed == [True]
 
 
@@ -1655,3 +1657,149 @@ def test_queued_issues_are_the_pending_requests_issue_references(world):
         _queue.enqueue(world.queue, request)
     profile = dataclasses.replace(board_profile(), state=world.profile.state)
     assert _reconcile.queued_issues(profile) == {"example/scratch#8"}
+
+
+class Uninstalled(App):
+    """The App with no installation on `repo`: every call there fails as `installation_token` does (#103)."""
+
+    def __init__(self, repo="upstream/public"):
+        super().__init__()
+        self.repo = repo
+        self.calls = 0
+
+    def issue_comments_since(self, repo, number, since=""):
+        if repo == self.repo:
+            self.calls += 1
+            raise _github.AppNotInstalled(f"the GitHub App (id 1) is not installed on {repo}", 404)
+        return super().issue_comments_since(repo, number, since)
+
+
+def test_heal_milestones_skips_a_repo_the_app_is_not_installed_on(world, monkeypatch, caplog):
+    from flyte_agent_factory import _factory, _reconcile
+
+    first = _factory.launch_project("brief", "first", issue="upstream/public#97")["run"]
+    _factory.launch_project("brief", "second", issue="upstream/public#29")
+    started = _reconcile._started_at(world.runs[first])
+    assert started is not None
+    monkeypatch.setattr(time, "time", lambda: started + 3630)
+    app = Uninstalled()
+    skipped: dict[str, list[str]] = {}
+    caplog.set_level(logging.WARNING)
+    assert _reconcile.heal_milestones(world.profile, github(app), skipped=skipped) == 0
+    assert app.calls == 1  # the second run on the repo is skipped without asking GitHub again
+    assert sorted(skipped["upstream/public"]) == ["upstream/public#29", "upstream/public#97"]
+    reports = [r.getMessage() for r in caplog.records if "upstream/public" in r.getMessage()]
+    assert len(reports) == 1
+    assert "Milestones skipped" in reports[0] and "not installed" in reports[0]
+
+
+def test_heal_milestones_still_raises_other_github_errors_past_an_uninstalled_repo(world, monkeypatch):
+    from flyte_agent_factory import _factory, _reconcile
+
+    first = _factory.launch_project("brief", "first", issue="upstream/public#97")["run"]
+    _factory.launch_project("brief", "ours", issue="you/repo#12")
+    started = _reconcile._started_at(world.runs[first])
+    assert started is not None
+    monkeypatch.setattr(time, "time", lambda: started + 3630)
+
+    class Broken(Uninstalled):
+        def comment(self, repo, number, body):
+            raise _github.GithubError("github: HTTP 500", 500)
+
+    with pytest.raises(_github.GithubError, match="HTTP 500"):
+        _reconcile.heal_milestones(world.profile, github(Broken()))
+
+
+async def test_a_run_on_a_repo_without_the_app_does_not_fail_the_tick(world, monkeypatch, caplog):
+    from flyte_agent_factory import _factory, _reconcile
+
+    upstream = _factory.launch_project("brief", "upstream", issue="upstream/public#97")["run"]
+    ours = _factory.launch_project("brief", "ours", issue="you/repo#12")["run"]
+    board = Board({"upstream/public#97": {"status": "Ready"}, "you/repo#12": {"status": "Ready"}}).install(
+        monkeypatch
+    )
+    app = Uninstalled()
+    monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
+    tokens: list[str] = []
+
+    def take_token(secret):
+        tokens.append(secret)
+        return "token"
+
+    monkeypatch.setattr(_board, "take_token", take_token)
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: app)
+    started = _reconcile._started_at(world.runs[upstream])
+    assert started is not None
+    monkeypatch.setattr(time, "time", lambda: started + 3630)
+    caplog.set_level(logging.WARNING)
+    result = await _reconcile.reconcile()
+    assert tokens == ["github_board_pat"]  # board writes use the board identity
+    # Board status is reconciled for every item, the App-less repo's included.
+    assert board.items["upstream/public#97"]["status"] == "In flight"
+    assert board.items["you/repo#12"]["status"] == "In flight"
+    assert app.keys(ours, "you/repo#12") == ["started"]
+    assert "milestones skipped on upstream/public: the GitHub App is not installed there" in result
+    assert "FAILED" not in result
+    assert sum("Milestones skipped on upstream/public" in r.getMessage() for r in caplog.records) == 1
+
+
+async def test_a_failed_step_is_reported_when_another_succeeded(world, monkeypatch, caplog):
+    from flyte_agent_factory import _reconcile
+
+    monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
+    monkeypatch.setattr(_board, "take_token", lambda *a: "token")
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: App())
+    monkeypatch.setattr(_reconcile, "project_runs", list)
+    monkeypatch.setattr(_reconcile, "heal_milestones", lambda *a, **kw: 0)
+    monkeypatch.setattr(_board_events, "drift", lambda *a, **kw: [])
+
+    def fail(self):
+        raise RuntimeError("No report is available")
+
+    monkeypatch.setattr(_board.Reconciler, "tick", fail)
+    result = await _reconcile.reconcile()
+    assert "board FAILED (RuntimeError)" in result
+    assert "0 milestone(s) posted" in result
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert errors == ["Reconcile board failed: RuntimeError: No report is available"]
+
+
+async def test_a_tick_where_every_step_failed_still_raises(world, monkeypatch):
+    from flyte_agent_factory import _reconcile
+
+    monkeypatch.setattr(_reconcile, "PROFILE", board_profile(app=True))
+    monkeypatch.setattr(_board, "take_token", lambda *a: "token")
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: App())
+    monkeypatch.setattr(_reconcile, "project_runs", list)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(_reconcile, "heal_milestones", fail)
+    monkeypatch.setattr(_board_events, "drift", fail)
+    monkeypatch.setattr(_board.Reconciler, "tick", fail)
+    with pytest.raises(RuntimeError, match="down"):
+        await _reconcile.reconcile()
+
+
+async def test_a_skipped_repo_does_not_hide_a_tick_where_every_step_failed(world, monkeypatch):
+    from flyte_agent_factory import _factory, _reconcile
+
+    first = _factory.launch_project("brief", "first", issue="upstream/public#97")["run"]
+    _factory.launch_project("brief", "ours", issue="you/repo#12")
+    started = _reconcile._started_at(world.runs[first])
+    assert started is not None
+    monkeypatch.setattr(time, "time", lambda: started + 3630)
+
+    class Broken(Uninstalled):
+        def comment(self, repo, number, body):
+            raise _github.GithubError("github: HTTP 500", 500)
+
+    monkeypatch.setattr(_reconcile, "PROFILE", dataclasses.replace(board_profile(app=True), board=None))
+    monkeypatch.setattr(_pull_requests, "take_app_key", lambda *a: "key")
+    monkeypatch.setattr(_github, "GithubApp", lambda *a, **kw: Broken())
+    with pytest.raises(_github.GithubError, match="HTTP 500"):
+        await _reconcile.reconcile()

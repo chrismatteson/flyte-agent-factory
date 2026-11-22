@@ -3,7 +3,8 @@
 The supervisor writes live run fields and milestones; this heals writes lost to an outage or a dead
 pod. GitHub issues and main commits also prove completion for work merged without a project run.
 Uncertain board drift is reported for review, with a summary status on main. The tick keeps no durable
-state: a failed pass is the next pass's work, and a failed tick raises so the run list shows the streak.
+state: a failed pass is the next pass's work. A tick where every step failed raises so the run list
+shows the streak; one where only some failed reports them in its log and result.
 The retired `factory-board-sync` and `issue_outbox` outboxes are no longer read or written.
 """
 
@@ -286,6 +287,7 @@ def heal_milestones(
     app: _github.GithubApp,
     now: float | None = None,
     runs: list[remote.Run] | None = None,
+    skipped: dict[str, list[str]] | None = None,
 ) -> int:
     """Post the milestones Flyte proves happened that are missing from their issues; how many it posted.
 
@@ -294,9 +296,14 @@ def heal_milestones(
     first remote error once every run has been tried. Unavailable reports skip that run for this tick,
     with warnings limited to an hourly window even across fresh processes. `runs` defaults to the
     project's recent runs.
+
+    A repository the App is not installed on (a public upstream the owner cannot install it on) is not a
+    failure: its issues' milestones are skipped, with one warning per repository, and `skipped` (when
+    given) maps each such repository to the issues skipped on it.
     """
     now = time.time() if now is None else now
     posted, failed = 0, []
+    unreachable: dict[str, tuple[str, list[str]]] = {}
     runs = list(_factory.recent_runs(MILESTONE_WINDOW_H) if runs is None else runs)
     _missing_reports.intersection_update(run.name for run in runs)
     for run in runs:
@@ -311,6 +318,10 @@ def heal_milestones(
                 continue
             issue = _run_issue(profile, labels)
             if not issue:
+                continue
+            repo = _issues.parse_issue(issue)[0].lower()
+            if repo in unreachable:
+                unreachable[repo][1].append(issue)
                 continue
             started = _started_at(run)
             if started is None:
@@ -339,9 +350,15 @@ def heal_milestones(
             since = datetime.fromtimestamp(started, timezone.utc).isoformat()
             for key, body in due:
                 posted += _issues.post_milestone(app, issue, run.name, key, body, since=since)
+        except _github.AppNotInstalled as exc:
+            unreachable[_issues.parse_issue(issue)[0].lower()] = (str(exc), [issue])
         except REMOTE_ERRORS as exc:
             log.warning("Could not heal the milestones of %s on %s: %s", run.name, issue, type(exc).__name__)
             failed.append(exc)
+    for repo, (reason, issues) in unreachable.items():
+        log.warning("Milestones skipped on %s (%s): %s", repo, ", ".join(dict.fromkeys(issues)), reason)
+        if skipped is not None:
+            skipped[repo] = list(dict.fromkeys(issues))
     if failed:
         raise failed[0]
     return posted
@@ -379,7 +396,9 @@ async def reconcile(completion_run: str = "") -> str:
             await asyncio.sleep(2)
     token = _board.take_token(PROFILE.board.pat_secret if PROFILE.board else "")
     key = _pull_requests.take_app_key(PROFILE.github.private_key_secret)
-    done, failed = [], []
+    done: list[str] = []
+    failed: list[tuple[str, Exception]] = []
+    notes: list[str] = []  # what the result reports beside the steps; not a step that succeeded
     milestones = PROFILE.github.configured and key
     # Shared by both halves; direct fetches are only for distinct board runs absent from the listing.
     runs = await asyncio.to_thread(project_runs) if PROFILE.board or milestones else []
@@ -397,7 +416,7 @@ async def reconcile(completion_run: str = "") -> str:
             )
             done.append("board")
         except REMOTE_ERRORS as exc:
-            failed.append(exc)
+            failed.append(("board", exc))
     if PROFILE.board and milestones:
         try:
             # After the run projection. The one board audit: it needs the App for the pull requests,
@@ -415,8 +434,9 @@ async def reconcile(completion_run: str = "") -> str:
             done.append(f"{corrections} board truth correction(s)")
             done.append(f"{len(rows) - corrections} board drift row(s)")
         except REMOTE_ERRORS as exc:
-            failed.append(exc)
+            failed.append(("board truth", exc))
     if milestones:
+        unreached: dict[str, list[str]] = {}
         try:
             count = await asyncio.to_thread(
                 heal_milestones,
@@ -424,12 +444,21 @@ async def reconcile(completion_run: str = "") -> str:
                 _github.GithubApp(PROFILE.github.app_id, key, permissions=_github.ISSUES_WRITE),
                 None,
                 runs,
+                unreached,
             )
             done.append(f"{count} milestone(s) posted")
         except REMOTE_ERRORS as exc:
-            failed.append(exc)
+            failed.append(("milestones", exc))
+        if unreached:
+            notes.append(
+                f"milestones skipped on {', '.join(unreached)}: the GitHub App is not installed there"
+            )
     if PROFILE.board and not milestones:
         log.info("Board truth skipped: it needs the GitHub App for pull requests, commits and comments")
-    if failed:
-        raise failed[0]
-    return "; ".join(done) or "nothing to reconcile"
+    if failed and not done:
+        raise failed[0][1]
+    # One step's failure is the next tick's work; it must not hide what the other steps did.
+    for step, error in failed:
+        log.error("Reconcile %s failed: %s: %s", step, type(error).__name__, error)
+        notes.append(f"{step} FAILED ({type(error).__name__})")
+    return "; ".join(done + notes) or "nothing to reconcile"

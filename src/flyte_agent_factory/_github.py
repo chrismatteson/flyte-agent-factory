@@ -83,6 +83,10 @@ class GithubError(RuntimeError):
         self.status = status
 
 
+class AppNotInstalled(GithubError):
+    """The GitHub App has no installation on the repository: no token can reach it, however scoped."""
+
+
 def _error_detail(response: httpx.Response) -> str:
     """GitHub's `message` plus each `errors[]` entry.
 
@@ -385,7 +389,7 @@ class GithubApp(_GithubReader):
             installation = self._request("GET", f"/repos/{repo}/installation", app)
         except GithubError as exc:
             if "HTTP 404" in str(exc):
-                raise GithubError(
+                raise AppNotInstalled(
                     f"the GitHub App (id {self._app_id}) is not installed on {repo}", 404
                 ) from exc
             raise
