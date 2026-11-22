@@ -241,9 +241,10 @@ def test_tracked_root_markdown_is_only_readme_and_agents():
     root_docs = {p for p in tracked if "/" not in p}
     # AGENTS.md is allowed, not required: it is not tracked in this repo yet. CONTRIBUTING.md and SECURITY.md
     # are the community files GitHub shows a public repository's visitors (#110 asks for them at the root);
-    # each is a short pointer to its page under docs/.
+    # each is a short pointer to its page under docs/. REPORT.md is the project report its brief names at
+    # this path (issue #49: "answer the issue's open questions in REPORT.md").
     assert "README.md" in root_docs
-    assert root_docs <= {"README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md"}
+    assert root_docs <= {"README.md", "AGENTS.md", "CONTRIBUTING.md", "SECURITY.md", "REPORT.md"}
 
 
 _FLOOR_KEYWORDS = (

@@ -648,15 +648,18 @@ def test_every_package_module_loads_with_the_agent():
     # `_image_user` is the deploy children's root-image check, run from the engine checkout that deploys.
     # `_deploy_reads` is the deployer's (what a direction commit must touch to deploy); `_code_closure` is
     # the factory deploy child's (factory-mcp's code digest).
+    # `_app_logs`, `_app_tools`, `_mcp_budget` and `_mcp_redact` are `_factory_mcp`'s (the factory side);
+    # `_oss_follow` is `_factory`'s and is in the slot env's `include`. `_timefmt` is the time format those
+    # MCP modules share, so it ships with them.
     assert out.stdout.strip() == (
-        "_admission,_backlog,_bench,_bench_check,_bench_expiry_hidden,_bench_flow,_bench_logstats_files,"
+        "_admission,_app_logs,_app_tools,_backlog,_bench,_bench_check,_bench_expiry_hidden,_bench_flow,_bench_logstats_files,"
         "_bench_mlpipe_files,_bench_stats,_bench_store,_bench_suite,_board_events,_bootstrap,_bootstrap_base,_bootstrap_finish,_bootstrap_flyte,"
         "_bootstrap_github,_bootstrap_keys,_bootstrap_profile,_bootstrap_state,_bootstrap_steps,_code_closure,_deploy,_deploy_apps,_deploy_child,_deploy_reads,_deployer,"
         "_factory,_factory_base,_factory_envs,"
         "_factory_grants,_factory_live,_factory_mcp,_factory_meters,_factory_policy,_factory_recreate,"
         "_factory_status,_factory_usage,_grant_page,_grants_cli,_image_user,_isolation_canary,_loop,_loop_flow,"
-        "_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_seal_launch,_seal_report,_slow_lane,_state_bucket,_state_volume,_tick_guard,"
-        "_webhook,voice"
+        "_mcp_budget,_mcp_redact,_oss_follow,_planner,_planner_facts,_planner_runtime,_promote,_reconcile,_seal_launch,_seal_report,_slow_lane,_state_bucket,_state_volume,_tick_guard,"
+        "_timefmt,_webhook,voice"
     )
 
 

@@ -1,7 +1,10 @@
 import ast
+import asyncio
 import importlib.metadata
 import inspect
 import json
+import re
+import threading
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +17,7 @@ from flyte.ai.mcp import ALL_MCP_TOOLS, FlyteMCPAppEnvironment
 from flyte.models import ActionPhase
 from mcp.server.fastmcp.exceptions import ToolError
 
-from flyte_agent_factory import _factory, _factory_base, _git
+from flyte_agent_factory import _factory, _factory_base, _git, _mcp_budget, _mcp_redact
 from flyte_agent_factory import _factory_mcp as factory
 
 ROOT = Path(factory.__file__).resolve().parents[2]
@@ -364,7 +367,7 @@ async def test_the_patient_tools_replace_the_stock_ones_without_changing_the_too
     """The patient tools replace the stock ones without changing the tool set."""
     assert factory.app.mcp is not None
     tools = {tool.name: tool for tool in await factory.app.mcp.list_tools()}
-    assert set(tools) == set(factory.TOOLS)
+    assert set(tools) == set(factory.SERVED_TOOLS)
     for name in ("get_run_io", "wait_for_run"):
         description = tools[name].description or ""
         assert "bounded" in description or "outputs_ready" in description
@@ -439,7 +442,9 @@ def test_exposes_launching_and_following_projects_only():
 def test_enables_every_stock_tool():
     assert factory.app.enabled_tools == set(ALL_MCP_TOOLS)
     assert set(factory.TOOLS) == set(ALL_MCP_TOOLS)
-    assert set(_registered_tools()) == set(ALL_MCP_TOOLS)
+    # Stricter than it was: every stock tool and exactly the factory's own five, nothing else.
+    assert set(factory.SERVED_TOOLS) == set(ALL_MCP_TOOLS) | set(factory.FACTORY_TOOLS)
+    assert set(_registered_tools()) == set(factory.SERVED_TOOLS)
     # `ALL_MCP_TOOLS` is every tool the SDK implements: a plain stock environment registers exactly those.
     # (This compared against the private `TOOL_REGISTRY` before; the stock app raises if the two drift.)
     stock = FlyteMCPAppEnvironment(name="stock")
@@ -493,7 +498,12 @@ def remote(lagging, monkeypatch):
 
     async def project_get(name):
         calls.append(("Project.get", name))
-        raise AssertionError("get_project must refuse before asking Union")
+        assert name == _factory.PROJECT, "get_project must refuse before asking Union"
+        return SimpleNamespace(
+            pb2=SimpleNamespace(
+                id=name, name=name, description="", state=0, domains=[], HasField=lambda _: False
+            )
+        )
 
     async def secret_listall(*args, **kwargs):
         # A secret object that carries its value, as a careless SDK change might make it.
@@ -598,8 +608,10 @@ async def test_scoping_leaves_each_tools_input_schema_unchanged():
     assert stock.mcp is not None
     stock_tools = {t.name: t for t in stock.mcp._tool_manager.list_tools()}
     ours = _registered_tools()
-    assert set(ours) == set(stock_tools)
+    assert set(ours) == set(stock_tools) | set(factory.FACTORY_TOOLS)
     for name, tool in ours.items():
+        if name in factory.FACTORY_TOOLS:
+            continue
         assert tool.parameters == stock_tools[name].parameters, name
         assert tool.annotations == stock_tools[name].annotations, name
 
@@ -607,6 +619,9 @@ async def test_scoping_leaves_each_tools_input_schema_unchanged():
 async def test_list_projects_shows_only_the_factory_project(remote):
     result = await call_list("list_projects")
     assert [p["id"] for p in result] == [_factory.PROJECT]
+    # The factory's own key may not list the organisation's projects: it asks for its one project.
+    assert ("Project.listall", None) not in remote
+    assert remote.count(("Project.get", _factory.PROJECT)) == 1
 
 
 @pytest.mark.parametrize("limit", [-1, 0, 1])
@@ -795,7 +810,7 @@ def test_the_grant_page_is_behind_the_stock_auth_of_each_mode(requires_auth, una
 def test_the_grant_page_adds_no_mcp_tool():
     assert factory.app.enabled_tools == set(factory.TOOLS)
     assert factory.app.mcp is not None
-    assert set(_registered_tools()) == set(factory.TOOLS)
+    assert set(_registered_tools()) == set(factory.SERVED_TOOLS)
 
 
 def test_instructions_declare_the_operator_state_file_and_write_targets():
@@ -1154,12 +1169,13 @@ async def test_the_wrappers_keep_the_stock_input_schema_and_only_the_patient_one
     stock = FlyteMCPAppEnvironment(name="stock", tools=list(factory.TOOLS))
     assert stock.mcp is not None
     stock_tools = {t.name: t for t in stock.mcp._tool_manager.list_tools()}
-    ours = _registered_tools()
+    ours = {n: t for n, t in _registered_tools().items() if n in stock_tools}
     for name, tool in ours.items():
         assert tool.parameters == stock_tools[name].parameters, name
         assert tool.annotations == stock_tools[name].annotations, name
     changed = {n for n, t in ours.items() if t.description != stock_tools[n].description}
-    assert changed == {"get_run_io", "wait_for_run"}
+    # The app tools say they never return environment values; the two patient ones say how they wait.
+    assert changed == {"get_run_io", "wait_for_run", "get_app", "activate_app", "deactivate_app"}
     # The new arguments of get_run_io are there, so a chat can use them.
     assert {"action_name", "inputs_only", "outputs_only"} <= set(ours["get_run_io"].parameters["properties"])
 
@@ -1311,3 +1327,605 @@ def test_the_factory_mcp_server_uses_no_private_name_of_the_flyte_environment():
     assert [
         n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "_tool_manager"
     ].__len__() == 1
+
+
+# ---- the served layer: budget, redaction, the app tools and the documented tool list ----
+
+
+IN_SCOPE = {"project": _factory.PROJECT, "domain": _factory.DOMAIN}
+
+
+def _documented_tools() -> set[str]:
+    """The tool names in the first column of the tool table in docs/architecture.md."""
+    lines = (ROOT / "docs" / "architecture.md").read_text().splitlines()
+    start = lines.index("| Tool | What it does |")
+    names: set[str] = set()
+    for line in lines[start + 2 :]:
+        if not line.startswith("|"):
+            break
+        names.update(re.findall(r"`([a-z_]+)`", line.split("|")[1]))
+    return names
+
+
+async def test_served_tools_match_the_docs_both_ways():
+    assert factory.app.mcp is not None
+    served = {tool.name for tool in await factory.app.mcp.list_tools()}
+    documented = _documented_tools()
+    assert served == set(factory.SERVED_TOOLS)
+    assert served - documented == set(), "served but not in the table in docs/architecture.md"
+    assert documented - served == set(), "in the table in docs/architecture.md but not served"
+
+
+def test_the_factorys_own_tools_are_the_documented_five():
+    assert factory.FACTORY_TOOLS == (
+        "get_app_status",
+        "get_app_logs",
+        "restart_app",
+        "factory_mcp_health",
+        "get_operation",
+    )
+    assert factory.SERVED_TOOLS == factory.TOOLS + factory.FACTORY_TOOLS
+
+
+def test_the_acting_tools_are_listed_in_one_tuple_and_all_exist():
+    assert set(factory.ACTING) <= set(factory.SERVED_TOOLS)
+    # A read must never join a call in flight, and a write must.
+    assert not {"get_run", "get_run_io", "get_logs", "get_secret", "list_secrets", "get_app"} & set(
+        factory.ACTING
+    )
+    assert {
+        "run_task",
+        "abort_run",
+        "signal_condition",
+        "activate_app",
+        "deactivate_app",
+        "restart_app",
+        "create_secret",
+        "update_secret",
+        "delete_secret",
+        "delete_app",
+        "create_trigger",
+        "delete_trigger",
+    } <= set(factory.ACTING)
+
+
+def test_every_served_tool_is_wrapped_by_the_one_layer():
+    # `get_operation` too: it is budgeted like any tool, its own wait held to `_FOLLOW_UP_BUDGET_SHARE` of it.
+    for name, tool in _registered_tools().items():
+        assert getattr(tool.fn, "served_layer", False), name
+
+
+@pytest.fixture
+def short_budget(monkeypatch):
+    from flyte_agent_factory import _mcp_budget
+
+    monkeypatch.setattr(_mcp_budget, "TOOL_BUDGET_S", 0.3)
+    monkeypatch.setattr(_mcp_budget, "OPERATIONS", _mcp_budget.Operations())
+    _mcp_budget.CALL_LOG.clear()
+    return _mcp_budget
+
+
+async def test_every_served_tool_is_bounded(remote, short_budget, monkeypatch):
+    """Slow fakes behind the served wrapper come back as `still_working`, not as a hang."""
+    import time
+
+    import flyte.remote
+
+    async def slow(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(2)
+        return SimpleNamespace(url="http://run", name="r1")
+
+    async def slow_run(name):
+        return SimpleNamespace(
+            name=name,
+            url="http://run",
+            phase=ActionPhase.RUNNING,
+            done=lambda: False,
+            wait=SimpleNamespace(aio=slow),
+        )
+
+    monkeypatch.setattr(flyte.run, "aio", slow)
+    monkeypatch.setattr(flyte.remote.Secret, "get", SimpleNamespace(aio=slow))
+    monkeypatch.setattr(flyte.remote.Run, "get", SimpleNamespace(aio=slow_run))
+    cases: list[tuple[str, dict[str, Any]]] = [
+        ("run_task", {"name": "factory.launch", "inputs": {}, **IN_SCOPE}),
+        ("get_secret", {"name": "claude_token"}),
+        ("wait_for_run", {"name": "r1", "timeout_s": 60}),
+    ]
+    for tool, arguments in cases:
+        started = time.monotonic()
+        result = await call(tool, **arguments)
+        assert time.monotonic() - started < 1.5, tool
+        assert result["status"] == "still_working", (tool, result)
+        assert result["call_again"]["tool"] == "get_operation"
+
+    # and the operation can be asked about: this one ends 0.2 s after the budget, inside get_operation's wait
+    async def a_little_slow(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.5)
+        return SimpleNamespace(url="http://run", name="r2")
+
+    monkeypatch.setattr(flyte.run, "aio", a_little_slow)
+    pending = await call("run_task", name="factory.queue_list", inputs={}, **IN_SCOPE)  # not the first one
+    assert pending["status"] == "still_working"
+    done = await call("get_operation", operation_id=pending["operation_id"], wait_s=5)
+    assert done["status"] == "done" and done["result"]["name"] == "r2"
+
+
+async def test_reads_on_a_slow_backend_are_bounded(remote, short_budget, monkeypatch):
+    """`get_run_io`, `get_logs` and `factory.status` on a backend that never answers end in the budget."""
+    import time
+
+    import flyte.remote
+
+    async def never(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(flyte.run, "aio", never)
+    monkeypatch.setattr(flyte.remote.Run, "get", SimpleNamespace(aio=never))
+    monkeypatch.setattr(flyte.remote.Action, "get", SimpleNamespace(aio=never))
+    cases: list[tuple[str, dict[str, Any]]] = [
+        ("get_run_io", {"name": "r1"}),
+        ("get_logs", {"run_name": "r1"}),
+        ("get_logs", {"run_name": "r1", "action_name": "a1"}),
+        ("run_task", {"name": "factory.status", "inputs": {}, **IN_SCOPE}),
+    ]
+    for tool, arguments in cases:
+        started = time.monotonic()
+        result = await call(tool, **arguments)
+        assert time.monotonic() - started < 1.5, (tool, arguments)
+        assert result["status"] == "still_working", (tool, arguments, result)
+        assert result["call_again"]["tool"] == "get_operation"
+
+
+class SecretRun(LaggingRun):
+    """A finished run whose output holds a secret."""
+
+    secret = "sk-" + "ant-api03-" + "AbCdEfGhIjKlMnOpQrSt"
+
+    async def _outputs(self):
+        return SimpleNamespace(named_outputs={"o0": json.dumps({"note": f"key is {self.secret}"})})
+
+
+async def test_every_served_result_is_redacted(remote, lagging):
+    """A tool that returns a secret returns it masked, through the served path."""
+    lagging(SecretRun(lag=0))
+    result = await call("get_run_io", name="r1")
+    assert SecretRun.secret not in json.dumps(result)
+    assert "[REDACTED]" in json.dumps(result)
+
+
+async def test_every_served_result_is_redacted_for_a_key_logged_per_line(monkeypatch):
+    """A private key logged one line per entry is masked whole through the served `get_app_logs`."""
+    import base64
+
+    from flyte_agent_factory import _app_tools
+
+    body = base64.b64encode(bytes(range(256)) * 5).decode()
+    lines = ["-----BEGIN " + "PRIVATE KEY-----", *(body[i : i + 64] for i in range(0, len(body), 64))]
+    lines.append("-----END " + "PRIVATE KEY-----")
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        return {"app": name, "lines": [{"message": line} for line in lines], "returned": len(lines)}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    served = json.dumps(await call("get_app_logs", name="demo"))
+    assert "[REDACTED]" in served
+    assert not any(body[i : i + 20] in served for i in range(len(body) - 19))
+
+
+async def test_every_served_result_is_redacted_for_a_union_key_after_an_equals_sign(monkeypatch):
+    """`export NAME=<key>` in an app's log comes through the served `get_app_logs` with the key masked."""
+    import base64
+
+    from flyte_agent_factory import _app_tools
+
+    token = base64.b64encode(
+        b"dns:///example.invalid:client-id-0123456789:" + b"0123456789abcdef" * 4 + b":None"
+    ).decode()
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        return {"app": name, "lines": [{"message": "export AGENT_FACTORY_UNION_KEY=" + token}], "returned": 1}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    served = json.dumps(await call("get_app_logs", name="demo"))
+    assert token not in served
+    assert "AGENT_FACTORY_UNION_KEY=[REDACTED]" in served
+
+
+async def test_every_served_result_is_redacted_for_a_union_key_in_a_json_log_line(monkeypatch):
+    """A JSON-formatted log line holds `\\n` as two characters; a key right after it is still masked."""
+    import base64
+
+    from flyte_agent_factory import _app_tools
+
+    token = base64.b64encode(
+        b"dns:///example.invalid:client-id-0123456789:" + b"0123456789abcdef" * 4 + b":None"
+    ).decode()
+    line = json.dumps({"level": "info", "msg": "minted key:\n" + token})
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        return {"app": name, "lines": [{"message": line}], "returned": 1}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    served = json.dumps(await call("get_app_logs", name="demo"))
+    assert token not in served
+
+
+async def test_every_served_result_is_redacted_for_a_union_key_after_a_json_unicode_escape(monkeypatch):
+    """`json.dumps` writes a curly quote as `\\u201c`; a key right after it is still masked."""
+    import base64
+
+    from flyte_agent_factory import _app_tools
+
+    token = base64.b64encode(
+        b"dns:///example.invalid:client-id-0123456789:" + b"0123456789abcdef" * 4 + b":None"
+    ).decode()
+    line = json.dumps({"level": "info", "msg": "minted key \u201c" + token + "\u201d"})
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        return {"app": name, "lines": [{"message": line}], "returned": 1}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    served = json.dumps(await call("get_app_logs", name="demo"))
+    assert token not in served
+
+
+async def test_every_served_result_is_redacted_for_a_password_under_a_prefixed_name(monkeypatch):
+    """A name that starts like a count or a list of names (`MINIO_`, `INPUT_`) still holds a secret."""
+    from flyte_agent_factory import _app_tools
+
+    value = "Zx9qW2" + "eR7tY5uI3o"
+    names = ("MINIO_ROOT_PASSWORD", "INPUT_PASSWORD", "NUM_API_KEY", "DB_PASSWORD")
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        lines = [{"message": f"{n}={value}"} for n in names]
+        return {"app": name, "lines": lines, "returned": len(lines)}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    served = json.dumps(await call("get_app_logs", name="demo"))
+    assert value not in served
+    assert all(n in served for n in names)
+    assert "[REDACTED]" in served
+
+
+async def test_every_served_result_is_redacted_for_a_union_key_after_an_ansi_colour_code(monkeypatch):
+    """A structlog console line colours its message; a key right after the colour code is still masked."""
+    import base64
+
+    from flyte_agent_factory import _app_tools
+
+    token = base64.b64encode(
+        b"dns:///example.invalid:client-id-0123456789:" + b"0123456789abcdef" * 4 + b":None"
+    ).decode()
+    line = "\x1b[2m2026-11-21 01:12:36\x1b[0m [\x1b[32m\x1b[1minfo     \x1b[0m] \x1b[1m" + token + "\x1b[0m"
+
+    async def read_logs(ctx: Any, name: str, **options: Any) -> dict[str, Any]:
+        return {"app": name, "lines": [{"message": line}], "returned": 1}
+
+    monkeypatch.setattr(_app_tools, "_read_logs", read_logs)
+    result = await call("get_app_logs", name="demo")
+    assert token not in json.dumps(result)
+    assert result["lines"][0]["message"].endswith("\x1b[1m[REDACTED]\x1b[0m")
+
+
+async def test_a_refused_call_is_logged_as_refused_and_makes_no_operation(remote, short_budget):
+    with pytest.raises(ToolError, match=OTHER["project"]):
+        assert factory.app.mcp is not None
+        await factory.app.mcp.call_tool("get_run", {"name": "x", "project": OTHER["project"]})
+    assert short_budget.CALL_LOG[-1][:2] == ("get_run", "refused")
+    assert len(short_budget.OPERATIONS) == 0
+
+
+@pytest.mark.parametrize(
+    "tool", ["run_task", "signal_condition", "activate_app", "deactivate_app", "restart_app"]
+)
+async def test_dropped_acting_call_is_joined_not_repeated(short_budget, tool):
+    """A dropped request does not cancel the work, and a repeat joins it instead of acting twice."""
+    acted: list[int] = []
+
+    async def act(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        acted.append(1)
+        await asyncio.sleep(1.2)
+        return {"name": name}
+
+    served = factory._serve(tool, act)
+    first = await served(name="a")
+    assert first["status"] == "still_working"
+    again = await served(name="a")  # the client calls again before the work is done
+    assert again["operation_id"] == first["operation_id"]
+    assert len(acted) == 1
+    await asyncio.sleep(1.3)
+    assert await served(name="a") == {"name": "a"}  # delivered once; the work ran once
+    assert len(acted) == 1
+
+
+async def test_restart_app_is_joined_like_any_acting_call(short_budget, monkeypatch):
+    from flyte_agent_factory import _app_tools
+
+    started: list[int] = []
+
+    async def transition(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        started.append(1)
+        await asyncio.sleep(1.2)
+        return {"outcome": "restarted"}
+
+    monkeypatch.setattr(_app_tools, "_run_transition", transition)
+    first = await call("restart_app", name="demo")
+    assert first["status"] == "still_working" and first["acting"] is True
+    again = await call("restart_app", name="demo")
+    assert again["operation_id"] == first["operation_id"] and len(started) == 1
+    await asyncio.sleep(1.3)
+    done = await call("restart_app", name="demo")
+    assert done == {"outcome": "restarted"} and len(started) == 1  # delivered once, acted once
+    fresh = await call("restart_app", name="demo")  # a delivered call repeated acts again
+    assert fresh["status"] == "still_working" and fresh["operation_id"] != first["operation_id"]
+    assert len(started) == 2
+
+
+async def test_served_layer_is_outermost_so_still_working_is_redacted(short_budget):
+    async def slow(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        short_budget.note_step(f"used {SecretRun.secret}")
+        await asyncio.sleep(1)
+        return {}
+
+    served = factory._serve("run_task", slow)
+    result = await served(name="x")
+    assert result["status"] == "still_working"
+    assert SecretRun.secret not in json.dumps(result)
+    assert result["steps_done"] == ["used [REDACTED]"]
+
+
+async def test_an_error_message_is_redacted_through_the_served_path(short_budget):
+    async def leaks(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        raise RuntimeError(f"auth failed with {SecretRun.secret}")
+
+    served = factory._serve("get_run", leaks)
+    with pytest.raises(ToolError) as caught:
+        await served(name="x")
+    assert SecretRun.secret not in str(caught.value)
+    assert "auth failed with [REDACTED]" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+
+
+async def test_an_error_without_a_secret_keeps_its_type(short_budget):
+    async def fails(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        raise LookupError("no run named x")
+
+    with pytest.raises(LookupError, match="no run named x"):
+        await factory._serve("get_run", fails)(name="x")
+
+
+async def test_served_redaction_runs_off_the_event_loop(short_budget, monkeypatch):
+    seen: list[str] = []
+
+    def spy(obj: object) -> object:
+        seen.append(threading.current_thread().name)
+        return obj
+
+    async def fine(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        return {"ok": True}
+
+    monkeypatch.setattr(_mcp_redact, "redact_result", spy)
+    await factory._serve("get_run", fine)(name="x")
+    assert seen and seen != [threading.main_thread().name]
+    assert threading.current_thread().name not in seen
+
+
+async def test_a_slow_redaction_does_not_block_the_event_loop(short_budget, monkeypatch):
+    import time
+
+    def slow(obj: object) -> object:
+        time.sleep(0.3)
+        return obj
+
+    async def fine(name: str = "x", ctx: Any = None) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr(_mcp_redact, "redact_result", slow)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    await factory._serve("get_run", fine)(name="x")
+    task.cancel()
+    assert ticks >= 10
+
+
+def test_health_counts_only_the_calls_of_the_last_hour(short_budget, monkeypatch):
+    import time
+
+    now = time.monotonic()
+    short_budget.CALL_LOG.extend(
+        [
+            ("get_run", "ok", 100, now - 7200),  # two hours ago: out
+            ("get_run", "still_working", 200_000, now - 3700),  # out
+            ("get_run", "ok", 300, now - 60),
+            ("run_task", "still_working", 200_000, now - 30),
+        ]
+    )
+    stats = factory._summarise_calls()
+    assert stats["count"] == 2 and stats["still_working"] == 1
+
+
+def test_the_call_summary_counts_dropped_requests(short_budget):
+    """A request its client dropped is counted, so the health tool shows whether drops reach the server."""
+    import time
+
+    now = time.monotonic()
+    short_budget.CALL_LOG.extend(
+        [
+            ("run_task", "dropped", 1_000, now - 7200),  # two hours ago: out
+            ("run_task", "dropped", 1_000, now - 60),
+            ("run_task", "joined", 2_000, now - 30),
+        ]
+    )
+    assert factory._summarise_calls()["dropped"] == 1
+
+
+async def test_the_app_tools_hide_their_step_callback_from_the_client_schema():
+    tools = {t.name: t for t in await factory.app.mcp.list_tools()}  # type: ignore[union-attr]
+    for name in ("restart_app", "activate_app", "deactivate_app"):
+        assert "on_step" not in tools[name].inputSchema["properties"], name
+    assert set(tools["get_app_logs"].inputSchema["properties"]) >= {"name", "max_lines", "since", "replica"}
+    # One content block, as the stock tools give: a structured second block is not what clients expect.
+    for name in (*factory.FACTORY_TOOLS, "get_app", "activate_app", "deactivate_app"):
+        assert tools[name].outputSchema is None, name
+
+
+@pytest.mark.parametrize("requested", [None, 600.0, 171.0])
+async def test_wait_for_run_clamps_the_timeout_and_says_so(lagging, monkeypatch, requested):
+    from flyte_agent_factory import _mcp_budget
+
+    lagging(LaggingRun(lag=0, phase=ActionPhase.RUNNING))
+    seen: list[float | None] = []
+    real = asyncio.wait_for
+
+    async def spy(awaitable: Any, timeout: float | None = None) -> Any:
+        seen.append(timeout)
+        return await real(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(_mcp_budget, "WAIT_CAP_S", 0.05)
+    monkeypatch.setattr(asyncio, "wait_for", spy)
+    result = await call("wait_for_run", name="r1", timeout_s=requested)
+    assert seen == [0.05]
+    assert result["timeout_capped_to_s"] == 0.05
+
+
+async def test_wait_for_run_inside_the_cap_is_not_marked_capped(lagging):
+    lagging(LaggingRun(lag=0))
+    result = await call("wait_for_run", name="r1", timeout_s=5)
+    assert "timeout_capped_to_s" not in result
+
+
+async def test_the_outputs_wait_fits_inside_the_budget(lagging, short_budget, monkeypatch):
+    """The 90 s outputs wait is cut to what is left of the budget, so the call ends with its own answer."""
+    import time
+
+    lagging(LaggingRun(lag=10**9))
+    monkeypatch.setattr(factory, "_OUTPUTS_WAIT_S", 60.0)
+    started = time.monotonic()
+    result = await call("wait_for_run", name="r1", timeout_s=5)
+    assert time.monotonic() - started < 0.3 + 0.2
+    assert result.get("status") != "still_working"
+    assert result["outputs_ready"] is False
+
+
+def test_instructions_and_skill_do_not_say_timeout_s_300():
+    skill = (ROOT / "skills/agent-factory/SKILL.md").read_text()
+    for text in (factory.INSTRUCTIONS, skill):
+        assert "timeout_s=300" not in text
+        assert "timeout_s=170" in text or "timeout_s up to 170" in text
+        assert "still_working" in text and "get_operation" in text
+    for name in ("get_app_status", "get_app_logs", "restart_app", "factory_mcp_health"):
+        assert name in factory.INSTRUCTIONS
+
+
+async def test_the_loop_lag_sampler_starts_with_the_server():
+    from flyte_agent_factory import _mcp_budget
+
+    assert factory.LOOP_LAG is not None and isinstance(factory.LOOP_LAG, _mcp_budget.LoopLag)
+    reached: list[str] = []
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        reached.append(scope["type"])
+
+    middleware = factory._GrantPage(inner)
+    await middleware({"type": "lifespan"}, None, None)  # type: ignore[arg-type]
+    assert reached == ["lifespan"]
+    task = factory._loop_lag_task
+    assert task is not None and not task.done()
+    task.cancel()
+    factory._loop_lag_task = None
+
+
+def test_the_app_knows_its_own_name_for_restart_to_refuse():
+    assert factory.app.env_vars is not None
+    assert factory.app.env_vars["AGENT_FACTORY_MCP_APP"] == factory.app.name
+
+
+def _private_flyte_uses(path: Path) -> list[str]:
+    """Private `flyte` imports, and `flyte._x` or `remote._x` attributes."""
+    problems: list[str] = []
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] == "flyte":
+            names = [f"{node.module}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("_") and not node.attr.startswith("__"):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in ("flyte", "remote"):
+                problems.append(f"{path.name}:{node.lineno}: .{node.attr}")
+            continue
+        else:
+            continue
+        problems += [
+            f"{path.name}:{node.lineno}: {name}"
+            for name in names
+            if name.split(".")[0] == "flyte" and any(part.startswith("_") for part in name.split("."))
+        ]
+    return problems
+
+
+#: Every module #49 added, and the server module it changed. `_profile_telemetry`, `_profile_repo_aliases` and
+#: `_timefmt` import no flyte today; listing them keeps it that way. Checked by hand against the added files:
+#: with `base=$(cat ../../.claude-flyte/mcp-apps-reliability/base-commit)`,
+#: `git diff --name-status $base..HEAD -- src/ | grep '^A'` lists eight of them; `_factory_mcp` is the ninth.
+NEW_MCP_MODULES = [
+    "_app_tools",
+    "_app_logs",
+    "_mcp_budget",
+    "_mcp_redact",
+    "_oss_follow",
+    "_factory_mcp",
+    "_profile_telemetry",
+    "_profile_repo_aliases",
+    "_timefmt",
+]
+
+
+@pytest.mark.parametrize("module", NEW_MCP_MODULES)
+def test_the_new_mcp_modules_use_no_private_name_of_flyte(module):
+    """Criterion 25 (#31): no private flyte name in the modules #49 added."""
+    assert _private_flyte_uses(Path(factory.__file__).with_name(f"{module}.py")) == []
+
+
+@pytest.mark.parametrize("doc", ["architecture.md", "factory-mcp-setup.md", "mcp-operator-smoke.md"])
+def test_the_docs_name_the_wait_cap_of_the_code(doc):
+    from flyte_agent_factory import _mcp_budget
+
+    assert str(int(_mcp_budget.WAIT_CAP_S)) in (ROOT / "docs" / doc).read_text(), doc
+
+
+def test_the_wait_cap_in_the_tool_description_and_instructions_is_the_constant(monkeypatch):
+    from flyte_agent_factory import _mcp_budget
+
+    cap = f"{_mcp_budget.WAIT_CAP_S:g}"
+    assert f"capped at {cap} (" in (_registered_tools()["wait_for_run"].description or "")
+    assert f"timeout_s={cap}" in factory.INSTRUCTIONS
+
+
+def test_get_operation_is_served_with_the_budgets_name_and_parameters():
+    tool = _registered_tools()["get_operation"]
+    assert sorted(tool.parameters["properties"]) == ["operation_id", "wait_s"]
+    assert "Ask about a call that returned `still_working`" in (tool.description or "")
+
+
+def test_the_factory_app_watches_for_dropped_requests_outermost():
+    """The disconnect watch is the first middleware, so a dropped request cancels every layer under it."""
+    outermost: object = factory.app._starlette_middleware()[0].cls  # typed as a factory protocol
+    assert outermost is _mcp_budget.CancelOnDisconnect
+
+
+async def test_acting_names_exactly_the_served_tools_that_are_not_read_only():
+    """`ACTING` agrees with every served tool's `readOnlyHint`: a writer a newer SDK adds is not a read."""
+    tools = await factory.app.mcp.list_tools()  # type: ignore[union-attr]
+    writers = {t.name for t in tools if not (t.annotations and t.annotations.readOnlyHint)}
+    assert writers == set(factory.ACTING)

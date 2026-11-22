@@ -31,8 +31,10 @@ from . import (
     _names,
     _profile_oss,
     _profile_policy,
+    _profile_repo_aliases,
     _profile_resources,
     _profile_state,
+    _profile_telemetry,
     _profile_union,
     _standards,
     _state_store,
@@ -40,6 +42,7 @@ from . import (
 from ._profile_policy import Gardening as Gardening
 from ._profile_policy import JudgementPolicy as JudgementPolicy
 from ._profile_state import State as State
+from ._profile_telemetry import telemetry_env as telemetry_env
 
 PROFILE_ENV = "AGENT_FACTORY_PROFILE"
 #: The profile's text, set on deployed environments. Not a `AGENT_FACTORY_<ROLE>_*` policy key.
@@ -324,6 +327,7 @@ class Profile:
     gardening: Gardening = Gardening()
     seal: _profile_policy.Seal = _profile_policy.Seal()
     judgement: JudgementPolicy = JudgementPolicy()
+    telemetry_flyte_sdk: bool = False  # [telemetry] flyte_sdk: the Flyte SDK may report (`telemetry_env`)
     # [resources.<component>] -> the keys it sets; `_resources.for_component` lays them over the defaults.
     resources: Mapping[str, _profile_resources.Spec] = field(default_factory=lambda: MappingProxyType({}))
     # [repo] key -> its earlier URLs (a GitHub rename): requests and projects from before still name them.
@@ -689,30 +693,6 @@ def _repo_keys(
     return MappingProxyType({key: value.strip() for key, value in table.items()})
 
 
-def _repo_aliases(
-    table: Mapping[str, Any], repos: Mapping[str, str], where: str
-) -> Mapping[str, tuple[str, ...]]:
-    current = {_git._repo_identity(url): key for key, url in repos.items()}
-    seen: dict[str, str] = {}
-    for key, urls in table.items():
-        if key not in repos:
-            raise ProfileError(f"{where}: [repo_aliases] {key} is not a key of [repo] ({', '.join(repos)})")
-        if not isinstance(urls, list) or not all(isinstance(u, str) and u.strip() for u in urls):
-            raise ProfileError(f"{where}: [repo_aliases] {key} must be a list of repository URLs")
-        for url in urls:
-            identity = _git._repo_identity(url)
-            # An alias that is a current URL would silently send that repo's projects elsewhere.
-            if identity in current:
-                raise ProfileError(
-                    f"{where}: [repo_aliases] {key}: {url!r} is the current [repo] {current[identity]} URL"
-                )
-            if seen.setdefault(identity, key) != key:
-                raise ProfileError(
-                    f"{where}: [repo_aliases] {url!r} is listed under both {seen[identity]} and {key}"
-                )
-    return MappingProxyType({key: tuple(u.strip() for u in urls) for key, urls in table.items()})
-
-
 #: Warnings already printed: a process parses its profile several times, and one notice is enough.
 _warned: set[str] = set()
 
@@ -778,6 +758,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
             "seal",
             "judgement",
             "resources",
+            "telemetry",
             "standards",
             "standards_payload",
         }
@@ -894,7 +875,11 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         _check_pinned_engine({**policy, **s.policy}, s, secrets, where)
 
     repo_keys = _repo_keys(_table(data, "repo_keys", where, required=False), repo, secrets, where)
-    repo_aliases = _repo_aliases(_table(data, "repo_aliases", where, required=False), repo, where)
+
+    try:
+        repo_aliases = _profile_repo_aliases.parse(_table(data, "repo_aliases", where, required=False), repo)
+    except _profile_repo_aliases.AliasError as exc:
+        raise ProfileError(f"{where}: {exc}") from exc
 
     mcp = None
     mcp_auth: object = None  # None: the key is absent and the kind's default applies
@@ -1138,7 +1123,12 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         judgement = _profile_policy.parse_judgement(_table(data, "judgement", where, required=False))
         seal = _profile_policy.parse_seal(_table(data, "seal", where, required=False))
         resources = _profile_resources.parse(_table(data, "resources", where, required=False))
-    except (_profile_policy.PolicyError, _profile_resources.ResourcesError) as exc:
+        telemetry = _profile_telemetry.parse(_table(data, "telemetry", where, required=False))
+    except (
+        _profile_policy.PolicyError,
+        _profile_resources.ResourcesError,
+        _profile_telemetry.TelemetryError,
+    ) as exc:
         raise ProfileError(f"{where}: {exc}") from exc
 
     planner_fields = _fields(
@@ -1178,6 +1168,7 @@ def parse(text: str, where: str = "profile", *, tolerate_unknown: bool = False) 
         gardening=gardening,
         seal=seal,
         judgement=judgement,
+        telemetry_flyte_sdk=telemetry,
         resources=MappingProxyType(resources),
         repo_aliases=repo_aliases,
         standards=standards,
@@ -1256,12 +1247,9 @@ def _bench(
 def _check_deploy_repo(url: str, setting: str, where: str) -> None:
     """Refuse `url` unless it is a github.com URL of exactly one `owner/repo`."""
     try:
-        parsed = _github.parse_repo(url)
+        _github.require_owner_repo(url)
     except _github.GithubError as exc:
         raise ProfileError(f"{where}: {setting} must be a github.com repository: {exc}") from exc
-    # The URL pattern lets a path or spaces through (`.../org/engine/tree/main`): only `owner/repo` reads.
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", parsed):
-        raise ProfileError(f"{where}: {setting} must be a github.com repository: not one owner/repo: {url!r}")
 
 
 def load(spec: str, *, tolerate_unknown: bool = False) -> Profile:
@@ -1408,8 +1396,10 @@ def child_env(profile: Profile, env: dict[str, str]) -> dict[str, str]:
 
     The worktree has no `profiles/` (real profiles are untracked), so the child gets the text.
     """
-    out = {k: v for k, v in env.items() if k != PROFILE_ENV}
+    # DO_NOT_TRACK: the profile decides (`telemetry_env`), not what the deployer inherited.
+    out = {k: v for k, v in env.items() if k not in (PROFILE_ENV, "DO_NOT_TRACK")}
     out[TOML_ENV] = profile.deployment_text()
+    out.update(telemetry_env(profile))
     return out
 
 
@@ -1441,6 +1431,7 @@ def pod_env() -> dict[str, str]:
     # Only the deployer's deploy children set these, explicitly (`_deploy._run_child`'s `deployer_env`).
     env.update(_deployer_env)
     env.update(_profile_oss.endpoint_env_and_kind(profile))
+    env.update(telemetry_env(profile))
     return env
 
 

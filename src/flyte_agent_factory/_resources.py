@@ -69,11 +69,18 @@ DEFAULTS: Mapping[str, Spec] = {
     "subagent": Spec("500m", "4", "1536Mi", "8Gi", "10Gi"),
     # Setup tasks are a few API calls.
     "setup": Spec("250m", "1", "256Mi", "1Gi"),
-    # Nothing at all (BestEffort): 104 MiB idle, 1.5 CPU-seconds at startup. Under node pressure a BestEffort
-    # pod is killed first (oom_score_adj 1000), instead of starving the pods that hold work; it restarts
-    # cheaply.
-    "mcp": Spec(),
-    # A FastAPI process forwarding deliveries (~80 MiB): as `mcp`.
+    # Measured RSS of the served app is 114-126 MiB (104 MiB idle, plus the app-log reads and a busy
+    # connector); 256Mi is about twice that, 512Mi about four times. It was BestEffort, which Kubernetes
+    # evicts first under node pressure, and the tool that reports on the factory must not be the first thing
+    # a busy node drops (#49: factory-mcp was replaced several times with no reason to read). CPU: the limit
+    # of one core covers the 1.5 CPU-seconds of startup and a burst. The request is the ticks' 100m: the
+    # default node's CPU budget (3.0: one slot and one lane shard beside the idle factory) has no room for
+    # more, and a CPU request only weights CPU shares and does not decide eviction (memory does), so a small
+    # one is enough. `scan` gave up the 100m this takes.
+    "mcp": Spec("100m", "1", "256Mi", "512Mi"),
+    # A FastAPI process forwarding deliveries (~80 MiB): nothing at all (BestEffort). Under node pressure a
+    # BestEffort pod is killed first (oom_score_adj 1000) instead of starving the pods that hold work, and it
+    # restarts cheaply.
     "webhook": Spec(),
     # Chromium is unbounded and a limit forces a request (Kubernetes copies it), so a 256Mi request goes with
     # the 4Gi cap. No CPU request: it bursts. Disk was 20Gi with no measurement behind it.
@@ -84,7 +91,7 @@ DEFAULTS: Mapping[str, Spec] = {
     # The ticks' floor, plus subprocesses that import the agent and submit a remote image build.
     "deployer": Spec("250m", "2", "512Mi", "2Gi"),
     # One standards-gate scan of one repository; `_factory.scan_targets` runs them one at a time.
-    "scan": Spec("250m", "2", "512Mi", "4Gi"),
+    "scan": Spec("150m", "2", "512Mi", "4Gi"),
     # A test lane runs as shards (`_slow_lane`, `_lane_shards`), each a child of `AGENT_FACTORY_LANE_CPUS`
     # CPUs sized by `lane_shard`; this is one default-sized shard. The profile's `[resources.lanes]` applies
     # on top of a shard of any size (`for_lane_shard`).

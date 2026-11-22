@@ -38,6 +38,15 @@ def cpu_allowance() -> float:
     return _lane_shards.read_cpu_quota(_CGROUP_CPU_MAX)
 
 
+def _read(path: str) -> bytes:
+    """Return the start of a small /proc file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return os.read(fd, 4096)
+    finally:
+        os.close(fd)
+
+
 def sample_group(pgid: int) -> Sample | None:
     """Return the schedstat of every thread of every live process in process group or session `pgid`.
 
@@ -45,23 +54,25 @@ def sample_group(pgid: int) -> Sample | None:
     started and ended between two samples is never seen; that only makes the clock closer to wall time.
     Neither is one that left the group with `setsid` (the gate's own tools start their own session).
     """
-    proc = Path("/proc")
-    if not (proc / "self/schedstat").exists():
+    if not os.path.exists("/proc/self/schedstat"):
         return None
     found: Sample = {}
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            # The command name is in parentheses and may hold spaces; the fields after it are fixed.
-            fields = (entry / "stat").read_text().rpartition(")")[2].split()
-            if pgid not in (int(fields[2]), int(fields[3])):  # process group, session
+    # os calls on bytes, not pathlib: a node can hold thousands of processes (unreaped zombies included),
+    # and a slow scan delays the clock's first poll past a short tool's whole life.
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if not entry.name.isdigit():
                 continue
-            for task in (entry / "task").iterdir():
-                cpu, wait = (task / "schedstat").read_text().split()[:2]
-                found[f"{entry.name}/{task.name}"] = (int(cpu), int(wait))
-        except (OSError, ValueError, IndexError):
-            continue  # it exited while being read
+            try:
+                # The command name is in parentheses and may hold spaces; the fields after it are fixed.
+                fields = _read(f"/proc/{entry.name}/stat").rpartition(b")")[2].split()
+                if pgid not in (int(fields[2]), int(fields[3])):  # process group, session
+                    continue
+                for task in os.listdir(f"/proc/{entry.name}/task"):
+                    cpu, wait = _read(f"/proc/{entry.name}/task/{task}/schedstat").split()[:2]
+                    found[f"{entry.name}/{task}"] = (int(cpu), int(wait))
+            except (OSError, ValueError, IndexError):
+                continue  # it exited while being read
     return found
 
 

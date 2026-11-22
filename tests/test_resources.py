@@ -114,7 +114,9 @@ def test_the_default_node_holds_at_least_one_shard_and_the_budget_says_how_many(
     assert _resources.budget(_profile.load(str(PROFILES / "example.toml"))).shards_at_once >= 1
     fewer_cpus = _resources.budget(parse('\n[resources.lanes]\ncpu = ["500m", "2"]\n'))
     assert fewer_cpus.shard.cpu == 0.5 and fewer_cpus.live_total.cpu == everything.live_total.cpu - 1.0
-    assert fewer_cpus.shards_at_once == 2  # memory binds: 12 GiB - 2.5 idle - 1.5 slot leaves 8, 3 per shard
+    assert (
+        fewer_cpus.shards_at_once == 2
+    )  # memory binds: 12 GiB - 2.75 idle - 1.5 slot leaves 7.75, 3 per shard
     smaller = _resources.budget(parse('\n[resources.lanes]\ncpu = ["500m", "2"]\nmemory = ["1Gi", "5Gi"]\n'))
     assert smaller.shards_at_once == 3  # CPU binds: 3.0 - 1.0 idle - 0.5 slot leaves 1.5, 0.5 per shard
 
@@ -178,8 +180,14 @@ def test_the_browser_apps_keep_shared_memory_and_a_memory_limit():
 
 
 def test_the_mcp_and_webhook_apps_request_nothing():
-    for app in (_factory_mcp.app, _webhook.env):
-        assert get_proto_resources(app.resources) is None, app.name
+    # Stricter than it was: the webhook still asks for nothing, but `mcp` has a real request and a memory
+    # limit (measured RSS 114-126 MiB), so it is no longer the first pod a node evicts.
+    assert get_proto_resources(_webhook.env.resources) is None
+    assert _resources.DEFAULTS["mcp"] == _resources.Spec("100m", "1", "256Mi", "512Mi")
+    proto = get_proto_resources(_factory_mcp.app.resources)
+    assert proto is not None
+    assert {_NAME(r.name): r.value for r in proto.requests} == {"CPU": "100m", "MEMORY": "256Mi"}
+    assert {_NAME(r.name): r.value for r in proto.limits} == {"CPU": "1", "MEMORY": "512Mi"}
 
 
 def test_a_bounded_component_serializes_a_request_and_a_limit():
@@ -210,9 +218,11 @@ memory = "4Gi"
 
 
 def test_a_profile_can_give_a_component_that_has_none_a_request():
-    mcp = _resources.for_component(parse('\n[resources.mcp]\nmemory = ["128Mi", "512Mi"]\n'), "mcp")
-    assert mcp.to_flyte().memory == ("128Mi", "512Mi")
-    assert mcp.to_flyte().cpu is None
+    webhook = _resources.for_component(
+        parse('\n[resources.webhook]\nmemory = ["128Mi", "512Mi"]\n'), "webhook"
+    )
+    assert webhook.to_flyte().memory == ("128Mi", "512Mi")
+    assert webhook.to_flyte().cpu is None
 
 
 def test_the_deployment_text_carries_the_table_to_the_pods():

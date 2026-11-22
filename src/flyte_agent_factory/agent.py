@@ -242,6 +242,7 @@ env = flyte.TaskEnvironment(
         "_factory_usage.py",
         "_grants_cli.py",
         "_lane_shards.py",
+        "_oss_follow.py",
         "_seal_launch.py",
         "_tick_guard.py",
         # The gate launches this by name; importing it would also register its task environment.
@@ -321,11 +322,10 @@ setup_env = flyte.TaskEnvironment(
     env_vars={"PYTHONUNBUFFERED": "1", **_project_env, **_profile.pod_env()},
 )
 
-# Sub-agents run here, not in `env`. Secrets are declared per environment, so a
-# sub-agent sharing `env` would inherit every secret the parent mounts -- the
-# deploy key, any API tokens -- and a sub-agent is the least supervised thing in
-# the system. It gets the Claude token and nothing else, and no volume: its
-# workspace arrives as a typed input and leaves as a typed output.
+# Sub-agents run here, not in `env`. Secrets are declared per environment, so a sub-agent sharing `env` would
+# inherit every secret the parent mounts -- the deploy key, any API tokens -- and a sub-agent is the least
+# supervised thing in the system. It gets the Claude token and nothing else, and no volume: its workspace
+# arrives as a typed input and leaves as a typed output.
 subagent_env = flyte.TaskEnvironment(
     name=_SUBAGENT_ENV_NAME,
     image=agent_image(),
@@ -335,17 +335,16 @@ subagent_env = flyte.TaskEnvironment(
         "PYTHONUNBUFFERED": "1",
         **_session_env_vars,
         **_profile_oss.endpoint_env_and_kind(),
+        **_profile.telemetry_env(_session_config._PROFILE),  # not `pod_env()`: the SDK's switch only
         "AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE": _names.getenv("AGENT_FACTORY_CHOSEN_AUTHOR_ENGINE", "claude"),
         **_token_secret_env(),
         **_codex_token_secret_env(),
     },
-    # Spot by default: a swarm is the bulk of the compute, it is discounted,
-    # and spot is a separate pool from the on-demand nodes this cluster has
-    # exhausted -- so it is both cheaper and likelier to be placed. A preempted
-    # sub-agent is retried on the platform's own budget rather than consuming
-    # `retries`; the cost is the work it had done, which for a short role
-    # invocation is small. Override to False for a sub-agent doing something
-    # long enough that losing it would hurt.
+    # Spot by default: a swarm is the bulk of the compute, it is discounted, and spot is a separate pool from
+    # the on-demand nodes this cluster has exhausted -- so it is both cheaper and likelier to be placed. A
+    # preempted sub-agent is retried on the platform's own budget rather than consuming `retries`; the cost
+    # is the work it had done, which for a short role invocation is small. Override to False for a sub-agent
+    # doing something long enough that losing it would hurt.
     interruptible=True,
     # No `reusable` policy. A warm pool was the original design, but a reusable
     # (actor) action runs the image's `unionai-actor-bridge`, which the agent

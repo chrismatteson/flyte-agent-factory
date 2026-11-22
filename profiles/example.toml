@@ -178,6 +178,11 @@ brand = "" # empty keeps inferred BRAND.md behaviour
 # memory = ["4Gi", "16Gi"]
 # disk = "50Gi"
 
+# Optional: the Flyte SDK's crash reports and usage counters are off in every environment the factory deploys.
+# Uncomment to send them to the SDK's maintainers (docs/security.md#flyte-sdk-telemetry).
+# [telemetry]
+# flyte_sdk = true
+
 [planner]
 # Change only after the single-writer deployment and live smoke gates pass.
 admission = "legacy"

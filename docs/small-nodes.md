@@ -39,25 +39,25 @@ Two scenarios, for the default profile (`profiles/example.toml`; regenerate with
 | Component | Environment | CPU request / limit | Memory request / limit | Disk request |
 |---|---|---|---|---|
 | **always on** | | | | |
-| mcp | factory-mcp | none | none | none |
+| mcp | factory-mcp | 100m / 1 | 256Mi / 512Mi | none |
 | ticks | factory | 100m / 1 | 256Mi / 1Gi | none |
 | deployer | factory-deployer | 250m / 2 | 512Mi / 2Gi | none |
 | ticks | factory-reconcile | 100m / 1 | 256Mi / 1Gi | none |
-| scan | gardening-scan | 250m / 2 | 512Mi / 4Gi | none |
+| scan | gardening-scan | 150m / 2 | 512Mi / 4Gi | none |
 | **one live project** | | | | |
 | slot | slot | 500m / 4 | 1536Mi / 8Gi | 20Gi |
 | lanes | test-lanes | 1500m / 2 | 3Gi / 5Gi | none |
 
 | Scenario | CPU | Memory | Ephemeral disk |
 |---|---|---|---|
-| idle | 0.70 | 1.50 Gi | 0 Gi |
-| one project live | 2.70 | 6.00 Gi | 20 Gi |
+| idle | 0.70 | 1.75 Gi | 0 Gi |
+| one project live | 2.70 | 6.25 Gi | 20 Gi |
 | budget | 3.00 | 12.00 Gi | 50 Gi |
 
 Lane shards that fit at once beside one live slot: 1.
 
 With every optional component on (webhook with issue intake, board, bench, loop, one personal browser) the totals are
-1.00 CPU / 2.50 Gi idle and 3.00 CPU / 7.00 Gi with one project live, still with room for one shard at a time; `tests/test_resources.py` asserts both profiles
+1.00 CPU / 2.75 Gi idle and 3.00 CPU / 7.25 Gi with one project live, still with room for one shard at a time; `tests/test_resources.py` asserts both profiles
 fit.
 
 Decisions in the count:
@@ -87,12 +87,12 @@ Decisions in the count:
 | `slot` | the slot's `agent.py` env | 1-4 CPU, 2-12 Gi, disk 120Gi | 500m-4 CPU, 1536Mi-8Gi, disk 20Gi | Measured 0.27 CPU average, ~0.5 GiB anonymous memory (Evidence). 120Gi could not be placed on a 100 GB boot disk. |
 | `subagent` | the slot's sub-agent env | 1-4 CPU, 2-8 Gi, disk 50Gi | 500m-4 CPU, 1536Mi-8Gi, disk 10Gi | As the slot; the workspace arrives as an input. |
 | `setup` | `factory-setup` | 1 CPU, 2Gi (request only) | 250m-1 CPU, 256Mi-1Gi | A few API calls. |
-| `mcp` | `factory-mcp` app | SDK default: 1 CPU, 512Mi | none (BestEffort) | 104 MiB idle. |
+| `mcp` | `factory-mcp` app | SDK default: 1 CPU, 512Mi; then none (BestEffort) | 100m-1 CPU, 256Mi-512Mi | Measured RSS 114-126 MiB: 256Mi is about twice that, 512Mi about four times. BestEffort made it the first pod a node evicts, and #49 found it replaced with no reason to read. |
 | `webhook` | `factory-webhook` app | 1 CPU, 512Mi | none (BestEffort) | A FastAPI process, ~80 MiB. |
 | `browser` | `claude-browser`, the personal browsers | 1-4 CPU, 2-8 Gi, disk 20Gi, shm 2Gi | no CPU request, 256Mi-4Gi, disk 10Gi, shm 2Gi | Chromium is unbounded, so it keeps a limit, and a limit forces a request. |
 | `ticks` | `factory`, `factory-reconcile`, `factory-loop`, `factory-issues`, `factory-bench` | 1 CPU, 1Gi (`factory-bench`: 2Gi), request only | 100m-1 CPU, 256Mi-1Gi | A tick is the Flyte runtime plus one import and a few HTTP calls. |
 | `deployer` | `factory-deployer` | 1 CPU, 2Gi | 250m-2 CPU, 512Mi-2Gi | A tick, plus subprocesses that import the agent and submit an image build. |
-| `scan` | `gardening-scan` | 2 CPU, 4Gi | 250m-2 CPU, 512Mi-4Gi | One scan at a time. |
+| `scan` | `gardening-scan` | 2 CPU, 4Gi | 150m-2 CPU, 512Mi-4Gi | One scan at a time; gave up 100m of CPU request to `mcp`, which the default node's CPU budget could not otherwise fit. |
 | `lanes` | each test-lane shard (`_slow_lane`, `_lane_shards`) | one lane of 8 CPU, 8Gi (request only), before #12 sharded it | per shard of `AGENT_FACTORY_LANE_CPUS` (default 2): 3/4 of the CPUs to all of them, 1.5 GiB per CPU (rounded up) to 2 per CPU plus 1 GiB; 1500m-2 CPU, 3Gi-5Gi by default | #12's shard sizing, unchanged; `[resources.lanes]` applies on top. The budget counts one shard. |
 | `bench` | `factory-bench-check` | 1 CPU, 2Gi | unchanged | Heavy, optional, not in the budget. |
 
@@ -131,18 +131,20 @@ laptop, with no such text, it uses the defaults.
 
 ## An app with no requests
 
-`factory-mcp` and `factory-webhook` ask for nothing. Flyte then writes no resources into the pod spec, and Kubernetes
+`factory-webhook` asks for nothing. Flyte then writes no resources into the pod spec, and Kubernetes
 makes the pod **BestEffort**. Two things can fill the gap, and the engine does neither:
 
 - a namespace **LimitRange** with `default` and `defaultRequest` (check with
   `kubectl get limitrange -n <namespace>`; on Union and OSS Flyte alike the engine creates none);
 - Knative's `config-defaults` (`revision-cpu-request` and the like), unset by default.
 
-If the cluster has either, the app gets those values instead; set `[resources.mcp]` to override them.
+If the cluster has either, the app gets those values instead; set `[resources.webhook]` to override them.
 
 **The trade-off.** A BestEffort pod has an OOM score adjustment of 1000, so under node memory pressure it is killed
-and evicted first, before any pod with requests. That is what is wanted of `factory-mcp` and `factory-webhook`: they
-restart in seconds, hold no state, and should not be what starves a slot. The browser is the opposite case: Chromium is
+and evicted first, before any pod with requests. That is what is wanted of `factory-webhook`: it
+restarts in seconds, holds no state, and should not be what starves a slot. `factory-mcp` is not BestEffort: it
+is the tool that reports on the factory, its operations and secret-input links live in memory, and #49 found it replaced several
+times with nothing to read afterwards, so it asks for 256Mi and may use 512Mi. The browser is the opposite case: Chromium is
 unbounded and must not take the node down, so it keeps a 4Gi limit. Kubernetes sets a container's request to its limit
 when only a limit is given, so the browser also gets an explicit 256Mi request, or it would be placed as a 4Gi pod.
 
@@ -158,7 +160,7 @@ cpu = ["2", "8"]
 memory = ["4Gi", "16Gi"]
 disk = "50Gi"
 
-[resources.mcp]          # give factory-mcp a guaranteed share instead of BestEffort
+[resources.webhook]      # give factory-webhook a guaranteed share instead of BestEffort
 memory = ["256Mi", "512Mi"]
 ```
 
@@ -191,7 +193,7 @@ Measured on a 16-core Xeon 8124M, fresh process, median of 3 (RSS / CPU time):
 | `agent` | 75.6 MiB | 0.95 s |
 
 - **factory-mcp**, served locally with uvicorn and idle for 20 s: RSS equals its peak, 104 MiB, and 1.47 s of CPU in
-  total, all of it startup.
+  total, all of it startup. Deployed, its RSS measured 114-126 MiB (#49).
 - **A live slot pod** on Union (this project's own, with a 4-CPU and a 12Gi limit), over the first ~10 minutes of an
   active Claude Code session: 172 CPU-seconds in 626 s of wall time (about 0.27 CPU on average, about 0.13 over the
   first 341 s). The cgroup's `memory.peak` was 3.47 GiB, of which 1.6 GiB was reclaimable page cache from restoring

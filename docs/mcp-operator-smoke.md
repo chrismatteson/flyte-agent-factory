@@ -136,7 +136,7 @@ check that (`list_runs` with `project "other"` is refused), so look from a shell
 `uv run flyte --config "$FLYTE_CONFIG" get run -p other -d <domain>` shows nothing new.
 
 **If this step succeeds and a run appears in `other`, the server is not scoping `run_project`: stop, abort that run,
-and do not leave the new version deployed.** The factory's `_scoped_to_the_factory` refuses every parameter whose
+and do not leave the new version deployed.** The factory's `_build_scope_check` refuses every parameter whose
 name ends in `project` or `domain` (`_scoped_arguments`), `run_project` and `run_domain` among them, so this
 step must be refused. Also run it with `run_domain "<other domain>"`; the message names `run_domain`.
 
@@ -151,7 +151,7 @@ asks for nothing:
 ```text
 Launch a project with run_task name "factory.launch" and inputs: name "smoke-test", model "<the model INSTRUCTIONS names>",
 brief "Smoke test of the MCP server. Do not change anything: write one line to README.md saying hello, then stop.",
-priority "low". Then call wait_for_run with timeout_s 300 and then get_run_io, and show me each result.
+priority "low". Then call wait_for_run with timeout_s 170 and then get_run_io, and show me each result.
 ```
 
 Must show:

@@ -42,6 +42,7 @@ from flyte_agent_factory import (
     _github,
     _issues,
     _names,
+    _oss_follow,
     _profile,
     _queue,
     _resources,
@@ -922,11 +923,14 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
     """Read a project's live or newest run report, or a specific run by id."""
     live = _factory_base._labelled_runs(name, in_phase=_factory_base.SERVER_LIVE, limit=1)
     run = next((r for r in live if _factory_base._phase(r) in _factory_base.LIVE), None)
-    if run is None:
-        # Runs launched before the queue's project labels can still be live for days.
+    if run is None:  # Runs launched before the queue's project labels can still be live for days.
         run = next((r for r in operated_live() if _project_name(r) == name), None)
     if run is None:
         run = next(iter(_factory_base._labelled_runs(name, limit=1)), None)
+    if run is None:  # OSS lists runs without labels, so the label filters above find nothing there.
+        run = _oss_follow.find_run_by_label(_factory_base.PROFILE, {_factory_base.LABEL_PROJECT: name})
+    if isinstance(run, dict):  # the server could not be asked: not the same as "no such project"
+        return {**run, "name": name}
     if run is None:
         try:
             run = remote.Run.get(name=name)
@@ -938,7 +942,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
     result: dict[str, Any] = {
         "name": _factory_base.run_labels(run).get(_factory_base.LABEL_PROJECT) or name,
         "run": run.name,
-        "url": run.url,
+        **_oss_follow.pick_url_fields(run.url, _factory_base.PROFILE),
     }
     queue = _factory_base.queue_root()
     # The grant is the newest request that was or will be run: a cancelled or failed one never ran.
@@ -964,11 +968,13 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
             ),
         }
     try:
-        page = _factory_base.report_html(run)
-    except REMOTE_ERRORS:  # a remote call; its error text may hold signed URLs, so it is omitted
-        return {**result, "error": "Run report unavailable; open the run URL for details"}
+        page: str | None = _factory_base.report_html(run)
+    except REMOTE_ERRORS as exc:  # a remote call; its error text may hold signed URLs, so it is omitted
+        page, error = _oss_follow.recover_report(run, _factory_base.PROFILE, exc)  # OSS: the stored copy
+        if page is None:
+            return {**result, **error}
     if not page or page == "None":
-        return {**result, "error": "Run report is not available yet"}
+        return {**result, **_oss_follow.explain_missing_report(run, _factory_base.PROFILE)}
     data = _dashboard.from_report(page)
     if data is None:
         return {**result, "error": "Run report has no dashboard snapshot (older report or not published yet)"}
@@ -999,7 +1005,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
             }
             for row in (timeline[-rows:] if rows > 0 else [])
         ],
-        open_questions=data.get("needs_you", []),
+        open_questions=_oss_follow.pick_open_questions(run, data, _factory_base.PROFILE),
         decisions=_factory_status.decisions(data),
         review=review,
         pr_url=(data.get("deliverables") or {}).get("pr", ""),
@@ -1017,7 +1023,7 @@ def read_status(name: str, rows: int = 40) -> dict[str, Any]:
             return {
                 "name": result["name"],
                 "run": run.name,
-                "url": run.url,
+                "url": result["url"],
                 "error": "Dashboard summary exceeds the status size limit; open the run URL",
                 "standards": result["standards"],
             }

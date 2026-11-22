@@ -163,6 +163,8 @@ NO_UNION = {
     ("ops/probes/reviewer_placement.py", "actor"): "returns a constant; the probe is where it is placed",
     ("ops/model_eval/mechanical.py", "env"): "runs a project's checks; deliberately declares no secrets",
     ("ops/probes/run_live_author_session.py", "env"): "runs `claude` on the slot's setup-token, nothing else",
+    ("ops/devbox_mcp/task.py", "env"): "runs an OSS devbox in a privileged pod; talks only to that devbox",
+    ("ops/devbox_mcp/probe_run.py", "env"): "registered on the OSS devbox, never on Union",
 }
 
 #: Functions that build an environment per call, and the test that checks what they build.
