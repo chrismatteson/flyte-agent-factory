@@ -44,6 +44,15 @@ def _project_python_first(monkeypatch):
     monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
+@pytest.fixture(autouse=True)
+def _checks_required(monkeypatch):
+    """These tests cover the rerun itself, so they run it as `--checks required` (the old behaviour).
+
+    The default (`off`) and `advisory` are covered by their own tests below, which pass `checks` explicitly.
+    """
+    monkeypatch.setitem(_promote.deliver.__kwdefaults__, "checks", "required")
+
+
 @pytest.fixture
 def world(tmp_path):
     """A bare target on `main`, and a workspace whose project `demo` imported it and committed a change."""
@@ -153,6 +162,45 @@ def test_red_lint_stops_before_push(world):
     assert not report.ok and report.stage == "ci"
     assert "lint is red" in report.message
     assert "promote/demo" not in branches(remote)
+
+
+def test_by_default_a_red_target_ci_is_not_rerun_and_the_branch_is_pushed(world):
+    """The pre-review gate and the PR's own CI run the target's checks; delivery leaves them to those."""
+    remote, _, _ = world
+    push_upstream(remote, {"check.py": CHECK_RED}, "Break the target's lint")
+    report = deliver(world, checks="off")
+    assert report.ok and report.stage == "done", report
+    assert "promote/demo" in branches(remote)
+
+
+def test_advisory_checks_push_and_put_the_failure_in_the_pull_request_body(world, monkeypatch):
+    remote, _, _ = world
+    push_upstream(remote, {"check.py": CHECK_RED}, "Break the target's lint")
+    bodies = []
+    real = _promote._push
+
+    def record(*args, **kwargs):
+        bodies.append(args[7])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_promote, "_push", record)
+    report = deliver(world, checks="advisory")
+    assert report.ok and report.stage == "done", report
+    assert "promote/demo" in branches(remote)
+    assert "rerun checks did not all pass" in report.message
+    assert "### Delivery checks (advisory)" in bodies[0] and "lint is red" in bodies[0]
+
+
+def test_an_unknown_checks_value_is_refused_before_anything_runs(world):
+    report = deliver(world, checks="sometimes")
+    assert not report.ok and report.stage == "checks", report
+    assert "promote/demo" not in branches(world[0])
+
+
+def test_a_secret_still_stops_delivery_with_checks_off(world, monkeypatch, tmp_path):
+    report = deliver(world, checks="off", **_secret(world, monkeypatch, tmp_path))
+    assert not report.ok and report.stage == "scan", report
+    assert "promote/demo" not in branches(world[0])
 
 
 def test_a_ci_that_could_not_run_stops_before_push(world, monkeypatch):
@@ -1038,7 +1086,8 @@ def test_the_deliver_command_passes_its_flags_on_and_exits_by_the_report(monkeyp
 
     monkeypatch.setattr(_promote, "deliver", fake_deliver)
     argv = ["deliver", "proj", "br", "--to", "T", "--fork", "F", "--title", "Ti", "--base", "B", "--no-dco"]
-    assert promote_cli.main([*argv, "--fixes", "a/b#1", "--fixes", "a/b#2", "--dry-run"]) == 0
+    flags = ["--fixes", "a/b#1", "--fixes", "a/b#2", "--dry-run", "--checks", "advisory"]
+    assert promote_cli.main([*argv, *flags]) == 0
     assert calls == [
         (
             Path("proj"),
@@ -1052,6 +1101,7 @@ def test_the_deliver_command_passes_its_flags_on_and_exits_by_the_report(monkeyp
                 "fixes": ["a/b#1", "a/b#2"],
                 "dry_run": True,
                 "replace": False,
+                "checks": "advisory",
             },
         )
     ]
