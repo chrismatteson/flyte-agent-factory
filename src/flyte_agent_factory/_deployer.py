@@ -5,10 +5,11 @@ On a signed push, or a periodic reconcile, `deploy_if_changed` compares the depl
 successful deploy. If they differ and its CI passed, it deploys that SHA: the work slots, the factory
 environments and itself, then the apps. It is on by `[deploy] auto` in the profile and is otherwise a no-op.
 
-It holds no deploy key. Status and source come through the profile's GitHub App
-(`_github`) when it is installed on the deploy repo, else anonymously (a public repository); the source is
-a shallow fetch of exactly the SHA over HTTPS. Projects that are running keep the version they started with,
-so a deploy never interrupts one.
+Status and source come through the profile's GitHub App (`_github`, read-only on code) when it is installed on
+the deploy repo, else anonymously (a public repository); the source is a shallow fetch of exactly the SHA over
+HTTPS. The one thing it writes is its deploy lease, on the state branch (`_acquire_lease`), with the workspace
+deploy key `[secrets] deploy_key`, which `_child_env` keeps from every deploy child. Projects that are running
+keep the version they started with, so a deploy never interrupts one.
 
 A commit to the direction repo that changes nothing the deploy reads (`_deploy_reads`: the profile file and
 the standards it captures; everything else there, such as `operator/STATE.md` and `projects/**`, is not read)
@@ -26,6 +27,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
         _deploy,
         _deploy_reads,
         _factory_base,
+        _git,
         _github,
         _github_mode,
         _isolation_canary,
@@ -52,6 +55,7 @@ if TYPE_CHECKING:
         _pull_requests,
         _resources,
         _standards,
+        _state_store,
         _tick_guard,
         _union_identity,
     )
@@ -62,6 +66,7 @@ else:
         _deploy,
         _deploy_reads,
         _factory_base,
+        _git,
         _github,
         _github_mode,
         _isolation_canary,
@@ -70,6 +75,7 @@ else:
         _pull_requests,
         _resources,
         _standards,
+        _state_store,
         _tick_guard,
         _union_identity,
     )
@@ -83,6 +89,8 @@ PROJECT = os.environ.get(
 DOMAIN = os.environ.get("FLYTE_MCP_DOMAIN", os.environ.get("FLYTE_INTERNAL_DOMAIN", PROFILE.backend.domain))
 MAX_RUNTIME = timedelta(minutes=60)
 MAX_ATTEMPTS = 3
+#: How much of a failed run's error the tick repeats; the run has the rest.
+_ERROR_SHOWN = 400
 #: Deploys one `deploy_pair` run makes when the heads move under it; a fourth head waits for a tick.
 MAX_DEPLOYS_PER_RUN = 3
 SETTLE = 10
@@ -139,12 +147,19 @@ def identities(profile: _profile.Profile) -> list[dict[str, str]]:
 def _child_env(profile: _profile.Profile) -> dict[str, str]:
     """Return this pod's environment for a child process, without any credential it must not pass on.
 
-    That is the App's credentials, the key Union injects into every pod, and any tier key but the
-    deployer's own (`KEY_ENV`), under either of its names.
+    That is the App's credentials, the key Union injects into every pod, the workspace deploy key (the
+    deploy lease's, which can write the state branch) and any tier key but the deployer's own (`KEY_ENV`),
+    under either of its names.
     """
     hidden = {
         *_pull_requests.credential_env_vars(profile.github.private_key_secret, os.environ),
         *_union_identity.INJECTED_VARS,
+        # `install_deploy_key` moves the key out of its variables into a file that GIT_SSH_COMMAND names,
+        # which would hand the key to anything that runs ssh; the mounted variables (`GIT_DEPLOY_KEY` and
+        # the per-repo ones) and Flyte's prefixed copy are hidden in case it has not run yet.
+        *(name for name in os.environ if name.startswith(_git.GIT_DEPLOY_KEY_ENV_VAR)),
+        _pull_requests.prefixed_key_env_var(profile.secrets.deploy_key, os.environ),
+        "GIT_SSH_COMMAND",
     }
     for secret, var in _tier_mounts(profile).items():
         hidden.add(_pull_requests.prefixed_key_env_var(secret, os.environ))
@@ -178,6 +193,8 @@ env = flyte.TaskEnvironment(
             else []
         ),
         *_IDENTITY_SECRETS,
+        # The deploy lease is a file on the state branch, pushed with this key (`_acquire_lease`).
+        *_factory_base.state_secrets(PROFILE),
     ],
     env_vars={
         "FLYTE_MCP_PROJECT": PROJECT,
@@ -343,11 +360,20 @@ def _started(run: remote.Run) -> bool:
     return cast(bool, status.HasField("start_time") and status.start_time.seconds > 0)
 
 
-async def _failed_attempts(profile: _profile.Profile, labels: dict[str, str], last: remote.Run | None) -> int:
-    """Return started runs of this pair that failed since the newest release, counted up to MAX_ATTEMPTS."""
+@dataclass(frozen=True)
+class _Failures:
+    count: int  # started runs of the pair that failed since the newest release, up to MAX_ATTEMPTS
+    newest: remote.Run | None  # the most recent of them
+
+
+async def _failed_attempts(
+    profile: _profile.Profile, labels: dict[str, str], last: remote.Run | None
+) -> _Failures:
+    """Return the started runs of this pair that failed since the newest release."""
     # The SDK's Run protobuf omits creation time. Traverse server creation order to the
     # success boundary instead of substituting start_time (queued runs can start out of order).
     failures = 0
+    newest = None
     async for candidate in _factory_base.iter_runs_aio(
         release_labels(profile),
         task_name=_deploy.DEPLOY_PAIR,
@@ -364,9 +390,55 @@ async def _failed_attempts(profile: _profile.Profile, labels: dict[str, str], la
             and _started(candidate)
         ):
             failures += 1
+            newest = newest or candidate
             if failures == MAX_ATTEMPTS:
                 break
-    return failures
+    return _Failures(failures, newest)
+
+
+#: What a failed attempt's error says when the cause is a credential or a permission, which a retry cannot
+#: fix: (pattern, what the owner changes). The first that matches names the fix.
+_CREDENTIAL_FAILURES = (
+    (
+        re.compile(r"access_tokens: HTTP (401|403|422)|permissions requested are not granted", re.I),
+        "the GitHub App is not allowed what the deployer asked of it: check the App's permissions and that "
+        "it is installed on the repositories named in [repo], [deploy] and [direction]",
+    ),
+    (
+        # What GitHub's ssh says to a key it does not accept, or a key that cannot write; not git's generic
+        # "Could not read from remote repository", which follows a timeout or a DNS failure as well.
+        re.compile(
+            r"Permission denied \(publickey|Permission to \S+ denied to|marked as read only"
+            r"|Host key verification failed",
+            re.I,
+        ),
+        "the state remote refused the deploy key: [secrets] deploy_key must be a write-enabled deploy key of "
+        "the [repo] project repository",
+    ),
+)
+
+
+# GitHub answers a rate limit, primary or secondary, with 403 (or 429) on any endpoint, the token one too:
+# that passes on its own, so it keeps the retries an ordinary failure gets.
+_RATE_LIMITED = re.compile(r"rate limit|abuse detection", re.I)
+
+
+def _find_credential_fix(error: str) -> str:
+    """Return what to fix when `error` is a credential or permission failure, else ""."""
+    if _RATE_LIMITED.search(error):
+        return ""
+    return next((fix for pattern, fix in _CREDENTIAL_FAILURES if pattern.search(error)), "")
+
+
+async def _read_run_failure(run: remote.Run) -> str:
+    """Return the redacted, one-line error of a failed run, or why it cannot be read."""
+    try:
+        failure = await run.first_failure.aio()
+        error = failure.error_message if failure else ""
+    except REMOTE_ERRORS as exc:
+        error = f"(error unreadable: {type(exc).__name__})"
+    error = " ".join(_deploy.redact(error).split())
+    return error[:_ERROR_SHOWN] + ("..." if len(error) > _ERROR_SHOWN else "") or "(no error recorded)"
 
 
 def _heads(profile: _profile.Profile, app: _github.GithubApp) -> tuple[str, str, str, str]:
@@ -400,10 +472,15 @@ async def _not_deployable(
     app: _github.GithubApp,
     heads: tuple[str, str, str, str],
     last: remote.Run | None,
-) -> tuple[str | None, dict[str, str]]:
+    *,
+    retry_credentials: bool = False,
+) -> tuple[str | None, dict[str, str], str]:
     """Why the tick's checks refuse these heads (given up on, or CI not green), or None to deploy.
 
-    Also return the labels an attempt at these heads is counted on.
+    Also return the labels an attempt at these heads is counted on, and, when an earlier attempt failed, what
+    it failed on (else ""): the tick says it, whether it submits again or not. An attempt that failed on a
+    credential or permission is not retried, however few attempts it was, unless `retry_credentials`: a
+    retry cannot fix it, and three silent ones only hide it for 45 minutes.
     """
     repo, sha, direction_repo, direction_sha = heads
     shown = _shown(sha, direction_sha)
@@ -414,7 +491,7 @@ async def _not_deployable(
         reader = _deploy_reader(app, target) if target == repo else app
         refused = _unhealthy(reader, target, head, prefix, needs_ci=target == repo)
         if refused:
-            return refused, _pair_labels(profile, sha, direction_sha)
+            return refused, _pair_labels(profile, sha, direction_sha), ""
     move_repo, move_sha = _move_head(profile, app, direction_sha)
     labels = _pair_labels(profile, sha, direction_sha, move_sha)
     if move_repo:
@@ -422,11 +499,28 @@ async def _not_deployable(
         # every tick. Optional, as there; the attempt judges it again before it deploys.
         refused = _unhealthy(app, move_repo, move_sha, "direction ", needs_ci=False)
         if refused:
-            return refused, labels
-    if await _failed_attempts(profile, labels, last) >= MAX_ATTEMPTS:
-        shown += f" moving to {move_repo} at {move_sha}" if move_repo else ""
-        return f"giving up on {shown} after {MAX_ATTEMPTS} attempts; waiting for a new commit", labels
-    return None, labels
+            return refused, labels, ""
+    failures = await _failed_attempts(profile, labels, last)
+    if failures.newest is None:
+        return None, labels, ""
+    detail = await _read_run_failure(failures.newest)
+    failed = f"{failures.newest.name}: {detail}"
+    shown += f" moving to {move_repo} at {move_sha}" if move_repo else ""
+    fix = _find_credential_fix(detail)
+    if failures.count >= MAX_ATTEMPTS:
+        # Before the credential stop: force does not lift the attempt limit, so it is not offered here.
+        msg = f"giving up on {shown} after {MAX_ATTEMPTS} attempts; waiting for a new commit"
+        cause = f" The latest was a credential or permission problem: {fix}." if fix else ""
+        return f"{msg}.{cause} Latest failure, run {failed}", labels, ""
+    if fix and not retry_credentials:
+        return (
+            f"not deploying {shown}: a credential or permission problem, which a retry will not fix; {fix}. "
+            "Not submitting again until a head moves or `deploy_if_changed(force=True)`. "
+            f"Latest failure, run {failed}",
+            labels,
+            "",
+        )
+    return None, labels, f"; the last attempt failed, run {failed}"
 
 
 def _move_head(profile: _profile.Profile, app: _github.GithubApp, direction_sha: str) -> tuple[str, str]:
@@ -513,85 +607,151 @@ async def _submit(task_name: str, *, labels: dict[str, str] | None = None, **inp
     ).run.aio(task, **inputs)
 
 
-def _lock_repo(profile: _profile.Profile, app: _github.GithubApp) -> str:
-    """Return the deploy lock's repository: the deploy repo if the App is installed, else [direction]."""
-    repo = _deploy_repo(profile)
-    if _deploy_reader(app, repo) is app:
-        return repo
-    if profile.direction:
-        return _github.parse_repo(profile.direction.repo)
-    raise _deploy.DeployError(
-        "nothing is deployed: the deploy lock needs a repository the GitHub App can write, and the App is "
-        f"not installed on {repo}. Install the App on {repo}, or set [direction] repo to a repository it is "
-        "installed on"
-    )
+def _hash_lock_name(profile: _profile.Profile) -> str:
+    """Name of this deployer's lock, the same for the lease and for the legacy ref an older engine wrote."""
+    return hashlib.sha256(f"{PROJECT}/{DOMAIN}/{profile.name}".encode()).hexdigest()
 
 
-def _acquire_ref(profile: _profile.Profile, app: _github.GithubApp, run_name: str, sha: str) -> bool:
-    """GitHub's create-if-absent / fast-forward update supplies CAS when listings cannot.
+def _build_lease_key(profile: _profile.Profile) -> str:
+    return f"deployer-lock/{_hash_lock_name(profile)}"
 
-    Keep the ref after completion. Deleting a dead holder's ref races with its successor; instead
-    contenders create sibling commits, so only one fast-forward can replace the terminal holder.
-    A missing/unreadable holder never expires: fail closed until its Flyte phase is authoritative.
+
+def _open_lease_store(profile: _profile.Profile) -> _state_store.Store:
+    """Return the git store of the lease: `[repo] project`'s state branch, whatever `[state] backend` is.
+
+    Not `_state_store.current`: the owner's rule is that the lease adds no state to an object store (or a
+    volume). The deploy key is mounted for every profile (`[secrets] deploy_key` is required), so this
+    works on every backend.
     """
-    repo = _lock_repo(profile, app)
-    # The lock is a git ref and commit: writing those needs contents:write and nothing else.
-    app = app.scoped(_github.CONTENTS_WRITE)
-    key = hashlib.sha256(f"{PROJECT}/{DOMAIN}/{profile.name}".encode()).hexdigest()
-    ref = f"heads/factory-deployer-lock/{key}"
-    path = f"/repos/{repo}/git"
-    parent = None
-    try:
-        current = app._call(repo, "GET", f"{path}/ref/{ref}")
-        parent = current["object"]["sha"]
-    except _github.GithubError as exc:
-        if exc.status != 404:
-            raise
-    if parent:
-        commit = app._call(repo, "GET", f"{path}/commits/{parent}")
-        owner = json.loads(commit["message"])
-        if owner.get("profile") != profile.name or owner.get("scope") != f"{PROJECT}/{DOMAIN}":
-            raise _deploy.DeployError("unrecognized deployer lock; operator resolution required")
-        if owner["run"] == run_name:
-            return True
-        holder = remote.Run.get(name=owner["run"])
-        if str(holder.phase).split(".")[-1] not in _TERMINAL:
-            _say(f"lease held by {owner['run']}")
-            return False
-    # The lock commit must be made of objects its own repository has: the deployed commit is not in a
-    # lock repo that is not the deploy repo, so that repo's own head stands in.
-    anchor = sha if repo == _deploy_repo(profile) else app.default_branch_sha(repo)[1]
-    source = app._call(repo, "GET", f"{path}/commits/{anchor}")
-    commit = app._call(
-        repo,
-        "POST",
-        f"{path}/commits",
-        json={
-            "message": json.dumps({"run": run_name, "profile": profile.name, "scope": f"{PROJECT}/{DOMAIN}"}),
-            "tree": source["tree"]["sha"],
-            "parents": [parent or anchor],
-        },
+    branch = profile.state.branch or _state_store.default_branch(
+        profile.backend.project, profile.backend.domain
     )
+    return _state_store.git_store(profile.repo, branch)
+
+
+#: How old a legacy lock ref can be and still have a live holder; twice the longest a deploy_pair runs.
+_LEGACY_MAX_AGE = 2 * MAX_RUNTIME
+
+
+def _parse_lock_holder(record: str | bytes) -> str:
+    """Return the run a lock record names; a record that is not one needs the operator, like a foreign one."""
     try:
-        if parent:
-            app._call(repo, "PATCH", f"{path}/refs/{ref}", json={"sha": commit["sha"], "force": False})
-        else:
-            app._call(repo, "POST", f"{path}/refs", json={"ref": f"refs/{ref}", "sha": commit["sha"]})
-    except _github.GithubError as exc:
-        if exc.status not in (409, 422):
-            raise
-        # Only contention is a stand-down; permissions/validation failures must fail the run.
-        current = app._call(repo, "GET", f"{path}/ref/{ref}")
-        if current["object"]["sha"] == (parent or commit["sha"]):
-            raise
-        _say("lease taken by a concurrent deploy_pair")
+        run = json.loads(record)["run"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise _deploy.DeployError("unrecognized deployer lock; operator resolution required") from exc
+    if not isinstance(run, str) or not run:
+        raise _deploy.DeployError("unrecognized deployer lock; operator resolution required")
+    return run
+
+
+def _parse_taken_at(commit: dict[str, Any]) -> datetime | None:
+    """When a legacy lock commit was made (GitHub's committer date), or None when it does not say."""
+    try:
+        taken = datetime.fromisoformat((commit.get("committer") or {})["date"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return taken if taken.tzinfo else taken.replace(tzinfo=timezone.utc)
+
+
+def _is_live(run_name: str) -> bool:
+    # Only an authoritative terminal phase frees a holder: a failed lookup raises, so admission fails closed.
+    return str(remote.Run.get(name=run_name).phase).split(".")[-1] not in _TERMINAL
+
+
+def _find_legacy_holder(profile: _profile.Profile, app: _github.GithubApp, run_name: str) -> str | None:
+    """Return the live run, other than `run_name`, that holds a lock ref written by an older deployer, if any.
+
+    Older deployers kept the lock as a git ref `heads/factory-deployer-lock/<key>` in the deploy repo (where
+    the App was installed) or in [direction], written with the App's contents:write. It is only read here,
+    with contents:read, and never written: a deploy_pair that was running when the engine upgraded still
+    holds it. A ref older than any deploy_pair can run (`MAX_RUNTIME` from its start, and it takes the lock
+    after it starts) is not looked up, so a holder Flyte has since forgotten cannot block every later deploy.
+    Remove this once no install has a live legacy holder.
+    """
+    repos = []
+    deploy = _deploy_repo(profile)
+    if _deploy_reader(app, deploy) is app:
+        repos.append(deploy)
+    if profile.direction:
+        repos.append(_github.parse_repo(profile.direction.repo))
+    contents = app.scoped(_github.CONTENTS_READ)
+    ref = f"heads/factory-deployer-lock/{_hash_lock_name(profile)}"
+    for repo in dict.fromkeys(repos):
+        try:
+            sha = contents._call(repo, "GET", f"/repos/{repo}/git/ref/{ref}")["object"]["sha"]
+            commit = contents._call(repo, "GET", f"/repos/{repo}/git/commits/{sha}")
+        except _github.GithubError as exc:
+            if exc.status != 404:  # no ref, or the App is not installed on this repo: nothing held here
+                raise
+            continue
+        taken = _parse_taken_at(commit)
+        if taken and datetime.now(timezone.utc) - taken > _LEGACY_MAX_AGE:
+            continue
+        holder = _parse_lock_holder(commit["message"])
+        if holder != run_name and _is_live(holder):
+            return str(holder)
+    return None
+
+
+def _acquire_lease(profile: _profile.Profile, app: _github.GithubApp, run_name: str) -> bool:
+    """Take the deploy lease: a file on the state branch, created or replaced by one non-forced push.
+
+    `StateStore.transact` is the compare-and-swap: of two acquirers that read the same tip only one push
+    lands, and the other re-reads the winner's record and stands down. The record is replaced, never deleted,
+    when its holder is finished, so a dead holder's successor has nothing to race with but the push.
+    A holder that cannot be looked up never expires: that raises, failing closed until its Flyte phase is
+    authoritative.
+    """
+    legacy = _find_legacy_holder(profile, app, run_name)
+    if legacy:
+        _say(f"lease held by {legacy} (legacy lock)")
         return False
-    return True
+    key = _build_lease_key(profile)
+    scope = f"{PROJECT}/{DOMAIN}"
+
+    def decide(snap: _state_store.SnapshotView) -> tuple[dict[str, bytes | None], bool]:
+        # May run again on a newer tip after a lost push, so it only looks; the lookup is repeated.
+        held = snap.read(key)
+        if held is not None:
+            _parse_lock_holder(held)  # a record that is not JSON naming a run needs the operator
+            owner = json.loads(held)
+            if (
+                not isinstance(owner, dict)
+                or owner.get("profile") != profile.name
+                or owner.get("scope") != scope
+            ):
+                raise _deploy.DeployError("unrecognized deployer lock; operator resolution required")
+            if owner["run"] == run_name:
+                return {}, True
+            if _is_live(owner["run"]):
+                _say(f"lease held by {owner['run']}")
+                return {}, False
+        record = json.dumps({"run": run_name, "profile": profile.name, "scope": scope}).encode()
+        return {key: record}, True
+
+    return _open_lease_store(profile).transact(decide, f"deployer lease {run_name}")
 
 
-async def _admitted(profile: _profile.Profile, app: _github.GithubApp, run_name: str, sha: str) -> bool:
+def _preflight_lease(profile: _profile.Profile) -> None:
+    """Refuse at the tick, where the owner reads it, when a deploy_pair could not take the lease."""
+    if not _git.install_deploy_key(profile.repo):
+        raise _deploy.DeployError(
+            f"nothing is deployed: the deploy lock is written to the state branch of {profile.repo} with the "
+            f"deploy key, and {_git.GIT_DEPLOY_KEY_ENV_VAR} is not mounted in {env.name}. Set "
+            "[secrets] deploy_key to a write-enabled deploy key of that repository and redeploy"
+        )
+    try:
+        _open_lease_store(profile).snapshot(fresh=True)
+    except _state_store.StateError as exc:
+        raise _deploy.DeployError(
+            f"nothing is deployed: the state branch of {profile.repo}, where the deploy lock lives, "
+            f"cannot be read with the deploy key: {exc}"
+        ) from exc
+
+
+async def _admitted(profile: _profile.Profile, app: _github.GithubApp, run_name: str) -> bool:
     if not RUN_LISTING_CONSISTENT:
-        return await asyncio.to_thread(_acquire_ref, profile, app, run_name, sha)
+        return await asyncio.to_thread(_acquire_lease, profile, app, run_name)
     await asyncio.sleep(SETTLE)
     # Include every live pair, not just this SHA: moving heads cannot deploy concurrently.
     runs = await _runs(profile, in_phase=_LIVE, sort_by=("created_at", "asc"), limit=1000000)
@@ -1022,8 +1182,10 @@ async def run_once(
             )
             if unread:
                 return _say(unread)
-        _lock_repo(profile, app)  # refuse here, where the owner reads it, rather than in the deploy run
-        refused, labels = await _not_deployable(profile, app, heads, release and release[0])
+        await asyncio.to_thread(_preflight_lease, profile)
+        refused, labels, earlier = await _not_deployable(
+            profile, app, heads, release and release[0], retry_credentials=force
+        )
         if refused:
             return _say(refused)
         if await _runs(profile, in_phase=_LIVE, limit=1):
@@ -1039,7 +1201,7 @@ async def run_once(
             )
         run = await _submit(_deploy.DEPLOY_PAIR, labels=labels, sha=sha, direction_sha=direction_sha)
         note = f"; may still be waiting for secrets: {', '.join(sorted(unchecked))}" if unchecked else ""
-        return _say(f"submitted {shown}: {run.name}{note}")
+        return _say(f"submitted {shown}: {run.name}{note}{earlier}")
     except _DEPLOY_ERRORS as exc:  # task boundary redacts remote errors
         raise _deploy.DeployError(_deploy.redact(str(exc))) from None
 
@@ -1073,7 +1235,7 @@ async def run_pair(
             except REMOTE_ERRORS as exc:  # the periodic tick recovers
                 _say(f"could not submit follow-up tick: {_deploy.redact(str(exc))}")
             return {"deployed": False}
-        if not await _admitted(profile, app, run_name, sha):
+        if not await _admitted(profile, app, run_name):
             return {"deployed": False}
         # An older pair for the same heads may have deployed and finished before this one was
         # placed; admission only says no other deploy is live.
@@ -1110,7 +1272,11 @@ async def run_pair(
                 # Moved while waiting for the lock; the next tick judges the new heads.
                 _say(f"{shown} is no longer the head; leaving it for the next tick")
                 break
-            refused, _ = await _not_deployable(profile, app, heads, release and release[0])
+            # The tick that submitted this pair already judged its credential failures (and was forced past
+            # them, or saw none); a follow-up's heads are new and judged here.
+            refused, _, _ = await _not_deployable(
+                profile, app, heads, release and release[0], retry_credentials=not deploy
+            )
             if refused:
                 _say(_describe_refusal(refused))
                 if not output["deployed"]:  # the run succeeds: its report is where the reason is read
@@ -1226,7 +1392,9 @@ async def deploy_pair(sha: str, direction_sha: str) -> dict[str, Any]:
 async def deploy_if_changed(force: bool = False) -> str:
     """Deploy the factory repo's default branch if it moved since the last deploy.
 
-    `force` deploys a direction repo change that touches nothing the deploy reads (`_deploy_reads`).
+    `force` deploys a direction repo change that touches nothing the deploy reads (`_deploy_reads`), and
+    retries heads whose last attempt failed on a credential or permission (once fixed); it does not lift the
+    MAX_ATTEMPTS limit.
     """
     # This task only runs within a named remote action.
     run_name = cast(str, flyte.ctx().action.run_name)

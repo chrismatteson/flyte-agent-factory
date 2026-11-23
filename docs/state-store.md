@@ -157,6 +157,7 @@ Tree layout (the same keys the old Flyte-bucket layout used; migration is a thre
 | `gardening/counts.json` | weekly gardening counts |
 | `limits/<sha256[:16]>.json`, `limits/engine-<engine>.json` | remembered usage limits and their clears, shared by every pod (`_limit_share`; advisory: a failed read or write is logged and never fails a call) |
 | `github/intake/...`, `loop/backlog/...` | intake de-duplication markers and leases |
+| `deployer-lock/<sha256(project/domain/profile)>` | the deployer's lease: `{"run", "profile", "scope"}` of the `deploy_pair` run that may deploy (below) |
 | `checkpoints/<run>.json` | checkpoint notes of runs started before the cutover, copied by the migration (read-only) |
 | `migration.json` | what the cutover migration has carried over, for its next pass, and the old Flyte-bucket layout's highest generation per project |
 
@@ -173,6 +174,17 @@ fetches the new tip, re-reads, re-decides and tries again (bounded; then it fail
 - The dispatch lease is a conditional update: "take it if absent, expired or mine" is decided against
   the tip and committed in one CAS. Two dispatchers or sweeps racing cannot both hold it: the second
   push is rejected, and the re-read shows the first holder.
+- The deployer's lease (`factory-deployer`, `_deployer._acquire_lease`) is the same kind of conditional update. It
+  is always in a git store on `[repo] project`, even when `[state] backend` is `bucket` or `volume`: it needs
+  the compare-and-swap, and the owner's rule is that it adds nothing to an object store. A `deploy_pair` run
+  takes it if it is absent, already its own, or held by a run whose Flyte phase is terminal; a run that
+  finds a live holder stands down, and one that cannot look the holder up fails (it never expires on a guess).
+  The record is replaced when its holder is finished, never deleted. The deploy key is mounted in the deployer
+  for it (`_factory_base.state_secrets`), and `_child_env` keeps its variables from the deploy's child processes
+  (the key file `_git.install_deploy_key` writes stays readable to them; see `deploy-lock-decision.md`). The tick
+  refuses, naming the fix, when the key is missing or the branch cannot be read. Installs from before it kept the
+  lock as a git ref `factory-deployer-lock/<key>` written by the App: a new run still reads that ref (contents
+  read only, never written) and stands down while its holder is live.
 - Behind the lease the dispatcher keeps its existing checks: it re-reads the cancel marker before and
   after creating a run, and a request that still gets two runs is de-duplicated on the server by labels
   (`_factory`). One live project per slot follows from one dispatcher at a time plus that dedupe.

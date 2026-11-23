@@ -83,7 +83,8 @@ The setup it performs, in the order a person thinks of it:
    **Deploying later engine changes.** The deployer deploys the default-branch head of `[deploy] repo` (default
    `[repo] factory`, the public engine) once that head's CI passed. Your App is installed on your workspace, not on
    `unionai-oss/flyte-agent-factory`, so it reads that repository anonymously, polls (`[deploy] webhook = false`) and
-   keeps its deploy lock in `[direction] repo`. With neither the App nor `[direction]` the profile is refused. To
+   takes its deploy lock on the state branch of your workspace with the workspace deploy key, so the App stays
+   read-only on code. If the deployer's tick says it cannot, it names the deploy key or the App permission to fix. To
    deploy the engine's current `main` at once, run the bootstrap again with `--redeploy`, with the same values as the
    first time. It deploys the work slots and the factory again, even though the last deploy matches your profile:
 

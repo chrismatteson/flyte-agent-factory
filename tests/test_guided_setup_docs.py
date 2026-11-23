@@ -609,8 +609,10 @@ def test_install_audit_classifies_every_step_and_keeps_external_work_not_run():
 
 
 APP_ERROR = "the GitHub App (id <your App id>) is not installed on unionai-oss/flyte-agent-factory"
-#: What the deployer does where the App is not installed (`_deployer._deploy_reader`); the docs say so.
-ANONYMOUS = ("anonymously", "`[direction] repo`")
+#: What the deployer does where the App is not installed (`_deployer._deploy_reader`,
+#: `_open_lease_store`): reads anonymously and keeps its deploy lock on the state branch (not in
+#: `[direction]`, #83); the docs say so.
+ANONYMOUS = ("anonymously", "state branch")
 FIRST_COMMAND = next(
     block.strip()
     for block in re.findall(r"```bash\n(.*?)```", read("docs/quickstart.md"), re.DOTALL)

@@ -175,15 +175,16 @@ Deploying is a setting, the same for every owner: with `[deploy] auto`, the depl
 other, imported with `ops/promote.py import` and promoted as above; it needs no App, deploy key or webhook on the
 repository that is deployed. A modified engine copy in the workspace is deployed only for testing and benchmarking;
 production, the owner's own factory included, runs what was merged. Without the App on the deployed repository the
-deployer reads it anonymously and takes its deploy lock in `[direction] repo`, so `[direction]` is then required
-and the App must be installed on the direction repository.
+deployer reads it anonymously. Its deploy lock is a lease on the state branch of the workspace
+([state-store.md](state-store.md)), written with the workspace deploy key: neither `[direction]` nor a repository
+the App can write is needed for it.
 
 The owner's own factory deploys from `unionai-oss/flyte-agent-factory` main, as every other owner's does from the
 public repository or a fork. The alternative, deploying from a private engine repository, would let a change reach
 production before it is public, with the factory's App on the deployed repository and no public CI. The cost of the
 public repository is latency: a change reaches production only after its promotion pull request passes the
 public CI and is merged, and the deployer reads that repository without the App, so it polls (`[deploy] webhook`
-off) and keeps its lock in `[direction] repo`. In exchange the owner runs exactly the documented setup, and every
+off) and keeps its lock on the state branch. In exchange the owner runs exactly the documented setup, and every
 deployed commit is public, reviewed and green.
 
 ## The public template

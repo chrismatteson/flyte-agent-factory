@@ -29,6 +29,9 @@ from flyteidl2.workflow.run_definition_pb2 import ActionStatus  # type: ignore[i
 from google.protobuf.timestamp_pb2 import Timestamp  # type: ignore[import-untyped]  # no stubs installed
 
 from flyte_agent_factory import (
+    _bootstrap_base,
+    _bootstrap_github,
+    _bootstrap_profile,
     _deploy,
     _deploy_apps,
     _deploy_child,
@@ -36,9 +39,11 @@ from flyte_agent_factory import (
     _factory,
     _factory_base,
     _factory_meters,
+    _git,
     _github,
     _profile,
     _standards,
+    _state_store,
     _union_identity,
 )
 from flyte_agent_factory._deploy import DeployError, Refused
@@ -46,6 +51,8 @@ from tests.test_github import PRIVATE_PEM, Clock, FakeGithub
 
 WORK = Path(__file__).resolve().parent / "profiles" / "work.toml"
 SHA = "a" * 40
+#: What GitHub answers a token request for more than the installation was granted.
+GITHUB_422 = "The level of access for permissions requested are not granted to this installation."
 OLD_SHA = "b" * 40
 DIRECTION_SHA = "d" * 40
 OLD_DIRECTION_SHA = "e" * 40
@@ -54,6 +61,10 @@ MOVED_SHA = "c" * 40  # the head of the repo a commit moves [direction] to
 REAL_CHECK_IN_TREE = _deploy.check_in_tree
 REAL_DEPLOY_IN_TREE = _deploy.deploy_in_tree
 PACKAGE = Path(_profile.__file__).resolve().parent
+
+
+def _scope() -> str:
+    return f"{_deployer.PROJECT}/{_deployer.DOMAIN}"
 
 
 def make_profile(state_uri: str, *, auto: bool = True) -> _profile.Profile:
@@ -81,51 +92,45 @@ def make_direction_profile(state_uri: str, *, ref: str = "") -> _profile.Profile
     return _profile.parse(text + (f'ref = "{ref}"\n' if ref else ""), "work+direction")
 
 
-class GitRefs:
-    """Model GitHub's create-if-absent and non-forced fast-forward semantics."""
+class LegacyLocks:
+    """The lock refs an older deployer left in GitHub: `heads/factory-deployer-lock/<key>`, readable only.
+
+    Older engines wrote them with contents:write. The current one only reads them (migration), so any other
+    request than a GET of a ref or of its commit is a bug and fails the test.
+    """
 
     def __init__(self):
-        self.ref = None
-        self.commits = {}
-        self.race = False
+        self.holders: dict[str, str] = {}  # repo -> run name holding the ref there
+        self.taken: dict[str, str] = {}  # repo -> the lock commit's committer date, when the test sets one
+        self.messages: dict[str, str] = {}  # repo -> a lock commit message other than the holder's record
         self.requests: list[tuple[str, str]] = []
-        self.scopes: list[dict[str, str]] = []
 
-    def installation_token(self, repo, permissions):
-        assert permissions  # every token names its permissions (#179)
-        return "token"  # the App is installed everywhere this model is used
+    def hold(self, repo: str, run: str, *, taken: str = "", message: str = "") -> None:
+        self.holders[repo] = run
+        if taken:
+            self.taken[repo] = taken
+        if message:
+            self.messages[repo] = message
 
-    def scoped(self, permissions):
-        self.scopes.append(dict(permissions))
-        return self
-
-    def _call(self, repo, method, path, **kwargs):
-        self.requests.append((method, path))
-        if method == "GET" and "/ref/" in path:
-            if self.ref is None:
-                raise _github.GithubError("not found", 404)
-            return {"object": {"sha": self.ref}}
-        if method == "GET" and "/commits/" in path:
-            # Any source commit has a tree; lock commits are the ones posted here.
-            return self.commits.get(path.rsplit("/", 1)[-1], {"tree": {"sha": "tree"}})
-        if method == "POST" and path.endswith("/commits"):
-            sha = f"commit-{len(self.commits)}"
-            self.commits[sha] = kwargs["json"]
-            return {"sha": sha}
-        target = kwargs["json"]["sha"]
-        if self.race:
-            self.ref = "other-contender"
-        if method == "POST":
-            if self.ref is not None:
-                raise _github.GithubError("already exists", 422)
-        elif method == "PATCH":
-            assert kwargs["json"]["force"] is False
-            if self.commits[target]["parents"] != [self.ref]:
-                raise _github.GithubError("not fast-forward", 422)
-        else:
-            raise AssertionError((method, path))
-        self.ref = target
-        return {"object": {"sha": target}}
+    def answer(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.requests.append((request.method, path))
+        assert request.method == "GET", f"the legacy lock is never written: {request.method} {path}"
+        repo = "/".join(path.split("/")[2:4])
+        if repo not in self.holders:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/git/ref/heads/factory-deployer-lock/" in path:
+            return httpx.Response(200, json={"object": {"sha": "legacy"}})
+        assert path.endswith("/git/commits/legacy"), path
+        message = {
+            "run": self.holders[repo],
+            "profile": "work",
+            "scope": f"{_deployer.PROJECT}/{_deployer.DOMAIN}",
+        }
+        body: dict[str, object] = {"message": self.messages.get(repo) or json.dumps(message)}
+        if repo in self.taken:
+            body["committer"] = {"date": self.taken[repo]}
+        return httpx.Response(200, json=body)
 
 
 class World:
@@ -148,10 +153,24 @@ class World:
         self.moved_gh.statuses = [{"context": "direction/profile-pins", "state": "success"}]
         client = httpx.Client(base_url=_github.API, transport=httpx.MockTransport(self.handler))
         self.app = _github.GithubApp("12345", PRIVATE_PEM, client=client, clock=self.clock)
-        # The git-ref lock (`RUN_LISTING_CONSISTENT=False`, production) uses the git data API, which
-        # FakeGithub does not have: `handler` sends those requests to a model of it. At the HTTP level,
-        # so the lock is served whichever scoped view of the App makes the call.
-        self.refs = GitRefs()
+        # The deploy lease (`RUN_LISTING_CONSISTENT=False`, production) is a file on the state branch of
+        # `[repo] project`: a real bare repository, reached through git's `insteadOf` so the profile keeps
+        # its ssh URL. Its own cache, so no test sees another's tip.
+        self.remote = tmp_path / "lease-remote.git"
+        subprocess.run(["git", "init", "--bare", "--quiet", str(self.remote)], check=True)
+        monkeypatch.setenv("AGENT_FACTORY_BASE", str(tmp_path / "base"))
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{self.remote}.insteadOf")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", self.profile.repo)
+        _state_store.configure(None)  # forget the stores an earlier test built
+        # The deploy key is mounted in the deployer (`state_secrets`); no key material is needed locally.
+        self.deploy_key: str | None = "/key"
+        monkeypatch.setattr(_git, "install_deploy_key", lambda repo="": self.deploy_key)
+        # The App's grant, as GitHub enforces it: a token request for more than this is a 422. None: any.
+        self.granted: dict[str, str] | None = None
+        self.token_requests: list[dict[str, str]] = []
+        # The older engines' lock refs: only read.
+        self.legacy = LegacyLocks()
         self.said: list[str] = []
         self.live_runs: list[str] = []
         self.runs: list[SimpleNamespace] = []
@@ -301,13 +320,19 @@ class World:
         path = request.url.path
         if path.startswith("/repos/acme/direction/git/trees/"):
             return self.git_tree(request)
+        if path.endswith("/access_tokens"):
+            wanted = json.loads(request.content)["permissions"]
+            self.token_requests.append(wanted)
+            if self.granted is not None and any(
+                not self.allows(name, level) for name, level in wanted.items()
+            ):
+                # GitHub's own answer to a token request for more than the installation was granted.
+                return httpx.Response(
+                    422,
+                    json={"message": GITHUB_422},
+                )
         if "/git/" in path:
-            body = json.loads(request.content) if request.content else None
-            try:
-                answer = self.refs._call("", request.method, path, **({"json": body} if body else {}))
-            except _github.GithubError as exc:
-                return httpx.Response(exc.status, json={"message": str(exc)})
-            return httpx.Response(200, json=answer)
+            return self.legacy.answer(request)
         if path.startswith("/repos/acme/new-direction"):
             return self.moved_gh.handler(
                 httpx.Request(
@@ -337,6 +362,10 @@ class World:
                 request.method, request.url.copy_with(path=path.replace("acme/direction", "acme/factory"))
             )
         )
+
+    def allows(self, name: str, level: str) -> bool:
+        have = (self.granted or {}).get(name)
+        return have == "write" or (have == "read" and level == "read")
 
     def compare(self, request: httpx.Request) -> httpx.Response:
         base, head = request.url.path.removeprefix("/repos/acme/direction/compare/").split("...")
@@ -471,6 +500,9 @@ class World:
                 raise run.output
             return (run.output,)
 
+        async def first_failure():
+            return SimpleNamespace(error_message=run.error)
+
         run = SimpleNamespace(
             name=name or f"attempt-{len(self.runs)}",
             phase=phase,
@@ -486,6 +518,7 @@ class World:
             record=record,
             error="",
             outputs=SimpleNamespace(aio=outputs),
+            first_failure=SimpleNamespace(aio=first_failure),
         )
         self.runs.append(run)
         return run
@@ -561,8 +594,15 @@ class World:
         run = self.add_run(
             "RUNNING", labels=_deployer._pair_labels(self.profile, SHA, ""), name=holder, inputs={}
         )
-        assert _deployer._acquire_ref(self.profile, self.app, holder, SHA)
+        assert _deployer._acquire_lease(self.profile, self.app, holder)
         return run
+
+    def lease(self) -> dict[str, str] | None:
+        """The deploy lease record on the state branch, or None when nothing holds it."""
+        body = _deployer._open_lease_store(self.profile).read(
+            _deployer._build_lease_key(self.profile), fresh=True
+        )
+        return None if body is None else cast(dict[str, str], json.loads(body))
 
     async def attempt(self, run) -> str:
         """Run a submitted `deploy_pair` attempt as Flyte would; what it said it did."""
@@ -589,12 +629,12 @@ class World:
 
 @pytest.fixture
 def world(tmp_path, monkeypatch, request):
-    # The git-ref lock unless a test asks for both paths with `both_paths`: it is what production uses.
+    # The state-branch lease unless a test asks for both paths with `both_paths`: it is what production uses.
     return World(tmp_path, monkeypatch, consistent=getattr(request, "param", False))
 
 
-#: Run a test on the git-ref lock (production) and on the consistent-listing rule.
-both_paths = pytest.mark.parametrize("world", [False, True], indirect=True, ids=["git-ref", "listing"])
+#: Run a test on the state-branch lease (production) and on the consistent-listing rule.
+both_paths = pytest.mark.parametrize("world", [False, True], indirect=True, ids=["lease", "listing"])
 
 
 # --- ticks -------------------------------------------------------------------------------------
@@ -614,14 +654,14 @@ async def test_no_change_means_no_deploy(world, capsys):
     assert f"[deploy] auto up to date at {SHA}" in capsys.readouterr().out
 
 
-async def test_every_token_a_deploy_mints_names_its_permissions_and_the_lock_writes_contents(world):
-    # The git-ref lock (this world's default) is a commit and a ref: contents:write, nothing more (#179).
+async def test_every_token_a_deploy_mints_names_its_permissions_and_none_writes_contents(world):
+    # The lease is a file on the state branch, pushed with the deploy key: the App never writes code (#83).
     world.record(OLD_SHA)
     assert (await world.tick()).startswith(f"deployed {SHA}")
     minted = [json.loads(r.content) for r in world.gh.requests if r.url.path.endswith("/access_tokens")]
     assert minted and all(body["permissions"] for body in minted)
-    assert {"contents": "write"} in [body["permissions"] for body in minted]
-    assert world.refs.ref  # the lock was taken
+    assert all(body["permissions"].get("contents") != "write" for body in minted)
+    assert world.lease() == {"run": world.runs[-1].name, "profile": "work", "scope": _scope()}  # taken
 
 
 @both_paths
@@ -1072,8 +1112,12 @@ async def test_the_same_sha_is_tried_three_times_then_given_up_on(world, capsys)
     await _fail_ticks(world, 3)
     assert len(world.factory_calls) == 3
     capsys.readouterr()
-    for _ in range(2):  # every later tick says so, and deploys nothing
-        assert await world.tick() == f"giving up on {SHA} after 3 attempts; waiting for a new commit"
+    for _ in range(
+        2
+    ):  # every later tick says so, names the run that failed last and why, and deploys nothing
+        message = await world.tick()
+        assert message.startswith(f"giving up on {SHA} after 3 attempts; waiting for a new commit. ")
+        assert f"run {world.runs[-1].name}: " in message and "factory deploy of" in message
     out = capsys.readouterr().out
     assert out.count(f"[deploy] auto giving up on {SHA} after 3 attempts; waiting for a new commit") == 2
     assert len(world.factory_calls) == 3 and world.failed["attempts"] == 3
@@ -1751,9 +1795,9 @@ async def test_a_failing_move_is_counted_on_the_new_repos_head_too(moving):
     assert all(run.pb2.labels["deploy-move"] == MOVED_SHA for run in moving.runs)
     assert moving.failed["attempts"] == _deployer.MAX_ATTEMPTS
     given_up = await moving.tick()
-    assert given_up == (
+    assert given_up.startswith(
         f"giving up on {SHA} with direction {DIRECTION_SHA} moving to acme/new-direction at {MOVED_SHA} "
-        f"after {_deployer.MAX_ATTEMPTS} attempts; waiting for a new commit"
+        f"after {_deployer.MAX_ATTEMPTS} attempts; waiting for a new commit. Latest failure, run "
     )
     moving.slot_rc = 0
     moving.moved_gh.head_sha = "3" * 40
@@ -1816,7 +1860,7 @@ async def test_a_head_that_moves_during_the_deploy_is_deployed_by_the_same_run(w
     assert not world.state.exists()
 
 
-@pytest.mark.parametrize("consistent", [False, True], ids=["git-ref", "listing"])
+@pytest.mark.parametrize("consistent", [False, True], ids=["lease", "listing"])
 async def test_a_direction_head_that_moves_during_the_deploy_is_deployed_by_the_same_run(
     directed, monkeypatch, consistent
 ):
@@ -2354,10 +2398,10 @@ async def test_missing_secrets_end_the_attempt_without_a_release_or_a_failure(wo
     assert run.output == {"deployed": False, "waiting_for_secrets": needs}
     assert any("browser_personal_token" in line for line in world.said)
     assert not world.deployed and world.last["sha"] == OLD_SHA  # not a release
-    assert (
-        await _deployer._failed_attempts(world.profile, _deployer._pair_labels(world.profile, SHA, ""), None)
-        == 0
+    failures = await _deployer._failed_attempts(
+        world.profile, _deployer._pair_labels(world.profile, SHA, ""), None
     )
+    assert failures.count == 0 and failures.newest is None
     release = await _deployer.deployed_pair(world.profile)
     assert release is not None and release[1] == (OLD_SHA, "")
 
@@ -2575,24 +2619,21 @@ async def test_an_uninstalled_deploy_repo_is_read_anonymously_and_cloned_by_its_
     assert public.anonymous and all("authorization" not in r.headers for r in public.anonymous)
 
 
-async def test_the_lock_of_an_uninstalled_deploy_repo_is_held_in_the_direction_repo(public):
+async def test_the_lock_of_an_uninstalled_deploy_repo_is_held_on_the_state_branch(public):
     public.profile = make_direction_profile(f"file://{public.state}")
     public.ship_direction_profile()
     await public.tick()
-    # The lock commit is made of the direction repo's own head, not of the deployed commit it does not have.
-    gets = [path for method, path in public.refs.requests if method == "GET" and "/commits/" in path]
-    assert any(path == "/repos/acme/direction/git/commits/" + DIRECTION_SHA for path in gets)
-    assert not any(SHA in path for path in gets)
-    (lock,) = public.refs.commits.values()
-    assert lock["parents"] == [DIRECTION_SHA]
+    # No repository the App can write is needed: the lease is on the workspace's state branch.
+    assert public.lease()["run"] == public.runs[-1].name
+    assert not any(method != "GET" for method, _ in public.legacy.requests)
 
 
-async def test_an_uninstalled_deploy_repo_without_a_direction_repo_refuses_naming_both_options(public):
-    with pytest.raises(DeployError) as err:
-        await public.tick()
-    message = str(err.value)
-    assert "acme/factory" in message and "Install the App" in message and "[direction] repo" in message
-    assert not public.deployed and not public.submissions
+async def test_an_uninstalled_deploy_repo_without_a_direction_repo_deploys_with_the_state_branch_lease(
+    public,
+):
+    # Before #83 this refused ("Install the App", "[direction] repo"): the lock needed an App-writable repo.
+    await public.tick()
+    assert public.deployed and public.lease()["run"] == public.runs[-1].name
 
 
 @pytest.mark.parametrize("installed", [True, False])
@@ -2685,3 +2726,51 @@ def test_public_head_is_empty_when_git_cannot_run_or_hangs(monkeypatch, error):
 
     _ls_remote(monkeypatch, run)
     assert _deploy.public_head("acme/factory") == ""
+
+
+def _writes_contents(requests: list[dict[str, str]]) -> bool:
+    return any(wanted.get("contents") == "write" for wanted in requests)
+
+
+# --- requirement 4: an App that can only read code deploys ---------------------------------------------
+
+
+async def test_an_app_with_only_contents_read_admits_and_deploys(public):
+    # The failing install of #83: [direction] is the workspace, the deploy repo is not installed, and the App
+    # is registered as the bootstrap registers it (`contents: read`).
+    public.granted = _bootstrap_github.manifest_permissions()
+    public.profile = make_direction_profile(f"file://{public.state}")
+    public.ship_direction_profile()
+    assert (await public.tick()).startswith(f"deployed {SHA}")
+    assert public.deployed and public.lease()["run"] == public.runs[-1].name
+    assert public.token_requests and not _writes_contents(public.token_requests)
+
+
+def test_the_fake_refuses_what_the_old_lock_asked_for(public):
+    # Without this the test above would pass on the old code too: the fake must answer GitHub's 422.
+    public.granted = {"contents": "read"}
+    with pytest.raises(_github.GithubError, match="not granted to this installation") as refused:
+        public.app.installation_token("acme/direction", _github.CONTENTS_WRITE)
+    assert refused.value.status == 422
+    public.app.installation_token("acme/direction", _github.CONTENTS_READ)
+
+
+async def test_a_fresh_bootstrap_profile_passes_every_lock_and_permission_precondition(
+    public, tmp_path, monkeypatch
+):
+    settings = _bootstrap_base.Settings("h.example.test", "p", "acme/direction", backend="oss")
+    text = _bootstrap_profile.render(settings, "12345").replace(
+        _bootstrap_profile.ENGINE_REPO_URL, "git@github.com:acme/factory.git"
+    )
+    profile = _profile.parse(text, "bootstrap")
+    assert profile.deploy.auto and profile.direction and profile.direction.repo.endswith("acme/direction.git")
+    # The bootstrap's own manifest: no code write (and `_bootstrap_github` is unchanged by #83).
+    public.granted = _bootstrap_github.manifest_permissions()
+    assert public.granted["contents"] == "read"
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", profile.repo)  # the profile's workspace is the lease remote
+    public.profile = profile
+    (public.direction_tree / profile.direction.profile).write_text(text)
+    _deployer._preflight_lease(profile)
+    assert (await public.tick()).startswith(f"deployed {SHA}")
+    assert not _writes_contents(public.token_requests)
+    assert public.lease()["run"] == public.runs[-1].name

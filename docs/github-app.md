@@ -9,7 +9,7 @@ The App is the guided-setup default, read-only on code (`contents: read`); pushe
 isolation canary reports `isolated`. It gives the factory CI visibility (check-runs, statuses and, for
 `ci-status --logs`, `actions: read`), draft pull requests and the verifier status. Every installation token the factory
 mints is limited to **one repository** and to the permissions its call names (the scopes in `_github.py`: `CI_READ`,
-`METADATA_READ`, `CONTENTS_READ`, `CONTENTS_WRITE` for the deployer's lock ref, `ISSUES_READ`, `ISSUES_WRITE`,
+`METADATA_READ`, `CONTENTS_READ`, `CONTENTS_WRITE` (only the benchmark's results store uses it), `ISSUES_READ`, `ISSUES_WRITE`,
 `PR_WRITE`, `VERIFIER` and the session push scope), so a token for one repository cannot touch another and no token
 carries everything the installation holds: an App handle made without permissions refuses to mint one at all.
 
@@ -149,8 +149,9 @@ and redeploy with `--redeploy` ([above](#deploying-the-public-engine)).
 The deployer deploys the default-branch head of `[deploy] repo` (default `[repo] factory`, the public
 `unionai-oss/flyte-agent-factory`) once that head's CI passed. Your App is installed on your workspace only, so for a
 repository it is not installed on the deployer reads anonymously (`git ls-remote`, a clone by the public URL), polls
-instead of waiting for a webhook (`[deploy] webhook = false`) and keeps its deploy lock in `[direction] repo`, the
-workspace. With neither the App nor `[direction]` the profile is refused, and the error names both options. Do not
+instead of waiting for a webhook (`[deploy] webhook = false`). Its deploy lock is not in a repository the App
+writes: it is a file on the factory's state branch in the workspace (`[repo] project`), written with the deploy key
+(`[secrets] deploy_key`, which the bootstrap creates with write access), so the App stays read-only on code. Do not
 try to install the App on `unionai-oss`.
 To deploy the engine's `main` at once instead of waiting for a poll, run the bootstrap again with `--redeploy` (the
 same values as the first time; it deploys the work slots and the factory, with a one-off deployment key that it

@@ -100,7 +100,7 @@ once its CI has passed.
 4. **Operator action** (check a tick in `ops/deploy_status.py`): in the
    private workspace's `profile.toml` set `[deploy] repo` to `https://github.com/unionai-oss/flyte-agent-factory`
    and `webhook = false` (pushes to a repository without the App never reach the webhook, so the deployer polls).
-   The deploy lock lives in `[direction] repo`, which the App is already installed on. This switch is made by the
+   The deploy lock lives on the state branch of the workspace, written with the workspace deploy key; the App needs no write access. This switch is made by the
    chat operator, not by the engine, and is not done until the status line shows the public head deployed:
    record that line.
 5. From then on: project in the workspace, review, `deliver`, PR CI green, the owner merges, the deployer deploys.

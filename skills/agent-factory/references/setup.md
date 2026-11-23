@@ -180,7 +180,8 @@ ruleset lets through; the engine token (`engine-token`) comes after the board.
    **Deploying later engine changes.** The deployer deploys the default-branch head of `[deploy] repo` (default
    `[repo] factory`, the public engine) once that head's CI passed. The person's App is installed on their workspace,
    not on the public engine, so it reads the engine anonymously, polls (`[deploy] webhook = false`) and keeps its
-   deploy lock in `[direction] repo`; with neither the App nor `[direction]` the profile is refused, so do not remove
+   deploy lock on the workspace's state branch, written with the workspace deploy key, so the App stays read-only on
+   code; if the deployer's tick says it cannot, it names the deploy key or App permission to fix. So do not remove
    `[deploy] auto` or `[direction]`, and do not ask them to install the App on unionai-oss (they cannot). To deploy an
    engine change at once, run this one command yourself on the person's word, with the same values as the first run,
    where your shell holds their deploy credentials; otherwise say which tool or access is missing and give it to
