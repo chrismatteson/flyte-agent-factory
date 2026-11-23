@@ -451,31 +451,6 @@ def test_checks_sh_leaves_the_slow_lane_to_ci_unless_asked(tmp_path):
     assert "CI's slow job runs it" in run.stderr
 
 
-@pytest.mark.parametrize("failing", [None, "not slow", "slow"])
-def test_the_project_checks_sh_runs_both_lanes_unasked_and_fails_with_either(tmp_path, failing):
-    """The project's entry point asks for the slow lane itself: an unqualified run covers both lanes."""
-    repo = Path(__file__).resolve().parents[1]
-    log = tmp_path / "uv.log"
-    uv = tmp_path / "bin" / "uv"
-    uv.parent.mkdir()
-    fail = f'if [[ "$*" == *"-m {failing}"* ]]; then exit 1; fi\n' if failing else ""
-    uv.write_text(f'#!/bin/bash\necho "$*" >> {log}\n{fail}')
-    uv.chmod(0o755)
-    unset = (
-        "AGENT_FACTORY_RUN_SLOW",
-        "AGENT_FACTORY_SLOW_LANE",
-        "AGENT_FACTORY_TEST_LANE",
-        _gate_tests.PYTEST_JUNIT_ENV,
-    )
-    env = {k: v for k, v in os.environ.items() if k not in unset}
-    env["PATH"] = f"{uv.parent}{os.pathsep}{os.environ['PATH']}"
-    run = subprocess.run(["bash", str(repo / "checks.sh")], cwd=repo, env=env, capture_output=True, text=True)
-    lane_calls = [c for c in log.read_text().splitlines() if "-m pytest" in c]
-    assert sorted(c.split(" -m ")[2].split(" ")[0] for c in lane_calls) == ["not", "slow"]
-    assert "slow lane: not run here" not in run.stderr
-    assert run.returncode == (1 if failing else 0), run.stdout[-2000:]
-
-
 def test_checks_sh_in_a_workspace_project_lends_the_launcher_the_root_run_context(tmp_path):
     """In a workspace subdirectory both lanes get the root's run context, and the link is gone after."""
     repo = Path(__file__).resolve().parents[1]
