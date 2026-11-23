@@ -41,7 +41,7 @@ resources; see [small-nodes.md](small-nodes.md) for the arithmetic and for raisi
    hand step besides creating secrets. After that a merge to the workspace deploys itself when the profile has
    `[direction]` (below). A merge to the public engine deploys once its CI is green: the App is installed on the
    workspace only, so the deployer reads the engine anonymously, polls (`[deploy] webhook = false`) and keeps its lock
-   in `[direction] repo`. To deploy sooner, run the
+   on the workspace's state branch, with the workspace deploy key. To deploy sooner, run the
    bootstrap with `--redeploy` ([quickstart.md](quickstart.md#what-agent-factory-walks-you-through)). The personal browser app
    follows the same rule ([personal-browser.md](personal-browser.md)); a merge to the workspace deploys
    only if the profile has `[direction]` pointing at it (`repo`, and `profile = "profile.toml"`), which the workspace's
@@ -244,7 +244,7 @@ tree, so a change must be pushed before it ships.
 Merged changes deploy themselves: with `[deploy] auto = true` in the profile, the `factory-deployer` task polls the
 default branch of `[deploy] repo` (default `[repo] factory`) every 5 minutes and ships a head whose CI passed, so a
 merge ships on the next tick plus build time. For a user on the public `unionai-oss/flyte-agent-factory`, where the
-App is not installed, the deployer reads that repository anonymously and keeps its deploy lock in `[direction] repo`;
+App is not installed, the deployer reads that repository anonymously and keeps its deploy lock on the workspace's state branch (written with the deploy key, never by the App);
 to deploy the engine's `main` at once, run the bootstrap with `--redeploy`
 ([quickstart.md](quickstart.md#what-agent-factory-walks-you-through)). With
 `[github] webhook_secret`, a signed push starts it instead and the schedule is an hourly reconcile
