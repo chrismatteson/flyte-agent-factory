@@ -906,10 +906,12 @@ class _FakeSubagent:
 
     def __init__(self, miss_on_spot: bool, miss_on_demand: bool = False):
         self.calls: list[bool] = []
+        self.short_names: list[str] = []
         self.miss = {True: miss_on_spot, False: miss_on_demand}
 
-    def override(self, *, interruptible, timeout):
+    def override(self, *, short_name, interruptible, timeout):
         outer = self
+        self.short_names.append(short_name)
         assert timeout.max_queued_time == _reviewer._REVIEWER_QUEUE_BOUND, (
             "unplaceable reviewers must be bounded"
         )
@@ -932,6 +934,7 @@ async def test_a_reviewer_unplaceable_on_spot_falls_back_to_on_demand(monkeypatc
     monkeypatch.setattr(_reviewer, "subagent_task", fake)
     text, _ = await _reviewer._call_reviewer(brief="b")
     assert fake.calls == [True, False] and "PASS" in text
+    assert fake.short_names == ["subagent", "subagent"], "a call with no purpose keeps the task's name (#91)"
 
 
 @pytest.mark.asyncio
@@ -942,6 +945,7 @@ async def test_a_reviewer_unplaceable_everywhere_raises_instead_of_hanging(monke
     with pytest.raises(flyte.errors.MaxQueuedTimeExceededError):
         await _reviewer._call_reviewer(brief="b")
     assert fake.calls == [True, False]
+    assert fake.short_names == ["subagent", "subagent"]
 
 
 @pytest.mark.asyncio

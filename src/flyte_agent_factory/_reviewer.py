@@ -14,6 +14,7 @@ from flyte.io import Dir
 
 from flyte_agent_factory import (
     _policy,
+    _roles,
     _seal_role,
     _session_config,
     _timeline,
@@ -175,11 +176,18 @@ async def _call_sealed(purpose: str, engine: str, **kwargs: Any) -> tuple[str, D
     """
     spec = _session_config._seal
     if spec is None:
-        return await _call_reviewer_raw(engine=engine, routed=True, **kwargs)
+        return await _call_reviewer_raw(
+            engine=engine, routed=True, action=_roles.action_name(purpose), **kwargs
+        )
     root = _session_config.SEAL_RECORD
     role_id = _seal_role.register_subagent(spec, root, _seal_role.kind_for(purpose), engine)
     text, out = await _call_reviewer_raw(
-        engine=engine, routed=True, seal=spec.to_json(), seal_role=role_id, **kwargs
+        engine=engine,
+        routed=True,
+        action=_roles.action_name(purpose),
+        seal=spec.to_json(),
+        seal_role=role_id,
+        **kwargs,
     )
     await merge_record(out, root)
     return text, out
@@ -192,8 +200,11 @@ async def merge_record(out: Dir, root: Path) -> None:
         _seal_role.merge_result(Path(tmp), root)
 
 
-async def _call_reviewer_raw(**kwargs: Any) -> tuple[str, Dir]:
-    """Run the reviewer sub-agent: spot first, bounded; then on-demand, bounded.
+async def _call_reviewer_raw(action: str = _roles.SUBAGENT_ACTION, **kwargs: Any) -> tuple[str, Dir]:
+    """Run the reviewer sub-agent as an action named `action`: spot first, bounded; then on-demand, bounded.
+
+    `action` is only the console's display name (`short_name`, `_roles.action_name`): the task, its
+    environment, image, secrets and resources are the one `subagent` task's whatever the role.
 
     Spot is cheaper and a separate pool, so it is tried first -- but an unplaceable
     action is neither a failure nor progress, so each attempt carries a queue
@@ -203,9 +214,11 @@ async def _call_reviewer_raw(**kwargs: Any) -> tuple[str, Dir]:
     bound = flyte.Timeout(max_queued_time=_REVIEWER_QUEUE_BOUND)
     with _union_identity.denied("submitting a reviewer"):
         try:
-            return await subagent_task.override(interruptible=True, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # Flyte's `.aio` is untyped
+            spot = subagent_task.override(short_name=action, interruptible=True, timeout=bound)
+            return await spot.aio(**kwargs)  # type: ignore[no-any-return]  # Flyte's `.aio` is untyped
         except flyte.errors.MaxQueuedTimeExceededError:
-            return await subagent_task.override(interruptible=False, timeout=bound).aio(**kwargs)  # type: ignore[no-any-return]  # as above
+            on_demand = subagent_task.override(short_name=action, interruptible=False, timeout=bound)
+            return await on_demand.aio(**kwargs)  # type: ignore[no-any-return]  # as above
 
 
 #: Every failing judge's findings, every round: (round, judge, findings). Shown to
