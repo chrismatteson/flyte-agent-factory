@@ -326,6 +326,32 @@ A gate that reports only a `harness fault` (the factory could not compute the pr
 the project's failure) holds review the same way a pre-review escalation does, without a bounce; `/review-again`
 resumes it (see [standards](standards.md)).
 
+#### How roles appear in the console
+
+Every out-of-process role runs as the one `subagent` task (`agent.py`): the judges, the contract, the planner, the
+arbiter, the finding checks, the judgement call and every delegate worker. Each call is submitted with Flyte's
+display-only `short_name`, so the run's graph names the action by the role it played rather than `subagent`:
+
+| Action in the graph | Role |
+|---|---|
+| `judge-correctness`, `judge-completeness`, `judge-craft` | the three judges, once per round |
+| `correctness-check`, `completeness-check` | the finding check of that judge's reply |
+| `contract`, `plan`, `arbitrate`, `judgement` | the review loop's other roles, when they run |
+| `delegate` | a delegate worker (`delegate "<brief>"` and `delegate --answer`) |
+| `subagent` | a call with no role, and a session's own direct `subagent(...)` call |
+
+The names are `_roles.action_name`, the same `_roles.display_role` names the reports and the timeline use, so the
+console and the report agree. The name is the role alone, without the round or a delegate id. A delegate has no
+review round, and its id names a directory in the session's workspace that a reader of the console cannot open; the round is
+already in the run report's timeline, next to each call's engine and cost; and a fixed name per role is one a person
+can search the graph for. A call that moves to the other engine keeps its name; the report's metering row is where
+the `+codex` suffix appears.
+
+`short_name` changes only the label. The task, its environment, image, secrets and resources are the same for
+every role, nothing new is registered, and the task's identity hash is computed from the task template, which the
+name does not touch. It is part of Flyte's task spec on Union and on OSS Flyte alike; a backend that ignores it shows
+`subagent` as before.
+
 #### Judge outcomes
 
 All three judges are required. Each ends a round as `PASS`, `FAIL`, `ADVISORY` (craft, when `CRAFT_BLOCKING` is
@@ -638,7 +664,7 @@ the session role definitions, the browser image files and the workspace template
 | `_conditions.py` | Flyte conditions with names that stay unique across task retries |
 | `_delegation.py` | the `delegate` command and its job layer |
 | `_subagent_run.py` | the delegate worker's run in its own container |
-| `_roles.py` | the session roles and the old-name aliases (`product`, `designer`, `dev`, `qa`) |
+| `_roles.py` | the session roles and the old-name aliases (`product`, `designer`, `dev`, `qa`), and the names reports and the console show for each role |
 | `_auth.py` | Claude sessions run on the setup-token |
 | `_codex_auth.py` | the Codex auth file: telling a dead login from other failures |
 | `_secret_env.py` | the environment and git invocation for anything started within the session's reach |
