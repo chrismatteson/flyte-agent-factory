@@ -211,10 +211,11 @@ A waiver (`waivers.toml`) may name the check (`factory:fail-to-pass`) or any rul
 ## Vendored upstream trees
 
 A project that builds a cross-repository patch may keep byte-identical copies of other repositories in its
-directory. Those files are upstream's, not the project's, so `factory:module-size`, `factory:fail-to-pass` and
-language detection judge only what the project changed in them. A copy that is a git checkout (has `.git`)
-needs nothing: its own history says what changed. A copy committed without `.git` is declared in
-`vendored.toml` at the project's root:
+directory. Those files are upstream's, not the project's, so `factory:module-size`, `factory:fail-to-pass`, language
+detection, `factory:ui-evidence`, `factory:suppressions`, shell lint (shellcheck), `forbid` rules, ruff, eslint,
+prettier and `terraform fmt` judge only what the project changed in them. A copy that is a git checkout (has `.git`)
+needs nothing: its own history says what changed. A copy committed without `.git` is declared in `vendored.toml` at
+the project's root:
 
 ```toml
 [[tree]]
@@ -251,8 +252,146 @@ do. They read only the cache, which the supervisor fills off the loop before the
 a vendored tree as the project's.
 
 **What changes.** A file identical to upstream's at the same path (compared by git blob id) is skipped by
-`factory:module-size`, is not one of the project's changed tests for `factory:fail-to-pass`, and is left out of
-language detection (a vendored Django `package.json` does not select the TypeScript pack).
+`factory:module-size`, is not one of the project's changed tests for `factory:fail-to-pass`, is left out of language
+detection (a vendored Django `package.json` does not select the TypeScript pack) and does not make the project a UI
+for `factory:ui-evidence`. The same holds for the tools that judge each file alone: shellcheck is not given an
+unchanged `.sh` (one named in the rule's command is dropped from it; with no script left it checks a temporary
+`#!/bin/sh` script, so its options are still checked), ruff, eslint, prettier and `terraform fmt`
+leave the unchanged paths out as below, and a `forbid` rule skips the file. No command line grows with the number of
+excluded files beyond 64 KiB (Linux refuses a single argument over 128 KiB):
+
+- `ruff check`, `ruff format`: by default the paths are added inline, `--config 'extend-exclude = ["./repo"]'`.
+  That adds to every configuration ruff finds, so the project's settings, its own `extend-exclude` included,
+  still apply, and so does a `ruff.toml` or `pyproject.toml` in a subdirectory, for the files below it. The ruff
+  `lint` kind gets the same and keeps `--isolated`, so it still reads no configuration but the excludes.
+  `--force-exclude` is never applied to a path the rule names: it would make the project's own excludes apply
+  to the command line (`ruff check gen.py` lints `gen.py` whatever the project's `extend-exclude` says). The
+  gate drops the upstream paths the command names itself: an unchanged file the rule names is dropped, and so
+  is a directory inside an upstream tree that holds no file of the project's. Any other directory the rule
+  names ruff walks itself, so every configuration it finds (the project's, a nested one, `[lint]` and
+  `[format]` excludes) applies to the files below it as with no upstream, and the gate's excludes, each of
+  which lies below such a directory, drop the unchanged ones. When every operand was dropped, an empty
+  temporary `.py` file in the project is named so that ruff does not fall back to `.`.
+  - When that argument would exceed 64 KiB and the command's only operand is `.`, the `.` is replaced by the
+    project's own files that ruff reads, as the fewest paths: a directory below the project root that holds no
+    unchanged file, else the file. Ruff still finds the closest configuration for each. The gate wrote every
+    operand, so `--force-exclude` is added here, and only here: it drops nothing the rule named, and keeps the
+    project's own excludes applying to the substitutes as the walk of `.` would. A git-ignored path, which ruff
+    would skip walking `.` but lints when named, is left out (asked of the git repository holding it; outside
+    one ruff reads no `.gitignore`).
+  - When that list would exceed 64 KiB too, or the command names anything but `.`, the excludes go in a
+    temporary configuration file passed with `--config`, which `extend`s the configuration ruff would otherwise
+    read at the project root (the project's `.ruff.toml`, `ruff.toml` or `pyproject.toml` with `[tool.ruff`, else
+    the gate's baseline; for the `lint` kind, which runs without `--isolated` then since ruff refuses a file
+    with it, nothing). A file replaces ruff's search for configuration, so no configuration nested below the
+    project root is read, and the rule's output says so: `Ruff read no configuration nested below the project
+    root: ...`.
+- eslint: a flat config that imports the one eslint would use (the file the rule's command names with `-c` or
+  `--config`, which the wrapper then replaces, else the project's `eslint.config.*`, else the gate's baseline) and
+  appends a global `ignores` entry, passed with `--config`; that config's rules and ignores still apply. With a
+  legacy `.eslintrc*` and no flat config, an ignore file passed with `--ignore-path`, holding the lines of the
+  ignore file the command names with `--ignore-path` (which it replaces), else of `.eslintignore`, and the
+  excludes, since `--ignore-path` replaces `.eslintignore`. With `--no-config-lookup` and no config named,
+  eslint reads no config, and the wrapper imports none. A flat config file in a subdirectory is not read by
+  eslint 9 in any case, so wrapping the root one loses none.
+  When the rule names a path inside an upstream tree, eslint also gets `--no-error-on-unmatched-pattern
+  --no-warn-ignored`, so a path that is wholly upstream's, and so wholly ignored, is skipped as walking `.`
+  would skip it rather than refused. Only then: those options would also hide a mistyped path.
+- prettier: an ignore file passed with `--ignore-path`. It also applies to files named in the command, and
+  `.gitignore` and `.prettierignore` are passed with it, since any `--ignore-path` replaces prettier's defaults.
+  An ignore file cannot spell `?` (prettier 3.5.3 and legacy eslint read `\?` as nothing and `[?]` as the
+  wildcard), so a command checking `.` is given the project's files, as below, when an excluded path holds one.
+  Otherwise, and for a legacy `.eslintrc`, `?` is written bare where no other file the tool reads would match it;
+  a file it would is judged as the project's and named in the output.
+- eslint (with a flat config) and prettier, past 50 excluded paths when the command checks `.`: the `.` is replaced
+  by the project's own files of any extension, collapsed as for ruff, and no ignore list is built. Eslint slows with
+  every global ignore it matches each file against (on a checkout of 40,000 files: 33 s with none, 35 s with 50,
+  60 s with 200, over 300 s with 2,500), and prettier likewise, so naming the project's files keeps such a run near
+  the time of a plain one. Eslint is passed `--no-error-on-unmatched-pattern --no-warn-ignored`, prettier
+  `--ignore-unknown --no-error-on-unmatched-pattern`, so a named file that the project's own ignores or config skip
+  (for eslint, one no config's `files` matches) is skipped silently, as walking `.` would; the project's config and
+  ignores, prettier's `.gitignore` and `.prettierignore` included, still apply to named files. Eslint reads no
+  `.gitignore`, so no git-ignored path is left out for it. When the list would exceed 64 KiB, or the command checks
+  something other than `.`, the ignore list is used as above; so it is with a legacy `.eslintrc`, since legacy
+  eslint lints a named file whatever its extension.
+- `terraform fmt -recursive` with no path: `terraform fmt` has no exclude option, but it takes files, so
+  `-recursive` is replaced by the project's own `.tf`, `.tfvars`, `.tftest.hcl` and `.tfmock.hcl` files, each named
+  (one beginning with `-` as `./-x.tf`): `terraform fmt -check main.tf sub/x.tf`. A hidden file, or one in a hidden
+  directory (`.terraform/modules/`), is not named: terraform's own walk never reaches it, and named it would be
+  checked. When no file is left, an empty temporary `.tf` is named, so terraform does not walk the directory. When
+  the list would exceed 64 KiB, or the rule names a path, the command runs as written, and in the first case its
+  output says so. Without a nested checkout or `vendored.toml` tree the command always runs as written.
+
+Eslint's and prettier's files hold any number of paths. The temporary files are removed when the tool exits. The
+recorded command is the one that ran, temporary file names included.
+
+The excluded paths are as few as cover every unchanged file the tool reads: the highest directory inside an upstream
+tree that holds no project file the tool reads (a whole untouched checkout is one path, `repo`), and an unchanged
+file one by one only where its directory also holds one. Which files ruff reads is asked of ruff (`ruff check
+--show-settings --no-force-exclude` for an empty file at the project root, with the command's `--isolated` or
+`--config`, so a project that excludes such a file's name still answers: the `include` and `extend-include` the
+project root's configuration resolves to, by default `*.py`, `*.pyi`, `*.ipynb`, `*.md`, `pyproject.toml`,
+`ruff.toml` and `.ruff.toml`), so a git-ignored `__pycache__/x.pyc` of the project's does not keep its directory
+from being excluded whole. Only the root configuration's `include` is asked, not a nested checkout's: a nested ruff
+configuration with a narrower one makes ruff skip a file the gate counts as read, which can only make ruff lint an
+owned file it otherwise would not, never skip one. A flat eslint config's `files` decide which files eslint reads
+(`.vue`, `.md`, `.es6` ...), and prettier's plugins which it formats, so for both any file of the project's keeps
+its directory, and every unchanged upstream file is excluded whatever its extension. Each path is anchored at the
+project: ruff's start with `./` (a bare `repo` would also exclude the project's own `tools/repo`), eslint's are
+resolved against the project, ignore-file lines start with `/`. Glob characters in a file name are escaped
+(`a\[1\].py`), so an exclude never matches a file of the project's that the pattern would otherwise cover.
+
+In a nested git checkout a file is upstream's only when it is in the checkout's base tree and git reports no change
+to it. A file new to the checkout is the project's, including one the checkout's `.gitignore` hides (git status
+does not list it): `factory:module-size`, test removal, language detection, `factory:ui-evidence` and the linters
+judge it as any other file of the project's. Walking a directory, ruff still skips git-ignored files,
+the project's own as much as these; one named in the rule's command is linted. A file inside a submodule, or
+inside a checkout cloned within the checkout, is judged against that checkout's own base (the innermost checkout
+holding it).
+
+The rule's output ends with what was taken as upstream's, including nested git checkouts: `Nested git checkouts
+judged against their base: repo (base <12 hex>); repo/sub (base <12 hex>).` A nested checkout's base is its merge-base with the first of:
+its remote's default branch (`origin/HEAD`, `origin/main` or `origin/master`); the commit it last fetched
+(`FETCH_HEAD`, written by `git fetch <url> <sha>` at any depth); a commit a shallow fetch cut its history at. So
+`git init`, `git fetch <url> <sha>` and `git checkout FETCH_HEAD` (the benchmark layout) needs neither a
+remote-tracking branch nor a local branch, with or without `--depth`. A local `main` or `master` is never a base:
+a repository the project created with `git init` and committed to, or a full clone whose remote was removed and
+that was not fetched into since, has none of the three (a clone writes no `FETCH_HEAD`; a later `git fetch` or
+`git pull` does), so every file in it is the project's, and the output says so. A checkout inside a checkout is
+judged against the commit the outer checkout's base records for it (a submodule's entry): a project that moves a
+submodule on changed its files. A clone inside a checkout that the outer's base does not record has a base by the
+rule above. A recorded commit the submodule does not hold leaves its base unknown.
+A nested git checkout needs no manifest; a copy without `.git` is
+recognised through `vendored.toml`, by the same rule: a file is upstream's only when identical to it.
+
+How each gate path that walks the project's files or runs a tool over them treats an unchanged upstream file. A
+file new to a nested checkout, git-ignored or not, is not one: every path judges it as the
+project's.
+
+| Gate path | Unchanged upstream file | Why |
+|---|---|---|
+| language detection | not counted | says nothing about the project's languages |
+| `factory:module-size` | skipped | judged against upstream's line count |
+| `factory:fail-to-pass` (test removal) | not one of the project's changed tests | judged against upstream's version |
+| `factory:fail-to-pass` (did the start tree have tests, for the `refactor: no behaviour change` exemption) | counted | an upstream test suite is tests the project can run and must keep passing, so a refactor of the checkout has behaviour to preserve |
+| `factory:ui-evidence` (is there UI: `.html`, `.htm`, `.tsx`, `.jsx`, `.vue`, `.svelte`) | not counted | an unchanged upstream page is upstream's UI, not the project's |
+| shellcheck file list | not listed | per-file linter: its findings are upstream's |
+| `forbid` rules | skipped | a pattern in upstream's file is upstream's |
+| `ruff check` / `ruff format` | excluded: inline `extend-exclude`; an unchanged file the command names is dropped, as is a named directory inside an upstream tree holding no project file; any other named directory ruff walks itself (none left: an empty file, so ruff does not fall back to `.`); past 64 KiB the project's files named in place of the rule's sole `.`, with `--force-exclude` so the project's own excludes still apply to them; past that a temporary `--config` file, noted in the output. A path the rule names is never subject to `--force-exclude` | per-file linter |
+| ruff `lint` kind (`--isolated`) | excluded (as above, keeping `--isolated`; the temporary file replaces it and extends nothing) | per-file linter |
+| eslint | excluded (temporary flat config importing the config the command names, else the project's or the baseline config; `--ignore-path` file for a legacy `.eslintrc`; past 50 paths, with a flat config, the project's files named in place of `.`; a named upstream path is skipped when wholly ignored) | per-file linter, when run on a directory or glob |
+| prettier `--check` | excluded (temporary ignore file; past 50 paths the project's files named in place of `.`) | per-file linter |
+| mypy / pyright | still judged | whole-program: the project's change elsewhere can break an unchanged file; configure it to exclude vendored trees |
+| pytest | still run | tests run as a whole; upstream's own failures are not filtered |
+| tsc (incl. the baseline `files` list) | still judged | whole-program, like mypy |
+| tflint | still judged | evaluates a module as a whole |
+| `terraform fmt -check -recursive` | excluded: the project's own `.tf`, `.tfvars`, `.tftest.hcl` and `.tfmock.hcl` files named in place of `-recursive`, hidden paths left out as terraform's walk leaves them; past 64 KiB run as written, and the output says so | per-file formatter |
+| `terraform validate` | still judged | evaluates a module as a whole, like tflint |
+| suppressions policy (`changed_lines`) | skipped | with a base commit it judges only the lines the project added, and an identical file adds none; without one it checks every `.py` except a file identical to upstream's, and its output names the trees |
+| `script` rules | not affected | run by the rule's own script, which gets no file list |
+
+Two other walks read the project's tree but judge nothing in it: finding the nested git checkouts themselves, and
+the content hash of the start tree that keys the cache of its rule results.
 
 **What still fails.** Judgement is against upstream's version, not against nothing: growing an over-limit
 module (`... lines, was N`), adding a skip to a vendored test or removing a test from it

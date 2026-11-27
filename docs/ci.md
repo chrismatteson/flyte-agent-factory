@@ -65,6 +65,14 @@ checks out two commits, so the module-size rule measures growth against the comm
 base it merges into; on a push of several commits to main, the last one's parent): a module already over the limit
 that did not grow is reported as debt, not a failure.
 
+### The linters the test jobs install
+
+The gate's tests (`tests/test_gate_upstream_lint.py`) run the real shellcheck, eslint and prettier, so
+`Tests (not slow)` installs them before pytest, without root, into `$RUNNER_TEMP`: shellcheck is the v0.11.0 release
+the other jobs download (checksum-verified), eslint and prettier are the factory image's pins (`_images.TOOLS`), kept
+equal by `tests/test_ci_workflow.py`. Nothing skips those tests when a linter is absent: run locally without one, they
+fail with the gate's own `image defect: <tool> missing` message.
+
 ### Why both test jobs run on every change
 
 Before the gate blocked, `Tests (not slow)` and `Tests (slow)` ran only for a change that could affect them

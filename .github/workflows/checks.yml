@@ -100,6 +100,21 @@ jobs:
         with:
           path: ~/.cache/factory-scanners/${{ steps.scanners.outputs.tflint }}
           key: ${{ steps.scanners.outputs.tflint }}
+      # The gate tests (tests/test_gate_upstream_lint.py) run the real linters and fail without them: a missing one
+      # is `image defect: <tool> missing`. shellcheck is the release the other jobs install; eslint and prettier are
+      # the factory image's pins (`_images.TOOLS`, kept equal by tests/test_ci_workflow.py). Into $RUNNER_TEMP, so
+      # the steps need no root.
+      - name: Install shellcheck
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
+      - name: Install eslint and prettier
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/node-linters" eslint@9.22.0 prettier@3.5.3
+          echo "$RUNNER_TEMP/node-linters/bin" >> "$GITHUB_PATH"
       # The owner's private literal list for the personal-literal guard (ops/personal_literals.py), from the
       # repository secret of the same name. Without it (a fork's pull request, a repository that has not set it)
       # the guard checks the generic shapes only.
