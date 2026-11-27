@@ -587,6 +587,8 @@ def nested(tmp_path):
     (upstream / "small.py").write_text("y = 1\n")
     git(upstream, "add", ".")
     git(upstream, "commit", "-m", "base")
+    git(upstream, "update-ref", "refs/remotes/origin/main", "main")
+    git(upstream, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     git(upstream, "checkout", "-b", "feature")
     return project, upstream
 
@@ -624,7 +626,7 @@ def test_a_grown_nested_file_with_form_feeds_is_not_debt(nested):
     paged = "x = 1  # \x0c\n" * (_module_size.MODULE_LINE_LIMIT + 100)
     (upstream / "big.py").write_text(paged)
     git(upstream, "commit", "-am", "paged")
-    git(upstream, "branch", "-f", "main")
+    git(upstream, "update-ref", "refs/remotes/origin/main", "HEAD")
     (upstream / "big.py").write_text(paged + "x = 2\n" * 10)
     git(upstream, "commit", "-am", "grow")
     code, output = _size(project)
@@ -644,7 +646,10 @@ def test_the_projects_own_big_file_still_fails(nested):
     project, _ = nested
     (project / "mine.py").write_text(BIG)
     code, output = _size(project)
-    assert code == 1 and "mine.py" in output and ".upstream" not in output
+    findings, _, note = output.partition("\nNested git checkouts")
+    # The findings are the project's alone; the closing note names the checkout it did not judge.
+    assert code == 1 and "mine.py" in findings and ".upstream" not in findings
+    assert ".upstream (base " in note
 
 
 # -- declared evidence commands --

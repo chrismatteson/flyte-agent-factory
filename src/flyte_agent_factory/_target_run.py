@@ -26,7 +26,14 @@ from . import _gate_base, _gate_start, _secret_env, _target_ci, _target_tools
 #: Each command of the target repo's own CI whose step and job set no `timeout-minutes`. Its lint and tests
 #: run at their full length, as they do upstream.
 TARGET_CI_TIMEOUT = 900
-DEFAULT_BRANCHES = ("origin/HEAD", "origin/main", "origin/master", "main", "master")
+#: A checkout's default branch is looked for at the remote first. The local `main`/`master` fallback serves
+#: the in-project target checkout (`git init -b main`, no remote), never a nested checkout: one the project
+#: made itself has a local `main` and no remote, and HEAD as its merge-base would make every commit the
+#: project made there upstream's. A nested checkout without a remote default branch takes as base the commit
+#: it last fetched, else a commit a shallow fetch cut its history at, else none (`find_nested_base`).
+REMOTE_DEFAULT_BRANCHES = ("origin/HEAD", "origin/main", "origin/master")
+DEFAULT_BRANCHES = (*REMOTE_DEFAULT_BRANCHES, "main", "master")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 #: What a runner's shell has from the machine. Everything else of the pod stays out.
 _ALLOWED = {
@@ -124,9 +131,12 @@ class Run:
     skipped: str = ""
 
 
-def target_base(checkout: Path) -> str:
-    """Return the commit the target checkout began at, its merge-base with the default branch ("" if none)."""
-    for ref in DEFAULT_BRANCHES:
+def target_base(checkout: Path, refs: Sequence[str] = DEFAULT_BRANCHES) -> str:
+    """Return the commit the target checkout began at ("" if none).
+
+    Its merge-base with the first of `refs`, the default branches by default, that has one.
+    """
+    for ref in refs:
         code, base = _gate_base._run(["git", "merge-base", "HEAD", ref], checkout)
         if not code and base.strip():
             return base.strip()
@@ -769,9 +779,8 @@ def _git_names(checkout: Path, *args: str) -> set[str] | None:
     return None if code else {name for name in output.split("\0") if name}
 
 
-def changed_since_base(checkout: Path) -> set[str] | None:
-    """Return the files of `checkout` that differ from its base, committed or not; None if unknown."""
-    base = target_base(checkout)
+def changed_since_base(checkout: Path, base: str) -> set[str] | None:
+    """Return the files of `checkout` that differ from `base`, committed or not; None if unknown."""
     tracked = _git_names(checkout, "diff", "--name-only", base) if base else None
     untracked = _git_names(checkout, "ls-files", "--others", "--exclude-standard")
     return None if tracked is None or untracked is None else tracked | untracked
@@ -801,18 +810,92 @@ class Nested:
             return None
 
 
+def read_shallow_boundaries(checkout: Path) -> list[str]:
+    """Return the commits a shallow fetch cut the checkout's history at: fetched ones, never made in it."""
+    code, path = _gate_base._run(["git", "rev-parse", "--git-path", "shallow"], checkout)
+    if code or not path.strip():
+        return []
+    try:
+        lines = (checkout / path.strip()).read_text().split()
+    except OSError:  # not a shallow repository: nothing was cut
+        return []
+    return [line for line in lines if _COMMIT.fullmatch(line)]
+
+
+def read_fetched_commits(checkout: Path) -> list[str]:
+    """Return the commits the checkout's last `git fetch` brought in (`FETCH_HEAD`), in the order fetched.
+
+    Only a fetch writes the file: `git init` plus commits and `git clone` never do.
+    """
+    code, path = _gate_base._run(["git", "rev-parse", "--git-path", "FETCH_HEAD"], checkout)
+    if code or not path.strip():
+        return []
+    try:
+        lines = (checkout / path.strip()).read_text().splitlines()
+    except OSError:  # never fetched into: nothing was brought in
+        return []
+    heads = [line.split("\t", 1)[0] for line in lines]
+    return [head for head in heads if _COMMIT.fullmatch(head)]
+
+
+def find_nested_base(checkout: Path) -> str:
+    """Return the commit a nested checkout began at ("" if unknown).
+
+    Its merge-base with the remote's default branch; without one, with the commit the checkout last fetched
+    (`git fetch <url> <sha>`, shallow or not); without that, with a commit a shallow fetch cut the history at.
+    Only a fetch makes either, so a repository the project made itself, or a full clone whose remote was
+    removed and that was not fetched into since, has no base and every file in it is the project's.
+    """
+    candidates = (
+        *REMOTE_DEFAULT_BRANCHES,
+        *read_fetched_commits(checkout),
+        *read_shallow_boundaries(checkout),
+    )
+    return target_base(checkout, candidates)
+
+
+def read_gitlink(checkout: Path, base: str, relative: str) -> str | None:
+    """Return the commit `base` of `checkout` records for a submodule at `relative`; None without one."""
+    code, output = _gate_base._run(["git", "ls-tree", base, "--", relative], checkout)
+    fields = output.split()
+    if code or len(fields) < 4 or fields[:2] != ["160000", "commit"]:
+        return None
+    return fields[2]
+
+
+def find_inner_base(checkout: Path, outer: Nested) -> str:
+    """Return the base of a checkout inside another checkout ("" if unknown).
+
+    The commit the outer's base records for it, when it is a submodule of that base: a project that moves the
+    submodule on changed its files. A checkout the outer's base does not record (a clone made inside it) has
+    its own base (`find_nested_base`). A recorded commit the checkout does not hold cannot be judged against.
+    """
+    relative = str(checkout.relative_to(outer.root))
+    gitlink = read_gitlink(outer.root, outer.base, relative) if outer.base else None
+    if gitlink is None:
+        return find_nested_base(checkout)
+    code, _ = _gate_base._run(["git", "cat-file", "-e", f"{gitlink}^{{commit}}"], checkout)
+    return "" if code else gitlink
+
+
 def nested_checkouts(project: Path, skip_dirs: set[str]) -> list[Nested]:
-    """Return the git checkouts inside `project` (not itself), outside the dependency and harness trees."""
+    """Return the git checkouts inside `project` (not itself), outside the dependency and harness trees.
+
+    A checkout inside a checkout (a submodule, a clone made inside one) is one of them, listed after the one
+    holding it: os.walk is top-down, and `skip_dirs` keeps it out of every `.git`.
+    """
     found: list[Nested] = []
     for directory, children, _ in os.walk(project):
         children[:] = [n for n in children if n not in skip_dirs]
-        for child in list(children):
+        for child in children:
             path = Path(directory) / child
             try:
                 checkout = (path / ".git").exists()
             except OSError:  # an unreadable directory is no checkout; os.walk skips it as well
                 checkout = False
-            if checkout:
-                children.remove(child)
-                found.append(Nested(path, changed_since_base(path), target_base(path)))
+            if not checkout:
+                continue
+            outer = next((n for n in reversed(found) if path.is_relative_to(n.root)), None)
+            base = find_inner_base(path, outer) if outer else find_nested_base(path)
+            found.append(Nested(path, changed_since_base(path, base), base))
     return found

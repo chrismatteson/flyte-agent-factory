@@ -227,10 +227,10 @@ def test_without_a_manifest_the_vendored_package_json_selects_typescript(django)
 
 
 def test_an_unchanged_nested_checkout_does_not_select_typescript(django):
-    project, *_ = django
+    project, root, _ = django
     nested = project / "repo"
-    _git(nested, "init", "-q", "-b", "main")
-    _commit(nested)
+    shutil.rmtree(nested)
+    _git(project, "clone", "-q", str(root), "repo")
     assert "typescript" not in _languages(project)
     (nested / "new.ts").write_text("export {};\n")
     assert "typescript" in _languages(project)

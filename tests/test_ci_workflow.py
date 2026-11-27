@@ -263,3 +263,29 @@ def test_no_job_downloads_a_scanner_release_itself():
         assert scanner.url not in text
         assert f"{scanner.name}/releases" not in text
         assert scanner.sha256 not in text
+
+
+def _install_step(job: str, name: str) -> str:
+    steps = _jobs()[job]["steps"]
+    [install] = [s for s in steps if s.get("name") == name]
+    # Unconditionally, and before the tests run.
+    assert "if" not in install
+    names = [s.get("name") for s in steps]
+    assert names.index(name) < next(i for i, n in enumerate(names) if n and "pytest" in n)
+    return str(install["run"])
+
+
+def test_the_fast_lane_installs_the_linters_the_gate_tests_run_at_the_image_pins():
+    # tests/test_gate_upstream_lint.py runs the real eslint, prettier and shellcheck; a missing one is
+    # `image defect: <tool> missing` and the tests fail, so CI installs them at the factory image's pins.
+    run = _install_step("tests-fast", "Install eslint and prettier")
+    for tool in ("eslint", "prettier"):
+        [pin] = re.findall(rf"\b{tool}@(\S+)", _images.TOOLS[tool])
+        assert re.findall(rf"\b{tool}@(\S+)", run) == [pin]
+    assert '/bin" >> "$GITHUB_PATH"' in run
+    # shellcheck is the release, and checksum, every other job installs.
+    run = _install_step("tests-fast", "Install shellcheck")
+    gate = _jobs()["standards"]["steps"]
+    [gate_run] = [str(s["run"]) for s in gate if s.get("name") == "Install shellcheck"]
+    assert gate_run.splitlines()[:3] == run.splitlines()[:3]
+    assert "sha256sum --check" in run and '>> "$GITHUB_PATH"' in run

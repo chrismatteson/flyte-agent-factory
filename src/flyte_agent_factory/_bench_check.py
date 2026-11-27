@@ -178,14 +178,19 @@ def run_hidden_check(
         return {"exit_code": None, "summary": refusal}
     project = project.resolve()
     with tempfile.TemporaryDirectory(prefix="bench-check-") as tmp:
-        hidden, home = Path(tmp) / "hidden", Path(tmp) / "home"
+        hidden, home, scratch = Path(tmp) / "hidden", Path(tmp) / "home", Path(tmp) / "tmp"
         hidden.mkdir()
         home.mkdir()
+        scratch.mkdir()
         for name, text in task.check_files.items():
             (hidden / name).write_text(text)
         env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": str(home),
+            # The check's own temporary directory, removed with it. A pytest the check runs keeps its
+            # tmp_path roots there, not in the machine's shared /tmp/pytest-of-<user>, where on exit it
+            # deletes other sessions' stale roots: gigabytes after a full suite, past a mutant's timeout.
+            "TMPDIR": str(scratch),
             "LANG": "C.UTF-8",
             "PYTHONDONTWRITEBYTECODE": "1",
             "BENCH_PROJECT": str(project),
